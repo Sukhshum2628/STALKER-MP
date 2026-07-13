@@ -22,7 +22,7 @@
     </g>
     <!-- 008 in progress + planned -->
     <g>
-      <rect x="60" y="185" width="150" height="46" rx="8" fill="#fff8c5" stroke="#d4a72c"/><text x="135" y="205" text-anchor="middle" font-weight="700">008 Snapshots</text><text x="135" y="222" text-anchor="middle" font-size="10.5" fill="#9a6700">▶ step 3 / 14</text>
+      <rect x="60" y="185" width="150" height="46" rx="8" fill="#fff8c5" stroke="#d4a72c"/><text x="135" y="205" text-anchor="middle" font-weight="700">008 Snapshots</text><text x="135" y="222" text-anchor="middle" font-size="10.5" fill="#9a6700">▶ step 5 / 14</text>
       <rect x="220" y="185" width="120" height="46" rx="8" fill="#f6f8fa" stroke="#8c959f"/><text x="280" y="205" text-anchor="middle" font-weight="700">009 Replication</text><text x="280" y="222" text-anchor="middle" font-size="10.5" fill="#57606a">planned</text>
       <rect x="350" y="185" width="120" height="46" rx="8" fill="#f6f8fa" stroke="#8c959f"/><text x="410" y="205" text-anchor="middle" font-weight="700">010 Prediction</text><text x="410" y="222" text-anchor="middle" font-size="10.5" fill="#57606a">planned</text>
       <rect x="480" y="185" width="150" height="46" rx="8" fill="#f6f8fa" stroke="#8c959f"/><text x="555" y="205" text-anchor="middle" font-weight="700">011–012 Persist</text><text x="555" y="222" text-anchor="middle" font-size="10.5" fill="#57606a">planned</text>
@@ -31,5 +31,5 @@
     </g>
   </g>
 
-  <text x="480" y="280" text-anchor="middle" font-size="13" font-weight="600" fill="#0d1117">330 tests passing · GCC + MSVC · 0 warnings · no regressions</text>
+  <text x="480" y="280" text-anchor="middle" font-size="13" font-weight="600" fill="#0d1117">335 tests passing · GCC + MSVC · 0 warnings · no regressions</text>
 </svg>

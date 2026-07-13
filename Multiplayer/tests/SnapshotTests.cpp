@@ -13,6 +13,9 @@
 #include "stalkermp/snapshot/ISnapshotView.h"
 #include "stalkermp/snapshot/SimulationSnapshot.h"
 #include "stalkermp/snapshot/SnapshotConfiguration.h"
+#include "stalkermp/snapshot/SnapshotPool.h"
+#include "stalkermp/adapters/EntitySnapshotSource.h"
+#include "stalkermp/world/IEntitySnapshotSource.h"
 #include "stalkermp/snapshot/SnapshotTypes.h"
 
 using namespace stalkermp;
@@ -319,4 +322,159 @@ TEST(SimulationSnapshotStep3, BeginBuildResetsForReuse)
     ASSERT_TRUE(snap.Finalize().HasValue());
     EXPECT_EQ(snap.Entities().size(), 1u);
     EXPECT_EQ(snap.Entities()[0].id.value, 9u);
+}
+
+// ============================================================================
+// Step 4 — SnapshotPool (fixed-capacity, exception-free intrusive ref-count)
+// ============================================================================
+
+// --- Reserve sets capacity; deterministic acquisition (lowest free index) -----
+TEST(SnapshotPoolStep4, DeterministicAcquisitionOrder)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(3);
+    EXPECT_EQ(pool.Capacity(), 3u);
+    EXPECT_EQ(pool.InUse(), 0u);
+
+    const auto a = pool.Acquire();
+    const auto b = pool.Acquire();
+    const auto c = pool.Acquire();
+    ASSERT_TRUE(a.HasValue());
+    ASSERT_TRUE(b.HasValue());
+    ASSERT_TRUE(c.HasValue());
+    EXPECT_EQ(pool.InUse(), 3u);
+    // Distinct buffers, each with ref-count 1.
+    EXPECT_NE(a.Value(), b.Value());
+    EXPECT_NE(b.Value(), c.Value());
+    EXPECT_EQ(pool.RefCount(a.Value()), 1u);
+}
+
+// --- Capacity exhaustion is a value outcome (PoolExhausted) -------------------
+TEST(SnapshotPoolStep4, CapacityExhaustion)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    ASSERT_TRUE(pool.Acquire().HasValue());
+    ASSERT_TRUE(pool.Acquire().HasValue());
+    EXPECT_TRUE(pool.Full());
+    const auto over = pool.Acquire();
+    EXPECT_FALSE(over.HasValue()); // PoolExhausted, not a throw
+    EXPECT_EQ(pool.InUse(), 2u);   // unchanged
+}
+
+// --- Buffer reuse: a returned buffer is re-acquired (same storage) ------------
+TEST(SnapshotPoolStep4, BufferReuse)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    const auto a = pool.Acquire();
+    const auto b = pool.Acquire();
+    ASSERT_TRUE(a.HasValue());
+    ASSERT_TRUE(b.HasValue());
+    snapshot::SimulationSnapshot* const first = a.Value();
+
+    pool.ReturnToPool(first);       // ref 1 -> 0 -> freed (slot 0)
+    EXPECT_EQ(pool.InUse(), 1u);
+    const auto reacquired = pool.Acquire(); // lowest free = slot 0 again
+    ASSERT_TRUE(reacquired.HasValue());
+    EXPECT_EQ(reacquired.Value(), first); // same underlying buffer reused
+    EXPECT_EQ(pool.InUse(), 2u);
+}
+
+// --- Reference-count lifecycle: retire only at zero (multi-consumer) ----------
+TEST(SnapshotPoolStep4, RefCountLifecycle)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    const auto acq = pool.Acquire();
+    ASSERT_TRUE(acq.HasValue());
+    snapshot::SimulationSnapshot* const buf = acq.Value();
+    EXPECT_EQ(pool.RefCount(buf), 1u);
+
+    pool.AddRef(buf); // second consumer
+    pool.AddRef(buf); // third consumer
+    EXPECT_EQ(pool.RefCount(buf), 3u);
+    EXPECT_EQ(pool.InUse(), 1u);
+
+    pool.ReturnToPool(buf); // 3 -> 2 : still in use
+    EXPECT_EQ(pool.RefCount(buf), 2u);
+    EXPECT_EQ(pool.InUse(), 1u);
+    pool.ReturnToPool(buf); // 2 -> 1 : still in use
+    EXPECT_EQ(pool.InUse(), 1u);
+    pool.ReturnToPool(buf); // 1 -> 0 : retired
+    EXPECT_EQ(pool.RefCount(buf), 0u);
+    EXPECT_EQ(pool.InUse(), 0u);
+
+    // Extra release / unknown / null are benign no-ops.
+    pool.ReturnToPool(buf);
+    pool.ReturnToPool(nullptr);
+    EXPECT_EQ(pool.InUse(), 0u);
+}
+
+// --- Acquired pooled buffers are usable SimulationSnapshots -------------------
+TEST(SnapshotPoolStep4, PooledBufferIsBuildable)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(1);
+    const auto acq = pool.Acquire();
+    ASSERT_TRUE(acq.HasValue());
+    snapshot::SimulationSnapshot* const s = acq.Value();
+    s->BeginBuild(snapshot::SnapshotId{1}, 100, 1);
+    ASSERT_TRUE(s->AddEntity(Ent(1)).HasValue());
+    ASSERT_TRUE(s->Finalize().HasValue());
+    EXPECT_EQ(s->State(), snapshot::SnapshotState::Finalized);
+    pool.ReturnToPool(s);
+    EXPECT_EQ(pool.InUse(), 0u);
+}
+
+// ============================================================================
+// Step 5 — world::IEntitySnapshotSource + NullEntitySnapshotSource
+// ============================================================================
+
+// --- Factory yields a usable, engine-free source ------------------------------
+TEST(EntitySnapshotSourceStep5, FactoryProducesSource)
+{
+    std::unique_ptr<world::IEntitySnapshotSource> src = adapters::CreateEngineEntitySnapshotSource();
+    ASSERT_NE(src, nullptr);
+}
+
+// --- Null source captures deterministically (inert, engine-free) --------------
+TEST(EntitySnapshotSourceStep5, NullCaptureDeterministic)
+{
+    std::unique_ptr<world::IEntitySnapshotSource> src = adapters::CreateEngineEntitySnapshotSource();
+    std::vector<snapshot::EntitySnapshot> a;
+    std::vector<snapshot::EntitySnapshot> b;
+    src->Capture(a);
+    src->Capture(b);
+    EXPECT_EQ(a.size(), b.size()); // same result every call (deterministic)
+}
+
+// --- Capture is APPEND-ONLY: pre-existing entries are preserved ---------------
+TEST(EntitySnapshotSourceStep5, CaptureIsAppendOnly)
+{
+    std::unique_ptr<world::IEntitySnapshotSource> src = adapters::CreateEngineEntitySnapshotSource();
+    std::vector<snapshot::EntitySnapshot> out;
+    snapshot::EntitySnapshot pre{};
+    pre.id = world::EntityId{42};
+    out.push_back(pre);
+    const std::size_t before = out.size();
+
+    src->Capture(out); // null appends nothing; must not clear
+    ASSERT_GE(out.size(), before);
+    EXPECT_EQ(out[0].id.value, 42u); // pre-existing entry preserved
+}
+
+// --- Usable polymorphically through the engine-free seam ----------------------
+TEST(EntitySnapshotSourceStep5, UsableThroughInterface)
+{
+    std::unique_ptr<world::IEntitySnapshotSource> src = adapters::CreateEngineEntitySnapshotSource();
+    world::IEntitySnapshotSource& iface = *src; // the SnapshotBuilder consumes this
+    std::vector<snapshot::EntitySnapshot> out;
+    iface.Capture(out);
+    // Result is a valid vector (possibly empty for the inert null), ascending-safe.
+    for (std::size_t i = 1; i < out.size(); ++i)
+    {
+        EXPECT_LT(out[i - 1].id.value, out[i].id.value);
+    }
+    SUCCEED();
 }

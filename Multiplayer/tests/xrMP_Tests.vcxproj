@@ -94,6 +94,7 @@
     <ClCompile Include="..\src\player\PlayerConfiguration.cpp" />
     <ClCompile Include="..\src\snapshot\SnapshotConfiguration.cpp" />
     <ClCompile Include="..\src\snapshot\SimulationSnapshot.cpp" />
+    <ClCompile Include="..\src\snapshot\SnapshotPool.cpp" />
     <ClCompile Include="..\src\player\PlayerRegistry.cpp" />
     <ClCompile Include="..\src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="..\src\player\PlayerSessionObserver.cpp" />
@@ -120,6 +121,7 @@
          The engine-only src\adapters\PlatformSockets.cpp is NOT linked here. -->
     <ClCompile Include="support\NullPlatformTransport.cpp" />
     <ClCompile Include="support\NullPlayerSpawnGateway.cpp" />
+    <ClCompile Include="support\NullEntitySnapshotSource.cpp" />
     <ClCompile Include="..\src\common\FileSystemUtil.cpp" />
     <ClCompile Include="..\src\common\StringUtil.cpp" />
     <ClCompile Include="..\src\common\Time.cpp" />
