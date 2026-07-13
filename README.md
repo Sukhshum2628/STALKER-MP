@@ -2,9 +2,9 @@
 
 **A host-authoritative, deterministic multiplayer framework for the X-Ray (S.T.A.L.K.E.R. Anomaly / Monolith) engine.**
 
-![Architecture Overview](docs/images/architecture-overview.png)
+![Architecture Overview](docs/images/architecture-overview.svg)
 
-> _Final diagrams are being exported to `docs/images/`. Equivalent Mermaid diagrams are embedded inline below and render directly on GitHub._
+> _Diagrams are provided as SVG in `docs/images/` (rendered above) and as inline Mermaid diagrams below (rendered directly by GitHub)._
 
 ---
 
@@ -54,7 +54,7 @@ flowchart LR
     W[World<br/>100] --> ER[EntityRegistry<br/>200] --> PL[PlayerLifecycle<br/>250] --> BUB[Bubble<br/>300] --> TR[Transition<br/>350] --> SN[Snapshot<br/>400] --> NET[Networking<br/>900]
 ```
 
-See `docs/images/frame-tick-order.png` and `docs/images/snapshot-dataflow.png` for the exported diagrams, and `Multiplayer/docs/` for per-subsystem documentation.
+See the SVG diagrams in `docs/images/` and the Mermaid pipeline above; per-subsystem documentation lives in `Multiplayer/docs/`.
 
 ---
 
@@ -91,7 +91,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Sprint Roadmap & Progress
 
-![Sprint Roadmap](docs/images/sprint-roadmap.png)
+![Sprint Roadmap](docs/images/sprint-roadmap.svg)
 
 | Sprint | Subsystem | Status |
 |---|---|---|
