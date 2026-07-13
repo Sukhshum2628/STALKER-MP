@@ -134,6 +134,7 @@
     <ClCompile Include="src\adapters\PlatformSockets.cpp" />
     <ClCompile Include="src\player\PlayerConfiguration.cpp" />
     <ClCompile Include="src\snapshot\SnapshotConfiguration.cpp" />
+    <ClCompile Include="src\snapshot\SimulationSnapshot.cpp" />
     <ClCompile Include="src\player\PlayerRegistry.cpp" />
     <ClCompile Include="src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="src\player\PlayerSessionObserver.cpp" />
@@ -263,6 +264,8 @@
     <ClInclude Include="include\stalkermp\player\PlayerDiagnostics.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotTypes.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotConfiguration.h" />
+    <ClInclude Include="include\stalkermp\snapshot\ISnapshotView.h" />
+    <ClInclude Include="include\stalkermp\snapshot\SimulationSnapshot.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />
