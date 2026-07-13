@@ -10,10 +10,29 @@
 #include <type_traits>
 
 #include "stalkermp/core/Config.h"
+#include "stalkermp/snapshot/ISnapshotView.h"
+#include "stalkermp/snapshot/SimulationSnapshot.h"
 #include "stalkermp/snapshot/SnapshotConfiguration.h"
 #include "stalkermp/snapshot/SnapshotTypes.h"
 
 using namespace stalkermp;
+
+namespace
+{
+    snapshot::EntitySnapshot Ent(std::uint32_t id)
+    {
+        snapshot::EntitySnapshot e{};
+        e.id = world::EntityId{id};
+        return e;
+    }
+    snapshot::PlayerSnapshot Plr(std::uint32_t id, std::uint32_t entity)
+    {
+        snapshot::PlayerSnapshot p{};
+        p.id = player::PlayerId{id};
+        p.entity = world::EntityId{entity};
+        return p;
+    }
+} // namespace
 
 // --- Enum layout: fixed std::uint8_t underlying type (deterministic ABI) -----
 TEST(SnapshotTypesStep1, EnumsHaveUint8UnderlyingType)
@@ -178,4 +197,126 @@ TEST(SnapshotConfigStep2, CrossFieldQueueDepthWithinPool)
     const auto r = snapshot::SnapshotConfiguration::FromConfig(ok);
     ASSERT_TRUE(r.HasValue());
     EXPECT_EQ(r.Value().queueDepth, 4u);
+}
+
+// ============================================================================
+// Step 3 — Immutable SimulationSnapshot + ISnapshotView
+// ============================================================================
+
+// --- Build -> Finalize: content captured, counts stamped, state Finalized -----
+TEST(SimulationSnapshotStep3, BuildAndFinalize)
+{
+    snapshot::SimulationSnapshot snap;
+    snap.BeginBuild(snapshot::SnapshotId{42}, /*tick*/ 1000, /*version*/ 1);
+    EXPECT_EQ(snap.State(), snapshot::SnapshotState::Building);
+
+    ASSERT_TRUE(snap.AddEntity(Ent(1)).HasValue());
+    ASSERT_TRUE(snap.AddEntity(Ent(5)).HasValue());
+    ASSERT_TRUE(snap.AddPlayer(Plr(1, 1)).HasValue());
+    snapshot::EnvironmentSnapshot env{};
+    env.simulationTick = 1000;
+    env.environmentVersion = 7;
+    ASSERT_TRUE(snap.SetEnvironment(env).HasValue());
+
+    ASSERT_TRUE(snap.Finalize().HasValue());
+    EXPECT_EQ(snap.State(), snapshot::SnapshotState::Finalized);
+    EXPECT_TRUE(snap.IsFinalized());
+
+    // Consumer surface (const-only) reflects the captured content.
+    const snapshot::ISnapshotView& view = snap;
+    EXPECT_EQ(view.Metadata().id.value, 42u);
+    EXPECT_EQ(view.Metadata().simulationTick, 1000u);
+    EXPECT_EQ(view.Metadata().version, 1u);
+    EXPECT_EQ(view.Metadata().entityCount, 2u);
+    EXPECT_EQ(view.Metadata().playerCount, 1u);
+    ASSERT_EQ(view.Entities().size(), 2u);
+    EXPECT_EQ(view.Entities()[0].id.value, 1u);
+    EXPECT_EQ(view.Entities()[1].id.value, 5u);
+    ASSERT_EQ(view.Players().size(), 1u);
+    EXPECT_EQ(view.Players()[0].id.value, 1u);
+    EXPECT_EQ(view.Environment().environmentVersion, 7u);
+}
+
+// --- Deterministic ordering: non-ascending / duplicate / zero rejected --------
+TEST(SimulationSnapshotStep3, AscendingUniqueEnforced)
+{
+    snapshot::SimulationSnapshot snap;
+    snap.BeginBuild(snapshot::SnapshotId{1}, 1, 1);
+    ASSERT_TRUE(snap.AddEntity(Ent(3)).HasValue());
+    EXPECT_FALSE(snap.AddEntity(Ent(3)).HasValue()); // duplicate
+    EXPECT_FALSE(snap.AddEntity(Ent(2)).HasValue()); // out of order
+    EXPECT_FALSE(snap.AddEntity(Ent(0)).HasValue()); // none id
+    ASSERT_TRUE(snap.AddEntity(Ent(4)).HasValue());  // ascending ok
+
+    ASSERT_TRUE(snap.AddPlayer(Plr(2, 20)).HasValue());
+    EXPECT_FALSE(snap.AddPlayer(Plr(2, 21)).HasValue()); // duplicate
+    EXPECT_FALSE(snap.AddPlayer(Plr(1, 22)).HasValue()); // out of order
+
+    ASSERT_EQ(snap.Entities().size(), 2u);
+    ASSERT_EQ(snap.Players().size(), 1u);
+}
+
+// --- Immutability: mutating a Finalized snapshot is rejected (E-G1-S) ---------
+TEST(SimulationSnapshotStep3, ImmutableAfterFinalize)
+{
+    snapshot::SimulationSnapshot snap;
+    snap.BeginBuild(snapshot::SnapshotId{1}, 1, 1);
+    ASSERT_TRUE(snap.AddEntity(Ent(1)).HasValue());
+    ASSERT_TRUE(snap.Finalize().HasValue());
+
+    // Every mutating operation now fails; content is unchanged.
+    EXPECT_FALSE(snap.AddEntity(Ent(2)).HasValue());
+    EXPECT_FALSE(snap.AddPlayer(Plr(1, 1)).HasValue());
+    EXPECT_FALSE(snap.SetEnvironment(snapshot::EnvironmentSnapshot{}).HasValue());
+    EXPECT_FALSE(snap.Finalize().HasValue()); // double-finalize rejected
+    EXPECT_EQ(snap.Entities().size(), 1u);
+    EXPECT_EQ(snap.State(), snapshot::SnapshotState::Finalized);
+}
+
+// --- Deterministic replay: identical build sequence => identical content ------
+TEST(SimulationSnapshotStep3, DeterministicBuild)
+{
+    auto build = [](snapshot::SimulationSnapshot& s) {
+        s.BeginBuild(snapshot::SnapshotId{7}, 500, 2);
+        (void)s.AddEntity(Ent(2));
+        (void)s.AddEntity(Ent(9));
+        (void)s.AddPlayer(Plr(3, 30));
+        snapshot::EnvironmentSnapshot e{};
+        e.weatherId = 4;
+        (void)s.SetEnvironment(e);
+        (void)s.Finalize();
+    };
+    snapshot::SimulationSnapshot a;
+    snapshot::SimulationSnapshot b;
+    build(a);
+    build(b);
+    ASSERT_EQ(a.Entities().size(), b.Entities().size());
+    for (std::size_t i = 0; i < a.Entities().size(); ++i)
+    {
+        EXPECT_EQ(a.Entities()[i].id.value, b.Entities()[i].id.value);
+    }
+    EXPECT_EQ(a.Metadata().id.value, b.Metadata().id.value);
+    EXPECT_EQ(a.Metadata().entityCount, b.Metadata().entityCount);
+    EXPECT_EQ(a.Environment().weatherId, b.Environment().weatherId);
+    // No wall-clock in content (timestampWallClock is a diagnostic field, unset).
+    EXPECT_EQ(a.Metadata().timestampWallClock, b.Metadata().timestampWallClock);
+}
+
+// --- BeginBuild restarts a build cycle (owner-driven buffer reuse) -------------
+TEST(SimulationSnapshotStep3, BeginBuildResetsForReuse)
+{
+    snapshot::SimulationSnapshot snap;
+    snap.BeginBuild(snapshot::SnapshotId{1}, 1, 1);
+    ASSERT_TRUE(snap.AddEntity(Ent(1)).HasValue());
+    ASSERT_TRUE(snap.Finalize().HasValue());
+
+    // Restart: prior content is cleared, back to Building (pool reuse in Step 4).
+    snap.BeginBuild(snapshot::SnapshotId{2}, 2, 1);
+    EXPECT_EQ(snap.State(), snapshot::SnapshotState::Building);
+    EXPECT_TRUE(snap.Entities().empty());
+    EXPECT_EQ(snap.Metadata().id.value, 2u);
+    ASSERT_TRUE(snap.AddEntity(Ent(9)).HasValue());
+    ASSERT_TRUE(snap.Finalize().HasValue());
+    EXPECT_EQ(snap.Entities().size(), 1u);
+    EXPECT_EQ(snap.Entities()[0].id.value, 9u);
 }

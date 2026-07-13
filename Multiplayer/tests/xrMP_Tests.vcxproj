@@ -93,6 +93,7 @@
     <ClCompile Include="..\src\net\TransportConfig.cpp" />
     <ClCompile Include="..\src\player\PlayerConfiguration.cpp" />
     <ClCompile Include="..\src\snapshot\SnapshotConfiguration.cpp" />
+    <ClCompile Include="..\src\snapshot\SimulationSnapshot.cpp" />
     <ClCompile Include="..\src\player\PlayerRegistry.cpp" />
     <ClCompile Include="..\src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="..\src\player\PlayerSessionObserver.cpp" />
