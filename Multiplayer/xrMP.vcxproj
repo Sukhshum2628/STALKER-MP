@@ -1,0 +1,304 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  STALKER-MP static library (Sprint-001).
+  Integrates into Engine/xray-monolith/src/engine-vs2022.sln following the
+  same configuration model as the engine's simple static libraries (the
+  15 solution configurations map onto the 4 engine-facing configurations
+  below: Release, Release-AVX, ProfiledDX11, Verified; Debug exists for the
+  standalone Multiplayer/xrMP.sln only).
+  Paths are anchored to this file so the project loads identically from the
+  engine solution and from the module solution.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ProfiledDX11|x64">
+      <Configuration>ProfiledDX11</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release-AVX|x64">
+      <Configuration>Release-AVX</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Verified|x64">
+      <Configuration>Verified</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{E1A9C0DE-5A17-4C6B-9B2F-3D8B1C2A4F10}</ProjectGuid>
+    <RootNamespace>xrMP</RootNamespace>
+    <ProjectName>xrMP</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'!='Debug'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Label="UserMacros">
+    <!-- Build output lands in the engine's build tree, mirroring the
+         engine's other static libraries so xrEngine's existing library
+         search paths find xrMP.lib without modification. -->
+    <xrMPBuildRoot>$(MSBuildThisFileDirectory)..\Engine\xray-monolith\_build\</xrMPBuildRoot>
+  </PropertyGroup>
+  <PropertyGroup>
+    <OutDir>$(xrMPBuildRoot)_game\bin_dbg\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(xrMPBuildRoot)intermediate\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>xrMP</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'!='Debug'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release-AVX'">
+    <ClCompile>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions</EnableEnhancedInstructionSet>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\core\Assert.cpp" />
+    <ClCompile Include="src\core\Bootstrap.cpp" />
+    <ClCompile Include="src\core\Config.cpp" />
+    <ClCompile Include="src\core\FrameDispatcher.cpp" />
+    <ClCompile Include="src\core\Log.cpp" />
+    <ClCompile Include="src\core\ModuleRegistry.cpp" />
+    <ClCompile Include="src\core\ServiceRegistry.cpp" />
+    <ClCompile Include="src\core\Version.cpp" />
+    <ClCompile Include="src\world\WorldConfiguration.cpp" />
+    <ClCompile Include="src\world\WorldManager.cpp" />
+    <ClCompile Include="src\world\WorldQueryService.cpp" />
+    <ClCompile Include="src\world\EntityRegistry.cpp" />
+    <ClCompile Include="src\world\EntityRegistryConfig.cpp" />
+    <ClCompile Include="src\world\EntityRegistryService.cpp" />
+    <ClCompile Include="src\world\BubbleConfiguration.cpp" />
+    <ClCompile Include="src\world\BubbleManager.cpp" />
+    <ClCompile Include="src\world\LocalPlayerPositionSource.cpp" />
+    <ClCompile Include="src\world\BubbleManagerService.cpp" />
+    <ClCompile Include="src\world\TransitionManager.cpp" />
+    <ClCompile Include="src\world\TransitionManagerService.cpp" />
+    <ClCompile Include="src\net\NetworkingConfig.cpp" />
+    <ClCompile Include="src\net\TransportConfig.cpp" />
+    <ClCompile Include="src\net\PacketHeader.cpp" />
+    <ClCompile Include="src\net\MessageRegistry.cpp" />
+    <ClCompile Include="src\net\MessageRegistryService.cpp" />
+    <ClCompile Include="src\net\ConnectionTable.cpp" />
+    <ClCompile Include="src\net\Handshake.cpp" />
+    <ClCompile Include="src\net\Session.cpp" />
+    <ClCompile Include="src\net\SessionService.cpp" />
+    <ClCompile Include="src\net\Reliability.cpp" />
+    <ClCompile Include="src\net\Fragmentation.cpp" />
+    <ClCompile Include="src\net\HostServer.cpp" />
+    <ClCompile Include="src\net\TransportService.cpp" />
+    <ClCompile Include="src\net\NetworkDiagnostics.cpp" />
+    <ClCompile Include="src\net\NetworkingService.cpp" />
+    <!-- Platform sockets: the only TU including OS socket (Winsock) headers.
+         Compiles in the engine build only; excluded from the test build
+         (tests link tests\support\NullPlatformTransport.cpp instead). Winsock is
+         in the Windows SDK (default include path); ws2_32.lib is linked via a
+         TU-scoped #pragma comment(lib) in the .cpp (One Platform Boundary). -->
+    <ClCompile Include="src\adapters\PlatformSockets.cpp" />
+    <ClCompile Include="src\player\PlayerConfiguration.cpp" />
+    <ClCompile Include="src\snapshot\SnapshotConfiguration.cpp" />
+    <ClCompile Include="src\player\PlayerRegistry.cpp" />
+    <ClCompile Include="src\player\PlayerLifecycle.cpp" />
+    <ClCompile Include="src\player\PlayerSessionObserver.cpp" />
+    <ClCompile Include="src\player\PlayerManager.cpp" />
+    <ClCompile Include="src\player\NetworkedPlayerPositionSource.cpp" />
+    <ClCompile Include="src\player\PlayerManagerService.cpp" />
+    <ClCompile Include="src\player\PlayerDiagnostics.cpp" />
+    <!-- Engine adapter layer: the only TU including X-Ray headers.
+         Compiles with engine include paths; excluded from the test build
+         (tests link tests\support\NullEngineAdapters.cpp instead). -->
+    <ClCompile Include="src\adapters\EngineAdapters.cpp">
+      <!-- Third-party include root for engine headers. xrCore/xrMemory_subst_msvc.h
+           and xr_resource.h include <fast_dynamic_cast/fast_dynamic_cast.hpp>, which
+           lives under Engine/xray-monolith/src/3rd party. The engine resolves this via
+           the "..\src\3rd party" entry on IncludePath in Common.props (line 19); since
+           this TU does not import Common.props, that root is replicated here. Scoped to
+           the adapter TU only because it is the sole unit that includes engine headers
+           (One Engine Boundary). -->
+      <!-- Sprint-005: the ALife switch gateway reaches CALifeSimulator /
+           CSE_ALifeDynamicObject, which live in xrGame and xrServerEntities. Both
+           roots are added here (scoped to this TU only — One Engine Boundary). -->
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\xrEngine;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\xrGame;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\xrGame\vs2022;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\xrServerEntities;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\xrCore;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\3rd party;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\src\3rd party\luajit-2\src;$(MSBuildThisFileDirectory)..\Engine\xray-monolith\sdk\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- Engine compatibility defines. This TU is the only one that includes
+           X-Ray headers, so it must replicate the engine's own compile-time
+           opt-ins. These are NOT invented by STALKER-MP; they mirror the engine.
+           _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS:
+             Why it exists: xrCore.h (line 197, under #ifndef _EDITOR) includes the
+               deprecated MSVC extension header <hash_map>, and _stl_extensions.h
+               derives xr_hash_map from stdext::hash_map. Modern MSVC STL emits a
+               deprecation diagnostic (STL4041) for these unless this macro is defined.
+             Where the engine defines it: Engine/xray-monolith/src/Common.props (line 30),
+               inherited by every engine project (xrCore, xrEngine, etc.).
+             Why STALKER-MP requires it: the adapter TU reproduces the engine include
+               chain but does not import Common.props, so the opt-in must be replicated
+               here for <hash_map> to compile the same way it does in the engine build. -->
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;XRGAME_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <!-- Permissive (non-conformant) name lookup for engine headers. xrCore's
+           _vector3d.h / _matrix.h templates reference the global `Device`
+           (declared in xrEngine/device.h, a layer above xrCore) as a non-dependent
+           name. Under /permissive- these bind at template definition time and fail
+           because Device is not visible when xrCore parses. The engine compiles these
+           headers in default permissive mode (it sets no ConformanceMode anywhere:
+           Common.props, xrCore.vcxproj, xrEngine.vcxproj), which defers the lookup to
+           instantiation that never occurs. This mirrors the engine's own compile
+           environment. Scoped to the adapter TU only; all Sprint-002 source keeps the
+           project-wide ConformanceMode=true (/permissive-) set above (One Engine Boundary). -->
+      <ConformanceMode>false</ConformanceMode>
+    </ClCompile>
+    <ClCompile Include="src\common\FileSystemUtil.cpp" />
+    <ClCompile Include="src\common\StringUtil.cpp" />
+    <ClCompile Include="src\common\Time.cpp" />
+    <ClCompile Include="src\common\Uuid.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\stalkermp\StalkerMP.h" />
+    <ClInclude Include="include\stalkermp\core\Assert.h" />
+    <ClInclude Include="include\stalkermp\core\Config.h" />
+    <ClInclude Include="include\stalkermp\core\Error.h" />
+    <ClInclude Include="include\stalkermp\core\Expected.h" />
+    <ClInclude Include="include\stalkermp\core\Log.h" />
+    <ClInclude Include="include\stalkermp\core\ModuleRegistry.h" />
+    <ClInclude Include="include\stalkermp\core\ServiceRegistry.h" />
+    <ClInclude Include="include\stalkermp\core\Version.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\IInitializable.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\IManager.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\IModule.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\ISerializable.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\IService.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\ISubsystem.h" />
+    <ClInclude Include="include\stalkermp\core\interfaces\ITickable.h" />
+    <ClInclude Include="include\stalkermp\adapters\EngineAdapters.h" />
+    <ClInclude Include="include\stalkermp\core\FrameDispatcher.h" />
+    <ClInclude Include="include\stalkermp\world\EntityView.h" />
+    <ClInclude Include="include\stalkermp\world\EntityHandle.h" />
+    <ClInclude Include="include\stalkermp\world\EntityMetadata.h" />
+    <ClInclude Include="include\stalkermp\world\EntityRecord.h" />
+    <ClInclude Include="include\stalkermp\world\EntityRegistry.h" />
+    <ClInclude Include="include\stalkermp\world\EntityRegistryConfig.h" />
+    <ClInclude Include="include\stalkermp\world\EntityRegistryService.h" />
+    <ClInclude Include="include\stalkermp\world\BubbleTypes.h" />
+    <ClInclude Include="include\stalkermp\world\TransitionTypes.h" />
+    <ClInclude Include="include\stalkermp\world\IAlifeSwitchGateway.h" />
+    <ClInclude Include="include\stalkermp\adapters\NullAlifeSwitchGateway.h" />
+    <ClInclude Include="include\stalkermp\world\TransitionIntentStore.h" />
+    <ClInclude Include="include\stalkermp\world\TransitionManager.h" />
+    <ClInclude Include="include\stalkermp\world\TransitionManagerService.h" />
+    <ClInclude Include="include\stalkermp\net\NetTypes.h" />
+    <ClInclude Include="include\stalkermp\net\ProtocolConstants.h" />
+    <ClInclude Include="include\stalkermp\net\PacketHeader.h" />
+    <ClInclude Include="include\stalkermp\net\ByteCursor.h" />
+    <ClInclude Include="include\stalkermp\net\NetworkingConfig.h" />
+    <ClInclude Include="include\stalkermp\net\TransportConfig.h" />
+    <ClInclude Include="include\stalkermp\net\ITransport.h" />
+    <ClInclude Include="include\stalkermp\net\MockTransport.h" />
+    <ClInclude Include="include\stalkermp\net\LoopbackTransport.h" />
+    <ClInclude Include="include\stalkermp\net\MessageRegistry.h" />
+    <ClInclude Include="include\stalkermp\net\MessageRegistryService.h" />
+    <ClInclude Include="include\stalkermp\net\Connection.h" />
+    <ClInclude Include="include\stalkermp\net\ConnectionTable.h" />
+    <ClInclude Include="include\stalkermp\net\IConnectionAuthenticator.h" />
+    <ClInclude Include="include\stalkermp\net\Handshake.h" />
+    <ClInclude Include="include\stalkermp\net\ISessionObserver.h" />
+    <ClInclude Include="include\stalkermp\net\Session.h" />
+    <ClInclude Include="include\stalkermp\net\SessionService.h" />
+    <ClInclude Include="include\stalkermp\net\PacketQueues.h" />
+    <ClInclude Include="include\stalkermp\net\Reliability.h" />
+    <ClInclude Include="include\stalkermp\net\Fragmentation.h" />
+    <ClInclude Include="include\stalkermp\net\HostServer.h" />
+    <ClInclude Include="include\stalkermp\net\TransportService.h" />
+    <ClInclude Include="include\stalkermp\net\NetworkDiagnostics.h" />
+    <ClInclude Include="include\stalkermp\net\NetworkingService.h" />
+    <ClInclude Include="include\stalkermp\adapters\PlatformTransport.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerTypes.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerConfiguration.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerRegistry.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerLifecycle.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerDeltaQueue.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerSessionObserver.h" />
+    <ClInclude Include="include\stalkermp\player\IPlayerSpawnGateway.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerManager.h" />
+    <ClInclude Include="include\stalkermp\player\NetworkedPlayerPositionSource.h" />
+    <ClInclude Include="include\stalkermp\adapters\PlayerSpawnGateway.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerManagerService.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerMessageIds.h" />
+    <ClInclude Include="include\stalkermp\player\PlayerDiagnostics.h" />
+    <ClInclude Include="include\stalkermp\snapshot\SnapshotTypes.h" />
+    <ClInclude Include="include\stalkermp\snapshot\SnapshotConfiguration.h" />
+    <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
+    <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
+    <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />
+    <ClInclude Include="include\stalkermp\world\LocalPlayerPositionSource.h" />
+    <ClInclude Include="include\stalkermp\world\BubbleManagerService.h" />
+    <ClInclude Include="include\stalkermp\world\EnvironmentService.h" />
+    <ClInclude Include="include\stalkermp\world\IClockService.h" />
+    <ClInclude Include="include\stalkermp\world\IEntitySource.h" />
+    <ClInclude Include="include\stalkermp\world\IEnvironmentService.h" />
+    <ClInclude Include="include\stalkermp\world\IEnvironmentSource.h" />
+    <ClInclude Include="include\stalkermp\world\ISpatialQueries.h" />
+    <ClInclude Include="include\stalkermp\world\IWorldQueries.h" />
+    <ClInclude Include="include\stalkermp\world\WorldQueryService.h" />
+    <ClInclude Include="include\stalkermp\world\IWorld.h" />
+    <ClInclude Include="include\stalkermp\world\SimulationClock.h" />
+    <ClInclude Include="include\stalkermp\world\WorldConfiguration.h" />
+    <ClInclude Include="include\stalkermp\world\WorldContext.h" />
+    <ClInclude Include="include\stalkermp\world\WorldManager.h" />
+    <ClInclude Include="include\stalkermp\world\WorldModule.h" />
+    <ClInclude Include="include\stalkermp\world\WorldTime.h" />
+    <ClInclude Include="include\stalkermp\world\WorldTypes.h" />
+    <ClInclude Include="include\stalkermp\common\FileSystemUtil.h" />
+    <ClInclude Include="include\stalkermp\common\Hash.h" />
+    <ClInclude Include="include\stalkermp\common\Math.h" />
+    <ClInclude Include="include\stalkermp\common\StringUtil.h" />
+    <ClInclude Include="include\stalkermp\common\Time.h" />
+    <ClInclude Include="include\stalkermp\common\Uuid.h" />
+  </ItemGroup>
+  <!-- Engine ABI alignment (see Documentation/Engine_Integration/Build_Model.md).
+       Imported for engine-linked (non-Debug / Release-family) configurations only:
+       Release, Release-AVX, ProfiledDX11, Verified. Placed after the inline
+       ItemDefinitionGroups so its ABI metadata (RuntimeLibrary, ConformanceMode,
+       ExceptionHandling, _SECURE_SCL, etc.) is authoritative. Debug is intentionally
+       left untouched (standalone-test ABI). No configurations are added or removed. -->
+  <ImportGroup Label="EngineAbi" Condition="'$(Configuration)'!='Debug'">
+    <Import Project="build\EngineAbi.props" />
+  </ImportGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

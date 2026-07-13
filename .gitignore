@@ -1,0 +1,160 @@
+# ============================================================================
+# STALKER-MP — .gitignore
+# Visual Studio / MSBuild / C++ / X-Ray (S.T.A.L.K.E.R.) engine development
+# ============================================================================
+
+# ---- Build output directories ---------------------------------------------
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+[Xx]64/
+[Xx]86/
+[Ww]in32/
+build/
+_build/
+out/
+Build/
+BuildOutput/
+**/_build/
+**/intermediate/
+**/Intermediate/
+
+# ---- Compiled objects / libraries / executables ---------------------------
+*.obj
+*.o
+*.lo
+*.slo
+*.lib
+*.a
+*.la
+*.dll
+*.so
+*.so.*
+*.dylib
+*.exe
+*.out
+*.app
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.res
+*.pch
+*.gch
+*.ipch
+*.aps
+*.sbr
+*.bsc
+*.ncb
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# ---- MSBuild / Visual Studio ----------------------------------------------
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.vcxproj.user
+*.csproj.user
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishsettings
+*.rsp
+*.log
+*.tli
+*.tmp
+*.vspscc
+*.vssscc
+[Bb]ootstrapper/
+enc_temp_folder/
+ipch/
+
+# ---- CMake (if used) ------------------------------------------------------
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+_deps/
+
+# ---- IDE / editor caches --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---- Test / build logs & generated artifacts ------------------------------
+build_log*.txt
+engine_build_log*.txt
+rebuild_*.txt
+test_containers.obj
+*.testlog
+test-results/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+CrashDumps/
+*.dmp
+
+# ---- Generated runtime config / logs --------------------------------------
+*.log
+logs/
+server.cfg
+client.cfg
+development.cfg
+*.local.cfg
+
+# ---- X-Ray / S.T.A.L.K.E.R. engine (external upstream dependency) ----------
+# The X-Ray Monolith / xray-16 engine is a large upstream dependency and is NOT
+# vendored in this repository. Obtain it separately (see README > Build
+# Requirements) and place it under Engine/. It is excluded here to keep the
+# STALKER-MP framework repository focused and reasonably sized.
+Engine/
+*.spawn
+*.xrf
+*.ogf
+*.omf
+*.dds
+*.thm
+*.geom
+*.dxvk-cache
+
+# ---- Third-party build artifacts (keep vendored sources, drop their builds)-
+third_party/**/build/
+third_party/**/_build/
+
+# ---- AI collaboration / handoff artifacts (not part of the public codebase) -
+# Internal AI-assisted workflow notes, session logs, and handoff docs are kept
+# local and are NOT published to the public repository.
+AI_START_HERE.md
+**/AI_START_HERE.md
+AI_Bootstrap.md
+AI_CONTEXT.md
+Documentation/AI/
+
+# ---- Non-project / marketing assets (not part of the public codebase) ------
+linkedin_assets/
+LinkedIn_Assets/
+marketing/
+promo/
+
+# ---- Misc -----------------------------------------------------------------
+*.bak
+*.orig
+*.rej
+node_modules/
+Documentation/SPRINTS/.movetest_ignore/

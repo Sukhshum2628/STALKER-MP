@@ -1,0 +1,242 @@
+-- S.T.A.L.K.E.R. Anomaly Engine Validation Test Suite
+-- Registers F1-F5 keys to trigger Experiments 1-5.
+
+local spawned_stalkers = {}
+local active_experiments = {}
+
+function on_game_start()
+    RegisterScriptCallback("on_key_press", on_key_press)
+    RegisterScriptCallback("actor_on_update", actor_on_update)
+end
+
+function on_key_press(key)
+    -- DIK Keycodes:
+    -- F1 = 59, F2 = 60, F3 = 61, F4 = 62, F5 = 63
+    if key == 59 then
+        start_experiment_1()
+    elseif key == 60 then
+        start_experiment_2()
+    elseif key == 61 then
+        start_experiment_3()
+    elseif key == 62 then
+        start_experiment_4()
+    elseif key == 63 then
+        start_experiment_5()
+    end
+end
+
+function actor_on_update(binder, delta)
+    local tg = time_global()
+    
+    -- Experiment 1 Tick: Drive movement smoothly along a circle
+    if active_experiments[1] and spawned_stalkers[1] then
+        local npc = level.object_by_id(spawned_stalkers[1])
+        if npc and npc:alive() then
+            -- Throttle path updates to 500ms to allow C++ detail path to build
+            if not npc.__path_tmr or tg > npc.__path_tmr then
+                npc.__path_tmr = tg + 500
+                
+                local center = db.actor:position()
+                local radius = 6
+                local speed = 0.00015 -- Slower, realistic walk speed
+                local angle = tg * speed
+                local target_pos = vector():set(
+                    center.x + math.cos(angle) * radius,
+                    center.y,
+                    center.z + math.sin(angle) * radius
+                )
+                local vid = level.vertex_id(target_pos)
+                if vid and vid < 4294967295 then
+                    npc:set_path_type(game_object.line)
+                    npc:set_dest_level_vertex_id(vid)
+                    npc:set_movement_type(move.run)
+                    -- Set State Manager target state to play walk/run animations
+                    state_mgr.set_state(npc, "run")
+                end
+            end
+        end
+    end
+
+    -- Experiment 3 Tick: Direct input positioning update
+    if active_experiments[3] and spawned_stalkers[3] then
+        local npc = level.object_by_id(spawned_stalkers[3])
+        if npc and npc:alive() then
+            -- Limit updates to 250ms to prevent engine fighting
+            if not npc.__path_tmr or tg > npc.__path_tmr then
+                npc.__path_tmr = tg + 250
+                
+                local actor_pos = db.actor:position()
+                local dir = vector():set(actor_pos.x - npc:position().x, 0, actor_pos.z - npc:position().z):normalize()
+                local target_pos = vector():set(
+                    npc:position().x + dir.x * 1.5,
+                    npc:position().y,
+                    npc:position().z + dir.z * 1.5
+                )
+                local vid = level.vertex_id(target_pos)
+                if vid and vid < 4294967295 then
+                    npc:set_path_type(game_object.line)
+                    npc:set_dest_level_vertex_id(vid)
+                    npc:set_movement_type(move.walk)
+                    state_mgr.set_state(npc, "walk", nil, nil, {look_object = db.actor})
+                end
+            end
+        end
+    end
+
+    -- Experiment 5 Tick: Multi-stalker synchronized action frame tick
+    if active_experiments[5] then
+        for i, id in ipairs(spawned_stalkers[5] or {}) do
+            local npc = level.object_by_id(id)
+            if npc and npc:alive() then
+                if not npc.__test_tmr or tg > npc.__test_tmr then
+                    npc.__test_tmr = tg + 2000
+                    
+                    local cycle = tg % 6000
+                    if cycle < 2000 then
+                        -- Forces NPC to aim and shoot at actor
+                        state_mgr.set_state(npc, "threat_fire", nil, nil, {look_object = db.actor})
+                    elseif cycle < 4000 then
+                        -- Forces NPC to crouch
+                        state_mgr.set_state(npc, "hide", nil, nil, {look_object = db.actor})
+                    else
+                        -- Forces NPC to stand idle
+                        state_mgr.set_state(npc, "idle", nil, nil, {look_object = db.actor})
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Spawning helpers
+function spawn_stalker_at_look(dist)
+    local actor = db.actor
+    local pos = actor:position()
+    local dir = actor:direction()
+    local target_pos = vector():set(pos.x + dir.x * dist, pos.y, pos.z + dir.z * dist)
+    local vid = level.vertex_id(target_pos)
+    local gvid = actor:game_vertex_id()
+    
+    local se_obj = alife():create("sim_default_stalker_0", target_pos, vid, gvid)
+    if se_obj then
+        printf("--- Validation Suite: Spawned stalker %s with ID %d", se_obj:name(), se_obj.id)
+        return se_obj.id
+    end
+    return nil
+end
+
+-- Experiment 1: Spawn one CAI_Stalker and drive it along a path via Lua
+function start_experiment_1()
+    printf("--- Validation Suite: Starting Experiment 1 (Lua-Driven Movement)")
+    local id = spawn_stalker_at_look(5)
+    if id then
+        spawned_stalkers[1] = id
+        active_experiments[1] = true
+        level.add_call(
+            function() return level.object_by_id(id) ~= nil end,
+            function()
+                local npc = level.object_by_id(id)
+                if npc then
+                    db.storage[id].controlled_by_network = true
+                end
+            end
+        )
+    end
+end
+
+-- Experiment 2: Disable AI planner and force weapon/motion states
+function start_experiment_2()
+    printf("--- Validation Suite: Starting Experiment 2 (State Overrides under Bypassed AI)")
+    local id = spawn_stalker_at_look(5)
+    if id then
+        level.add_call(
+            function()
+                return level.object_by_id(id) ~= nil
+            end,
+            function()
+                local npc = level.object_by_id(id)
+                if npc then
+                    printf("--- Validation Suite: Bypassing GOAP Planner for stalker %d", id)
+                    db.storage[id].controlled_by_network = true
+                    
+                    -- Use the state manager to force a crouched aim/firing state (will unholster and reload weapon if empty)
+                    state_mgr.set_state(npc, "hide_fire", nil, nil, {look_object = db.actor}, {fast_set = true})
+                end
+            end
+        )
+    end
+end
+
+-- Experiment 3: Direct simulated frame inputs (movement + direction)
+function start_experiment_3()
+    printf("--- Validation Suite: Starting Experiment 3 (Per-frame direct movement)")
+    local id = spawn_stalker_at_look(5)
+    if id then
+        spawned_stalkers[3] = id
+        active_experiments[3] = true
+        level.add_call(
+            function() return level.object_by_id(id) ~= nil end,
+            function()
+                local npc = level.object_by_id(id)
+                if npc then
+                    db.storage[id].controlled_by_network = true
+                end
+            end
+        )
+    end
+end
+
+-- Experiment 4: Spawn two network puppets and disable offline transitions
+function start_experiment_4()
+    printf("--- Validation Suite: Starting Experiment 4 (Offline switching prevention)")
+    local id1 = spawn_stalker_at_look(4)
+    local id2 = spawn_stalker_at_look(6)
+    
+    if id1 and id2 then
+        local se1 = alife_object(id1)
+        local se2 = alife_object(id2)
+        if se1 and se2 then
+            se1.controlled_by_network = true
+            -- se2 is normal, so it will go offline
+            printf("--- Validation Suite: Tagged stalker %d to remain online, %d is normal", id1, id2)
+        end
+        
+        -- Set switch distance to 10 meters so we can test within the map boundary
+        alife():switch_distance(10)
+        printf("--- Validation Suite: Set switch distance to 10m. Walk 15 meters away to test offline transitions!")
+    end
+end
+
+-- Experiment 5: Stress test with 10 stalkers under direct script commands
+function start_experiment_5()
+    printf("--- Validation Suite: Starting Experiment 5 (Stress test 10 puppets)")
+    spawned_stalkers[5] = {}
+    local actor = db.actor
+    local pos = actor:position()
+    local dir = actor:direction()
+    
+    for i = 1, 10 do
+        local angle = (i - 5.5) * 0.25 -- Spread in an arc 
+        local rx = dir.x * math.cos(angle) - dir.z * math.sin(angle)
+        local rz = dir.x * math.sin(angle) + dir.z * math.cos(angle)
+        
+        local target_pos = vector():set(pos.x + rx * 6, pos.y, pos.z + rz * 6)
+        local vid = level.vertex_id(target_pos)
+        local gvid = actor:game_vertex_id()
+        
+        local se_obj = alife():create("sim_default_stalker_0", target_pos, vid, gvid)
+        if se_obj then
+            table.insert(spawned_stalkers[5], se_obj.id)
+            level.add_call(
+                function() return level.object_by_id(se_obj.id) ~= nil end,
+                function()
+                    local npc = level.object_by_id(se_obj.id)
+                    if npc then
+                        db.storage[se_obj.id].controlled_by_network = true
+                    end
+                end
+            )
+        end
+    end
+    active_experiments[5] = true
+end

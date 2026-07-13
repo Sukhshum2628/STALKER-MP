@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  STALKER-MP unit test runner (Sprint-001, §7.14; GoogleTest per
+  Revision-1 R3, vendored in ..\third_party\googletest).
+  Compiles the module sources together with the tests (no dependency on the
+  engine build tree), so tests build and run in Debug independently of the
+  engine's configuration set. Part of Multiplayer/xrMP.sln, not of the
+  engine solution.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B7F4D2C3-8E61-4F0A-A54D-9C0E7F6A2B21}</ProjectGuid>
+    <RootNamespace>xrMP_Tests</RootNamespace>
+    <ProjectName>xrMP_Tests</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'!='Debug'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\_build\tests\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\_build\intermediate\tests\$(Configuration)\</IntDir>
+    <TargetName>xrMP_Tests</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\include;$(MSBuildThisFileDirectory)..\third_party\googletest\include;$(MSBuildThisFileDirectory)..\third_party\googletest;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <!-- Module sources under test. -->
+    <ClCompile Include="..\src\core\Assert.cpp" />
+    <ClCompile Include="..\src\core\Bootstrap.cpp" />
+    <ClCompile Include="..\src\core\Config.cpp" />
+    <ClCompile Include="..\src\core\FrameDispatcher.cpp" />
+    <ClCompile Include="..\src\core\Log.cpp" />
+    <ClCompile Include="..\src\core\ModuleRegistry.cpp" />
+    <ClCompile Include="..\src\core\ServiceRegistry.cpp" />
+    <ClCompile Include="..\src\core\Version.cpp" />
+    <ClCompile Include="..\src\world\WorldConfiguration.cpp" />
+    <ClCompile Include="..\src\world\WorldManager.cpp" />
+    <ClCompile Include="..\src\world\WorldQueryService.cpp" />
+    <ClCompile Include="..\src\world\EntityRegistry.cpp" />
+    <ClCompile Include="..\src\world\EntityRegistryConfig.cpp" />
+    <ClCompile Include="..\src\world\EntityRegistryService.cpp" />
+    <ClCompile Include="..\src\world\BubbleConfiguration.cpp" />
+    <ClCompile Include="..\src\world\BubbleManager.cpp" />
+    <ClCompile Include="..\src\world\LocalPlayerPositionSource.cpp" />
+    <ClCompile Include="..\src\world\BubbleManagerService.cpp" />
+    <ClCompile Include="..\src\world\TransitionManager.cpp" />
+    <ClCompile Include="..\src\world\TransitionManagerService.cpp" />
+    <ClCompile Include="..\src\net\NetworkingConfig.cpp" />
+    <ClCompile Include="..\src\net\TransportConfig.cpp" />
+    <ClCompile Include="..\src\player\PlayerConfiguration.cpp" />
+    <ClCompile Include="..\src\snapshot\SnapshotConfiguration.cpp" />
+    <ClCompile Include="..\src\player\PlayerRegistry.cpp" />
+    <ClCompile Include="..\src\player\PlayerLifecycle.cpp" />
+    <ClCompile Include="..\src\player\PlayerSessionObserver.cpp" />
+    <ClCompile Include="..\src\player\PlayerManager.cpp" />
+    <ClCompile Include="..\src\player\NetworkedPlayerPositionSource.cpp" />
+    <ClCompile Include="..\src\player\PlayerManagerService.cpp" />
+    <ClCompile Include="..\src\player\PlayerDiagnostics.cpp" />
+    <ClCompile Include="..\src\net\PacketHeader.cpp" />
+    <ClCompile Include="..\src\net\MessageRegistry.cpp" />
+    <ClCompile Include="..\src\net\MessageRegistryService.cpp" />
+    <ClCompile Include="..\src\net\ConnectionTable.cpp" />
+    <ClCompile Include="..\src\net\Handshake.cpp" />
+    <ClCompile Include="..\src\net\Session.cpp" />
+    <ClCompile Include="..\src\net\SessionService.cpp" />
+    <ClCompile Include="..\src\net\Reliability.cpp" />
+    <ClCompile Include="..\src\net\Fragmentation.cpp" />
+    <ClCompile Include="..\src\net\HostServer.cpp" />
+    <ClCompile Include="..\src\net\TransportService.cpp" />
+    <ClCompile Include="..\src\net\NetworkDiagnostics.cpp" />
+    <ClCompile Include="..\src\net\NetworkingService.cpp" />
+    <!-- Null engine adapters: test-build stand-in for src\adapters. -->
+    <ClCompile Include="support\NullEngineAdapters.cpp" />
+    <!-- Test-build platform transport: the null/mock factory (no OS sockets).
+         The engine-only src\adapters\PlatformSockets.cpp is NOT linked here. -->
+    <ClCompile Include="support\NullPlatformTransport.cpp" />
+    <ClCompile Include="support\NullPlayerSpawnGateway.cpp" />
+    <ClCompile Include="..\src\common\FileSystemUtil.cpp" />
+    <ClCompile Include="..\src\common\StringUtil.cpp" />
+    <ClCompile Include="..\src\common\Time.cpp" />
+    <ClCompile Include="..\src\common\Uuid.cpp" />
+    <!-- GoogleTest (vendored). Third-party code builds without /W4 /WX. -->
+    <ClCompile Include="..\third_party\googletest\src\gtest-all.cc">
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+    </ClCompile>
+    <!-- Tests. -->
+    <ClCompile Include="BootstrapTests.cpp" />
+    <ClCompile Include="CommonTests.cpp" />
+    <ClCompile Include="ConfigTests.cpp" />
+    <ClCompile Include="ExpectedTests.cpp" />
+    <ClCompile Include="FrameDispatcherTests.cpp" />
+    <ClCompile Include="WorldQueryTests.cpp" />
+    <ClCompile Include="WorldTests.cpp" />
+    <ClCompile Include="EntityRegistryTests.cpp" />
+    <ClCompile Include="LogTests.cpp" />
+    <ClCompile Include="ModuleRegistryTests.cpp" />
+    <ClCompile Include="ServiceRegistryTests.cpp" />
+    <ClCompile Include="BubbleTests.cpp" />
+    <ClCompile Include="TransitionTests.cpp" />
+    <ClCompile Include="NetworkTests.cpp" />
+    <ClCompile Include="PlayerTests.cpp" />
+    <ClCompile Include="SnapshotTests.cpp" />
+    <ClCompile Include="TestMain.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
