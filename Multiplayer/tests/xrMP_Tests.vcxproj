@@ -98,6 +98,7 @@
     <ClCompile Include="..\src\snapshot\SnapshotBuilder.cpp" />
     <ClCompile Include="..\src\snapshot\SnapshotQueue.cpp" />
     <ClCompile Include="..\src\snapshot\SnapshotManager.cpp" />
+    <ClCompile Include="..\src\snapshot\SnapshotDiagnostics.cpp" />
     <ClCompile Include="..\src\player\PlayerRegistry.cpp" />
     <ClCompile Include="..\src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="..\src\player\PlayerSessionObserver.cpp" />

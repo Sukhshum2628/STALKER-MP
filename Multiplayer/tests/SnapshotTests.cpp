@@ -18,6 +18,7 @@
 #include "stalkermp/snapshot/SnapshotQueue.h"
 #include "stalkermp/snapshot/SnapshotManager.h"
 #include "stalkermp/adapters/EntitySnapshotMarshal.h"
+#include "stalkermp/snapshot/SnapshotDiagnostics.h"
 #include "stalkermp/adapters/EntitySnapshotSource.h"
 #include "stalkermp/world/IEntitySnapshotSource.h"
 #include "stalkermp/world/IEnvironmentSource.h"
@@ -1113,4 +1114,159 @@ TEST(EngineEntitySnapshotMarshalStep9, DeterministicCaptureBehavior)
         EXPECT_EQ(a[i].state, b[i].state);
         EXPECT_FLOAT_EQ(a[i].position.x, b[i].position.x);
     }
+}
+
+// ============================================================================
+// Step 11 — SnapshotDiagnostics (read-only inspector)
+// ============================================================================
+
+namespace
+{
+    // Build a manager rig, tick it `ticks` times, and return the rig (with a joined
+    // player so player counts are non-trivial). Reuses the Step-6/8 fakes.
+    struct DiagRig
+    {
+        FakeEntitySource entities;
+        FakeEnvSource env;
+        BuilderSpawnGateway gw;
+        net::Session session{8};
+        player::PlayerManager players;
+        snapshot::SnapshotManager manager;
+
+        DiagRig(std::uint32_t entityCount)
+            : entities(entityCount),
+              players(BuilderPlayerConfig(8), gw, session),
+              manager(snapshot::SnapshotConfiguration{}, entities, players, env)
+        {
+        }
+    };
+} // namespace
+
+// --- Statistics correctness: mirrors the manager's aggregate tallies ----------
+TEST(SnapshotDiagnosticsStep11, StatisticsCorrectness)
+{
+    DiagRig rig{3};
+    ASSERT_TRUE(rig.players.RequestJoin(net::ConnectionId{5}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.manager.Tick(0.016);
+    rig.manager.Tick(0.016);
+
+    const snapshot::SnapshotDiagnostics diag{rig.manager};
+    const auto stats = diag.Statistics();
+    const auto expected = rig.manager.Statistics();
+    EXPECT_EQ(stats.built, expected.built);
+    EXPECT_EQ(stats.published, 2u);
+    EXPECT_EQ(stats.entityCount, 3u);
+    EXPECT_EQ(stats.playerCount, 1u);
+    EXPECT_EQ(stats.poolCapacity, snapshot::SnapshotConfiguration{}.poolCapacity);
+}
+
+// --- Queue reporting ----------------------------------------------------------
+TEST(SnapshotDiagnosticsStep11, QueueReporting)
+{
+    DiagRig rig{2};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    const snapshot::SnapshotDiagnostics diag{rig.manager};
+
+    const auto before = diag.QueueStatus();
+    EXPECT_EQ(before.depth, 0u);
+    EXPECT_EQ(before.published, 0u);
+    EXPECT_FALSE(before.hasCurrent);
+
+    rig.manager.Tick(0.016);
+    rig.manager.Tick(0.016);
+    rig.manager.Tick(0.016);
+    const auto after = diag.QueueStatus();
+    EXPECT_EQ(after.depth, 1u);       // latest-wins
+    EXPECT_EQ(after.published, 3u);
+    EXPECT_TRUE(after.hasCurrent);
+    EXPECT_EQ(after.currentTick, 3u);
+    EXPECT_EQ(after.currentId.value, rig.manager.LatestMetadata().id.value);
+}
+
+// --- Memory reporting ---------------------------------------------------------
+TEST(SnapshotDiagnosticsStep11, MemoryReporting)
+{
+    DiagRig rig{2};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    const snapshot::SnapshotDiagnostics diag{rig.manager};
+    rig.manager.Tick(0.016);
+
+    const auto mem = diag.MemoryUsage();
+    EXPECT_EQ(mem.poolCapacity, snapshot::SnapshotConfiguration{}.poolCapacity);
+    EXPECT_GE(mem.poolInUse, 1u); // the current published snapshot holds a buffer
+    EXPECT_EQ(mem.poolFree, mem.poolCapacity - mem.poolInUse);
+}
+
+// --- Snapshot dump correctness ------------------------------------------------
+TEST(SnapshotDiagnosticsStep11, SnapshotDumpCorrectness)
+{
+    DiagRig rig{4};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.manager.Tick(0.016);
+    const snapshot::SnapshotDiagnostics diag{rig.manager};
+
+    const snapshot::SnapshotId currentId = rig.manager.LatestMetadata().id;
+    const auto dump = diag.DumpSnapshot(currentId);
+    EXPECT_TRUE(dump.available);
+    EXPECT_EQ(dump.metadata.id.value, currentId.value);
+    EXPECT_EQ(dump.entityCount, 4u);
+    EXPECT_FALSE(dump.text.empty());
+
+    // A non-current / unknown id is not available.
+    const auto missing = diag.DumpSnapshot(snapshot::SnapshotId{999999});
+    EXPECT_FALSE(missing.available);
+    EXPECT_EQ(missing.entityCount, 0u);
+}
+
+// --- Consistency validation ---------------------------------------------------
+TEST(SnapshotDiagnosticsStep11, ConsistencyValidation)
+{
+    DiagRig rig{3};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.manager.Tick(0.016);
+    const snapshot::SnapshotDiagnostics diag{rig.manager};
+
+    const auto consistency = diag.ValidateConsistency();
+    EXPECT_TRUE(consistency.IsHealthy());
+    EXPECT_TRUE(consistency.immutableWhenPublished); // published snapshot is Finalized
+
+    const auto history = diag.BuildHistory();
+    ASSERT_EQ(history.size(), 1u); // latest build recorded, tick-indexed
+    EXPECT_EQ(history[0].tick, 1u);
+    EXPECT_EQ(history[0].entityCount, 3u);
+    EXPECT_FALSE(diag.DescribeState().empty());
+}
+
+// --- Read-only guarantees: diagnostics never mutate manager/queue/pool --------
+TEST(SnapshotDiagnosticsStep11, ReadOnlyGuarantees)
+{
+    DiagRig rig{2};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.manager.Tick(0.016);
+    rig.manager.Tick(0.016);
+
+    const snapshot::SnapshotDiagnostics diag{rig.manager};
+    const auto before = rig.manager.Statistics();
+    const std::uint64_t publishedBefore = rig.manager.Queue().Published();
+    const std::size_t depthBefore = rig.manager.Queue().Depth();
+
+    // Exercise every accessor repeatedly.
+    for (int i = 0; i < 3; ++i)
+    {
+        (void)diag.Statistics();
+        (void)diag.DescribeState();
+        (void)diag.DumpSnapshot(rig.manager.LatestMetadata().id);
+        (void)diag.BuildHistory();
+        (void)diag.QueueStatus();
+        (void)diag.MemoryUsage();
+        (void)diag.ValidateConsistency();
+    }
+
+    const auto after = rig.manager.Statistics();
+    EXPECT_EQ(after.built, before.built);           // unchanged by observation
+    EXPECT_EQ(after.published, before.published);
+    EXPECT_EQ(rig.manager.Queue().Published(), publishedBefore);
+    EXPECT_EQ(rig.manager.Queue().Depth(), depthBefore);
 }
