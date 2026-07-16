@@ -122,7 +122,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Test Status
 
-- **355 / 355 build tests passing** (Release x64) on **GCC** and **MSVC** **Game testing has not started yet**.
+- **355 / 355 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.
