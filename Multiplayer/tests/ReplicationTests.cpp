@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "stalkermp/core/Config.h"
+#include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
 
 using namespace stalkermp;
@@ -138,4 +140,118 @@ TEST(ReplicationTypesStep1, ChannelStateOutcomeNamesTotal)
     EXPECT_STREQ(replication::ReplicationOutcomeName(replication::ReplicationOutcome::Overflow), "Overflow");
     EXPECT_STREQ(replication::ReplicationOutcomeName(replication::ReplicationOutcome::NotRelevant), "NotRelevant");
     EXPECT_STREQ(replication::ReplicationOutcomeName(static_cast<replication::ReplicationOutcome>(200)), "Unknown");
+}
+
+// ============================================================================
+// Step 2 — ReplicationConfiguration::FromConfig
+// ============================================================================
+
+// --- Missing [replication] section => all documented defaults -----------------
+TEST(ReplicationConfigStep2, DefaultsWhenSectionAbsent)
+{
+    core::ConfigStore store;
+    const auto r = replication::ReplicationConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.maxClients, 64u);
+    EXPECT_EQ(c.maxEntitiesPerUpdate, 1024u);
+    EXPECT_EQ(c.maxPlayersPerUpdate, 64u);
+    EXPECT_EQ(c.reliableQueueDepth, 256u);
+    EXPECT_EQ(c.unreliableQueueDepth, 512u);
+    EXPECT_EQ(c.retryLimit, 5u);
+    EXPECT_EQ(c.bandwidthBudgetBytesPerTick, 65536u);
+    EXPECT_EQ(c.interestRadiusMeters, 150u);
+    EXPECT_EQ(c.updateBudgetTicks, 0u);
+    EXPECT_EQ(c.version, 1u);
+}
+
+// --- Each field parses a valid supplied value (override) ----------------------
+TEST(ReplicationConfigStep2, OverridesParsed)
+{
+    core::ConfigStore store;
+    store.Set("replication", "max_clients", "128");
+    store.Set("replication", "max_entities_per_update", "2048");
+    store.Set("replication", "max_players_per_update", "32");
+    store.Set("replication", "reliable_queue_depth", "300");
+    store.Set("replication", "unreliable_queue_depth", "600");
+    store.Set("replication", "retry_limit", "8");
+    store.Set("replication", "bandwidth_budget_bytes_per_tick", "131072");
+    store.Set("replication", "interest_radius_meters", "200");
+    store.Set("replication", "update_budget_ticks", "3");
+    store.Set("replication", "version", "2");
+    const auto r = replication::ReplicationConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.maxClients, 128u);
+    EXPECT_EQ(c.maxEntitiesPerUpdate, 2048u);
+    EXPECT_EQ(c.maxPlayersPerUpdate, 32u);
+    EXPECT_EQ(c.reliableQueueDepth, 300u);
+    EXPECT_EQ(c.unreliableQueueDepth, 600u);
+    EXPECT_EQ(c.retryLimit, 8u);
+    EXPECT_EQ(c.bandwidthBudgetBytesPerTick, 131072u);
+    EXPECT_EQ(c.interestRadiusMeters, 200u);
+    EXPECT_EQ(c.updateBudgetTicks, 3u);
+    EXPECT_EQ(c.version, 2u);
+}
+
+// --- Advisory/unbounded fields accept 0 ---------------------------------------
+TEST(ReplicationConfigStep2, AdvisoryFieldsAcceptZero)
+{
+    core::ConfigStore store;
+    store.Set("replication", "bandwidth_budget_bytes_per_tick", "0");
+    store.Set("replication", "interest_radius_meters", "0");
+    store.Set("replication", "update_budget_ticks", "0");
+    const auto r = replication::ReplicationConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    EXPECT_EQ(r.Value().bandwidthBudgetBytesPerTick, 0u);
+    EXPECT_EQ(r.Value().interestRadiusMeters, 0u);
+    EXPECT_EQ(r.Value().updateBudgetTicks, 0u);
+}
+
+// --- Invalid per-field values are rejected (value outcome) --------------------
+TEST(ReplicationConfigStep2, InvalidValuesRejected)
+{
+    {
+        core::ConfigStore store;
+        store.Set("replication", "max_clients", "0"); // below min 1
+        EXPECT_FALSE(replication::ReplicationConfiguration::FromConfig(store).HasValue());
+    }
+    {
+        core::ConfigStore store;
+        store.Set("replication", "version", "0"); // below min 1
+        EXPECT_FALSE(replication::ReplicationConfiguration::FromConfig(store).HasValue());
+    }
+    {
+        core::ConfigStore store;
+        store.Set("replication", "reliable_queue_depth", "0"); // below min 1
+        EXPECT_FALSE(replication::ReplicationConfiguration::FromConfig(store).HasValue());
+    }
+    {
+        core::ConfigStore store;
+        store.Set("replication", "retry_limit", "-1"); // below min 1
+        EXPECT_FALSE(replication::ReplicationConfiguration::FromConfig(store).HasValue());
+    }
+    {
+        core::ConfigStore store;
+        store.Set("replication", "max_entities_per_update", "0"); // below min 1
+        EXPECT_FALSE(replication::ReplicationConfiguration::FromConfig(store).HasValue());
+    }
+}
+
+// --- Boundary minimums (== 1) are accepted ------------------------------------
+TEST(ReplicationConfigStep2, BoundaryMinimumsAccepted)
+{
+    core::ConfigStore store;
+    store.Set("replication", "max_clients", "1");
+    store.Set("replication", "max_entities_per_update", "1");
+    store.Set("replication", "max_players_per_update", "1");
+    store.Set("replication", "reliable_queue_depth", "1");
+    store.Set("replication", "unreliable_queue_depth", "1");
+    store.Set("replication", "retry_limit", "1");
+    store.Set("replication", "version", "1");
+    const auto r = replication::ReplicationConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    EXPECT_EQ(r.Value().maxClients, 1u);
+    EXPECT_EQ(r.Value().retryLimit, 1u);
+    EXPECT_EQ(r.Value().version, 1u);
 }
