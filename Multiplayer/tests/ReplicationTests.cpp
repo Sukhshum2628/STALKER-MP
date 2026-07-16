@@ -12,6 +12,7 @@
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/replication/IReplicationView.h"
+#include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
 #include "stalkermp/replication/ReplicationUpdate.h"
@@ -377,4 +378,125 @@ TEST(ReplicationUpdateStep3, DeterministicBuild)
     EXPECT_EQ(a.Metadata().reliability, b.Metadata().reliability);
     // No wall-clock in content identity (timestampWallClock unset).
     EXPECT_EQ(a.Metadata().timestampWallClock, b.Metadata().timestampWallClock);
+}
+
+// ============================================================================
+// Step 4 — ReplicationClientRegistry (per-client baselines)
+// ============================================================================
+
+namespace
+{
+    world::PlayerPosition Focus(std::uint32_t playerId, float x)
+    {
+        world::PlayerPosition f{};
+        f.id = world::PlayerId{playerId};
+        f.position = world::Vec3{x, 0.0f, 0.0f};
+        return f;
+    }
+} // namespace
+
+// --- Lifecycle: register / find (by id + connection) / unregister -------------
+TEST(ReplicationClientRegistryStep4, RegisterFindUnregister)
+{
+    replication::ReplicationClientRegistry registry{8};
+    EXPECT_EQ(registry.Count(), 0u);
+    EXPECT_EQ(registry.Capacity(), 8u);
+
+    const auto a = registry.Register(net::ConnectionId{5}, Focus(1, 1.0f));
+    ASSERT_TRUE(a.HasValue());
+    const auto b = registry.Register(net::ConnectionId{9}, Focus(2, 2.0f));
+    ASSERT_TRUE(b.HasValue());
+    EXPECT_EQ(registry.Count(), 2u);
+
+    // Ascending, non-reused ids starting at 1.
+    EXPECT_EQ(a.Value().value, 1u);
+    EXPECT_EQ(b.Value().value, 2u);
+
+    const replication::ClientRecord* byId = registry.FindById(a.Value());
+    ASSERT_NE(byId, nullptr);
+    EXPECT_EQ(byId->connection.value, 5u);
+    const replication::ClientRecord* byConn = registry.FindByConnection(net::ConnectionId{9});
+    ASSERT_NE(byConn, nullptr);
+    EXPECT_EQ(byConn->id.value, 2u);
+    EXPECT_EQ(registry.FindById(replication::ClientId{999}), nullptr);
+
+    // Duplicate connection is rejected (value outcome).
+    EXPECT_FALSE(registry.Register(net::ConnectionId{5}, Focus(3, 3.0f)).HasValue());
+
+    // Unregister; the id is never reused.
+    ASSERT_TRUE(registry.Unregister(a.Value()).HasValue());
+    EXPECT_EQ(registry.Count(), 1u);
+    EXPECT_EQ(registry.FindById(a.Value()), nullptr);
+    EXPECT_FALSE(registry.Unregister(a.Value()).HasValue()); // already gone
+    const auto c = registry.Register(net::ConnectionId{5}, Focus(3, 3.0f));
+    ASSERT_TRUE(c.HasValue());
+    EXPECT_EQ(c.Value().value, 3u); // NOT reusing id 1
+}
+
+// --- Capacity bounded by maxClients (value outcome) ---------------------------
+TEST(ReplicationClientRegistryStep4, CapacityBounded)
+{
+    replication::ReplicationClientRegistry registry{2};
+    ASSERT_TRUE(registry.Register(net::ConnectionId{1}, Focus(1, 0)).HasValue());
+    ASSERT_TRUE(registry.Register(net::ConnectionId{2}, Focus(2, 0)).HasValue());
+    EXPECT_TRUE(registry.Full());
+    EXPECT_FALSE(registry.Register(net::ConnectionId{3}, Focus(3, 0)).HasValue()); // over capacity
+    EXPECT_EQ(registry.Count(), 2u);
+}
+
+// --- Deterministic ascending order + focus update -----------------------------
+TEST(ReplicationClientRegistryStep4, AscendingOrderAndFocus)
+{
+    replication::ReplicationClientRegistry registry{8};
+    (void)registry.Register(net::ConnectionId{7}, Focus(1, 1.0f));
+    (void)registry.Register(net::ConnectionId{4}, Focus(2, 2.0f));
+    (void)registry.Register(net::ConnectionId{9}, Focus(3, 3.0f));
+
+    const auto active = registry.ActiveClients();
+    ASSERT_EQ(active.size(), 3u);
+    for (std::size_t i = 1; i < active.size(); ++i)
+    {
+        EXPECT_LT(active[i - 1].id.value, active[i].id.value); // ascending
+    }
+
+    ASSERT_TRUE(registry.UpdateFocus(replication::ClientId{2}, Focus(2, 42.0f)).HasValue());
+    EXPECT_FLOAT_EQ(registry.FindById(replication::ClientId{2})->focus.position.x, 42.0f);
+    EXPECT_FALSE(registry.UpdateFocus(replication::ClientId{999}, Focus(9, 0)).HasValue());
+}
+
+// --- Monotonic acknowledgement updates ----------------------------------------
+TEST(ReplicationClientRegistryStep4, MonotonicAck)
+{
+    replication::ReplicationClientRegistry registry{4};
+    const auto id = registry.Register(net::ConnectionId{1}, Focus(1, 0));
+    ASSERT_TRUE(id.HasValue());
+
+    ASSERT_TRUE(registry.RecordAck(id.Value(), 10, 100).HasValue());
+    EXPECT_EQ(registry.FindById(id.Value())->lastAckedReplicationId, 10u);
+    EXPECT_EQ(registry.FindById(id.Value())->lastAckedSnapshotTick, 100u);
+
+    // Newer ack advances the baseline.
+    ASSERT_TRUE(registry.RecordAck(id.Value(), 15, 150).HasValue());
+    EXPECT_EQ(registry.FindById(id.Value())->lastAckedReplicationId, 15u);
+
+    // Older/equal acks are ignored (benign; baseline unchanged).
+    ASSERT_TRUE(registry.RecordAck(id.Value(), 15, 999).HasValue());
+    ASSERT_TRUE(registry.RecordAck(id.Value(), 5, 999).HasValue());
+    EXPECT_EQ(registry.FindById(id.Value())->lastAckedReplicationId, 15u);
+    EXPECT_EQ(registry.FindById(id.Value())->lastAckedSnapshotTick, 150u);
+
+    EXPECT_FALSE(registry.RecordAck(replication::ClientId{999}, 1, 1).HasValue()); // unknown
+}
+
+// --- Consistency validation ---------------------------------------------------
+TEST(ReplicationClientRegistryStep4, ConsistencyValid)
+{
+    replication::ReplicationClientRegistry registry{8};
+    EXPECT_TRUE(registry.ValidateConsistency()); // empty is consistent
+    (void)registry.Register(net::ConnectionId{1}, Focus(1, 0));
+    (void)registry.Register(net::ConnectionId{2}, Focus(2, 0));
+    (void)registry.Register(net::ConnectionId{3}, Focus(3, 0));
+    ASSERT_TRUE(registry.Unregister(replication::ClientId{2}).HasValue());
+    EXPECT_TRUE(registry.ValidateConsistency()); // still ascending + unique after erase
+    EXPECT_EQ(registry.Count(), 2u);
 }
