@@ -15,6 +15,7 @@
 #include "stalkermp/snapshot/SnapshotConfiguration.h"
 #include "stalkermp/snapshot/SnapshotPool.h"
 #include "stalkermp/snapshot/SnapshotBuilder.h"
+#include "stalkermp/snapshot/SnapshotQueue.h"
 #include "stalkermp/adapters/EntitySnapshotSource.h"
 #include "stalkermp/world/IEntitySnapshotSource.h"
 #include "stalkermp/world/IEnvironmentSource.h"
@@ -689,3 +690,184 @@ TEST(SnapshotBuilderStep6, OverflowHandling)
     EXPECT_FALSE(builder.Building());  // build aborted
     EXPECT_EQ(pool.InUse(), 0u);       // buffer returned to the pool (no orphan)
 }
+
+// ============================================================================
+// Step 7 — SnapshotQueue (single-producer / multi-consumer publication)
+// ============================================================================
+
+namespace
+{
+    // Acquire a pooled buffer and Finalize it into a publishable immutable
+    // snapshot with the given id/tick. Returns the pool's buffer (refCount 1).
+    const snapshot::SimulationSnapshot* MakePublished(snapshot::SnapshotPool& pool,
+                                                      std::uint64_t id, std::uint64_t tick)
+    {
+        auto acq = pool.Acquire();
+        if (!acq.HasValue()) return nullptr;
+        snapshot::SimulationSnapshot* s = acq.Value();
+        s->BeginBuild(snapshot::SnapshotId{id}, tick, 1);
+        (void)s->AddEntity(Ent(static_cast<std::uint32_t>(id)));
+        (void)s->Finalize();
+        return s;
+    }
+} // namespace
+
+// --- Publish lifecycle: current advances; depth is latest-wins (0/1) ----------
+TEST(SnapshotQueueStep7, PublishLifecycle)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(4);
+    snapshot::SnapshotQueue queue{pool};
+
+    EXPECT_EQ(queue.Depth(), 0u);
+    EXPECT_EQ(queue.Published(), 0u);
+    EXPECT_EQ(queue.Acquire(), nullptr); // nothing published yet
+
+    const auto* s1 = MakePublished(pool, 1, 100);
+    ASSERT_NE(s1, nullptr);
+    ASSERT_TRUE(queue.Publish(s1).HasValue());
+    EXPECT_EQ(queue.Depth(), 1u);
+    EXPECT_EQ(queue.Published(), 1u);
+    EXPECT_EQ(queue.Current(), s1);
+
+    // Null / non-Finalized publications are value-outcome rejections.
+    EXPECT_FALSE(queue.Publish(nullptr).HasValue());
+    auto build = pool.Acquire();
+    ASSERT_TRUE(build.HasValue());
+    build.Value()->BeginBuild(snapshot::SnapshotId{9}, 1, 1); // Building, not Finalized
+    EXPECT_FALSE(queue.Publish(build.Value()).HasValue());
+    EXPECT_EQ(queue.Published(), 1u); // unchanged by rejected publishes
+    pool.ReturnToPool(build.Value());
+}
+
+// --- Acquire / Release lifecycle: consumer reference is taken and returned -----
+TEST(SnapshotQueueStep7, AcquireReleaseLifecycle)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    snapshot::SnapshotQueue queue{pool};
+
+    const auto* s1 = MakePublished(pool, 1, 10);
+    ASSERT_NE(s1, nullptr);
+    ASSERT_TRUE(queue.Publish(s1).HasValue());
+    EXPECT_EQ(pool.RefCount(s1), 1u); // publication reference only
+
+    const snapshot::SimulationSnapshot* got = queue.Acquire();
+    EXPECT_EQ(got, s1);
+    EXPECT_EQ(pool.RefCount(s1), 2u); // + consumer reference
+
+    // Acquired object is immutable (const view) — consume through ISnapshotView.
+    const snapshot::ISnapshotView& view = *got;
+    EXPECT_EQ(view.Metadata().id.value, 1u);
+
+    queue.Release(got);
+    EXPECT_EQ(pool.RefCount(s1), 1u); // back to publication reference
+    queue.Release(nullptr);           // no-op
+    EXPECT_EQ(pool.RefCount(s1), 1u);
+}
+
+// --- Reference-count retirement: buffer freed only at count zero --------------
+TEST(SnapshotQueueStep7, ReferenceCountRetirement)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(1);
+    snapshot::SnapshotQueue queue{pool};
+
+    const auto* s1 = MakePublished(pool, 1, 5);
+    ASSERT_NE(s1, nullptr);
+    ASSERT_TRUE(queue.Publish(s1).HasValue());
+    const auto* c1 = queue.Acquire();
+    const auto* c2 = queue.Acquire();
+    EXPECT_EQ(pool.RefCount(s1), 3u); // publication + two consumers
+    EXPECT_EQ(pool.InUse(), 1u);
+
+    queue.Release(c1);
+    EXPECT_EQ(pool.InUse(), 1u); // still referenced
+    queue.Release(c2);
+    EXPECT_EQ(pool.InUse(), 1u); // publication reference remains
+    EXPECT_EQ(pool.RefCount(s1), 1u);
+}
+
+// --- Superseded snapshot retirement: old buffer retires only after replaced ---
+TEST(SnapshotQueueStep7, SupersededSnapshotRetirement)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    snapshot::SnapshotQueue queue{pool};
+
+    const auto* s1 = MakePublished(pool, 1, 10);
+    ASSERT_NE(s1, nullptr);
+    ASSERT_TRUE(queue.Publish(s1).HasValue());
+
+    // A consumer holds s1 across the supersede.
+    const auto* held = queue.Acquire();
+    EXPECT_EQ(pool.RefCount(s1), 2u);
+
+    const auto* s2 = MakePublished(pool, 2, 20); // uses the 2nd buffer
+    ASSERT_NE(s2, nullptr);
+    ASSERT_TRUE(queue.Publish(s2).HasValue()); // supersede: s1 publication ref released
+    EXPECT_EQ(queue.Current(), s2);
+    EXPECT_EQ(queue.Depth(), 1u);              // latest-wins
+    EXPECT_EQ(pool.RefCount(s1), 1u);          // superseded but still held by consumer
+    EXPECT_EQ(pool.InUse(), 2u);               // s1 (held) + s2 (current)
+
+    // s1 retires ONLY once the consumer releases (reference count reaches zero).
+    queue.Release(held);
+    EXPECT_EQ(pool.RefCount(s1), 0u);
+    EXPECT_EQ(pool.InUse(), 1u);               // only s2 remains
+    EXPECT_EQ(queue.Current(), s2);
+}
+
+// --- Multiple consumer acquisition: each Acquire is an independent reference ---
+TEST(SnapshotQueueStep7, MultipleConsumerAcquisition)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    snapshot::SnapshotQueue queue{pool};
+
+    const auto* s1 = MakePublished(pool, 1, 1);
+    ASSERT_NE(s1, nullptr);
+    ASSERT_TRUE(queue.Publish(s1).HasValue());
+
+    const auto* a = queue.Acquire();
+    const auto* b = queue.Acquire();
+    const auto* c = queue.Acquire();
+    EXPECT_EQ(a, s1);
+    EXPECT_EQ(b, s1);
+    EXPECT_EQ(c, s1);
+    EXPECT_EQ(pool.RefCount(s1), 4u); // publication + three consumers
+
+    queue.Release(a);
+    queue.Release(b);
+    queue.Release(c);
+    EXPECT_EQ(pool.RefCount(s1), 1u); // publication reference persists
+    EXPECT_EQ(pool.InUse(), 1u);
+}
+
+// --- Deterministic publication behavior: monotonic count; latest-wins current --
+TEST(SnapshotQueueStep7, DeterministicPublicationBehavior)
+{
+    auto run = [](std::vector<std::uint64_t>& ids, std::uint64_t& published) {
+        snapshot::SnapshotPool pool;
+        pool.Reserve(4);
+        snapshot::SnapshotQueue queue{pool};
+        for (std::uint64_t i = 1; i <= 3; ++i)
+        {
+            const auto* s = MakePublished(pool, i, i * 10);
+            ASSERT_NE(s, nullptr);
+            ASSERT_TRUE(queue.Publish(s).HasValue());
+            ids.push_back(queue.Current()->Metadata().id.value);
+        }
+        published = queue.Published();
+    };
+    std::vector<std::uint64_t> a, b;
+    std::uint64_t pa = 0, pb = 0;
+    run(a, pa);
+    run(b, pb);
+    EXPECT_EQ(a, b);                    // identical publication sequence
+    EXPECT_EQ(pa, pb);
+    EXPECT_EQ(pa, 3u);                  // monotonic count
+    ASSERT_EQ(a.size(), 3u);
+    EXPECT_EQ(a.back(), 3u);            // latest-wins current
+}
+// end of Sprint-008 Step-07 tests

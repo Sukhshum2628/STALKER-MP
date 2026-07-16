@@ -102,7 +102,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **005** | ALife Transition Layer (online/offline switching) | ✅ Verified (Closed) |
 | **006** | Host Networking Infrastructure (transport, session, wire) | ✅ Verified (Closed) |
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
-| **008** | **Snapshot System (immutable snapshots)** | 🚧 **In progress** — Step 6 / 14 |
+| **008** | **Snapshot System (immutable snapshots)** | 🚧 **In progress** — Step 7 / 14 |
 | 009 | Replication Pipeline | ⏳ Planned |
 | 010 | Client Prediction / Interpolation | ⏳ Planned |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
@@ -116,13 +116,13 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 ## Current Implementation Status
 
 - **Sprints 001–007:** implemented, independently verified, and closed.
-- **Sprint-008:** value types (Step 1), configuration (Step 2), the immutable `SimulationSnapshot` + `ISnapshotView` (Step 3), the exception-free fixed-capacity `SnapshotPool` (Step 4), the additive engine-free `world::IEntitySnapshotSource` capture seam + null (Step 5), and the deterministic value-only `SnapshotBuilder` (Step 6) implemented and verified; steps 7–14 (queue, manager, engine adapter, wiring, diagnostics, hardening, integration, closure) remain.
+- **Sprint-008:** value types (Step 1), configuration (Step 2), the immutable `SimulationSnapshot` + `ISnapshotView` (Step 3), the exception-free fixed-capacity `SnapshotPool` (Step 4), the additive engine-free `world::IEntitySnapshotSource` capture seam + null (Step 5), the deterministic value-only `SnapshotBuilder` (Step 6), and the single-producer / multi-consumer `SnapshotQueue` (Step 7) implemented and verified; steps 8–14 (manager, engine adapter, wiring, diagnostics, hardening, integration, closure) remain.
 - **Engine boundary:** intact — engine headers confined to `Multiplayer/src/adapters/EngineAdapters.cpp`.
 - **Platform boundary:** intact — OS socket headers confined to `Multiplayer/src/adapters/PlatformSockets.cpp`.
 
 ## Test Status
 
-- **344 / 344 tests passing** (Release x64) on **GCC** and **MSVC**.
+- **350 / 350 tests passing** (Release x64) on **GCC** and **MSVC**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.
