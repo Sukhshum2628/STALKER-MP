@@ -14,8 +14,13 @@
 #include "stalkermp/snapshot/SimulationSnapshot.h"
 #include "stalkermp/snapshot/SnapshotConfiguration.h"
 #include "stalkermp/snapshot/SnapshotPool.h"
+#include "stalkermp/snapshot/SnapshotBuilder.h"
 #include "stalkermp/adapters/EntitySnapshotSource.h"
 #include "stalkermp/world/IEntitySnapshotSource.h"
+#include "stalkermp/world/IEnvironmentSource.h"
+#include "stalkermp/net/Session.h"
+#include "stalkermp/player/IPlayerSpawnGateway.h"
+#include "stalkermp/player/PlayerManager.h"
 #include "stalkermp/snapshot/SnapshotTypes.h"
 
 using namespace stalkermp;
@@ -477,4 +482,210 @@ TEST(EntitySnapshotSourceStep5, UsableThroughInterface)
         EXPECT_LT(out[i - 1].id.value, out[i].id.value);
     }
     SUCCEED();
+}
+
+// ============================================================================
+// Step 6 — SnapshotBuilder (deterministic, value-only capture pass)
+// ============================================================================
+
+namespace
+{
+    // Test entity source: appends `count` ascending value-only entities. The
+    // per-entity `state` marker lets a test prove capture copies values.
+    class FakeEntitySource final : public world::IEntitySnapshotSource
+    {
+    public:
+        explicit FakeEntitySource(std::uint32_t count) : m_count(count) {}
+        void SetCount(std::uint32_t count) { m_count = count; }
+        void Capture(std::vector<snapshot::EntitySnapshot>& out) const override
+        {
+            for (std::uint32_t i = 1; i <= m_count; ++i)
+            {
+                snapshot::EntitySnapshot e{};
+                e.id = world::EntityId{i};
+                e.state = i * 10u; // observable value payload
+                out.push_back(e);
+            }
+        }
+    private:
+        std::uint32_t m_count;
+    };
+
+    // Test environment source: a fixed, engine-free sample.
+    class FakeEnvSource final : public world::IEnvironmentSource
+    {
+    public:
+        [[nodiscard]] std::optional<world::EnvironmentSample> Sample() const override
+        {
+            world::EnvironmentSample s{};
+            s.weatherName = "clear";
+            s.emissionActive = true;
+            return s;
+        }
+    };
+
+    // Minimal deterministic spawn gateway for building a player surface.
+    class BuilderSpawnGateway final : public player::IPlayerSpawnGateway
+    {
+    public:
+        [[nodiscard]] core::Expected<world::EntityId> Spawn(const player::PlayerProfile&,
+                                                            const world::PlayerPosition&) override
+        {
+            return world::EntityId{m_next++};
+        }
+        [[nodiscard]] player::SpawnOutcome Despawn(world::EntityId) override
+        {
+            return player::SpawnOutcome::Spawned;
+        }
+    private:
+        std::uint32_t m_next = 2000;
+    };
+
+    player::PlayerConfiguration BuilderPlayerConfig(std::uint32_t maxPlayers)
+    {
+        player::PlayerConfiguration c;
+        c.maxPlayers = maxPlayers;
+        return c;
+    }
+} // namespace
+
+// --- Successful build lifecycle: BeginBuild -> Capture -> Finalize -------------
+TEST(SnapshotBuilderStep6, SuccessfulBuildLifecycle)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    snapshot::SnapshotBuilder builder{snapshot::SnapshotConfiguration{}};
+
+    FakeEntitySource entities{3};
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+    ASSERT_EQ(players.RequestJoin(net::ConnectionId{5}, player::PlayerProfile{}, 100),
+              player::JoinOutcome::Accepted);
+    ASSERT_EQ(players.RequestJoin(net::ConnectionId{7}, player::PlayerProfile{}, 100),
+              player::JoinOutcome::Accepted);
+
+    const auto begun = builder.BeginBuild(pool, /*tick*/ 500);
+    ASSERT_TRUE(begun.HasValue());
+    EXPECT_TRUE(builder.Building());
+    EXPECT_EQ(builder.LastId().value, 1u); // monotonic, never 0
+
+    ASSERT_TRUE(builder.Capture(entities, players, env).HasValue());
+
+    const auto finalized = builder.Finalize();
+    ASSERT_TRUE(finalized.HasValue());
+    EXPECT_FALSE(builder.Building());
+
+    const snapshot::ISnapshotView& view = *finalized.Value();
+    EXPECT_EQ(view.Metadata().state, snapshot::SnapshotState::Finalized);
+    EXPECT_EQ(view.Metadata().simulationTick, 500u);
+    EXPECT_EQ(view.Metadata().id.value, 1u);
+    ASSERT_EQ(view.Entities().size(), 3u);
+    EXPECT_EQ(view.Entities()[0].id.value, 1u);
+    EXPECT_EQ(view.Entities()[2].id.value, 3u);
+    EXPECT_EQ(view.Players().size(), 2u);
+    EXPECT_NE(view.Environment().weatherId, 0u); // "clear" hashed
+    EXPECT_EQ(view.Environment().emissionState, 1u);
+
+    pool.ReturnToPool(finalized.Value());
+    EXPECT_EQ(pool.InUse(), 0u);
+}
+
+// --- Deterministic snapshot generation: identical inputs => identical content --
+TEST(SnapshotBuilderStep6, DeterministicSnapshotGeneration)
+{
+    FakeEnvSource env;
+    auto run = [&env](std::vector<std::uint32_t>& entityIds, std::uint32_t& weatherId) {
+        snapshot::SnapshotPool pool;
+        pool.Reserve(1);
+        snapshot::SnapshotBuilder builder{snapshot::SnapshotConfiguration{}};
+        FakeEntitySource entities{4};
+        BuilderSpawnGateway gw;
+        net::Session session(8);
+        player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+        (void)players.RequestJoin(net::ConnectionId{3}, player::PlayerProfile{}, 10);
+
+        ASSERT_TRUE(builder.BeginBuild(pool, 7).HasValue());
+        ASSERT_TRUE(builder.Capture(entities, players, env).HasValue());
+        const auto fin = builder.Finalize();
+        ASSERT_TRUE(fin.HasValue());
+        for (const auto& e : fin.Value()->Entities()) entityIds.push_back(e.id.value);
+        weatherId = fin.Value()->Environment().weatherId;
+        // First minted id is always 1 within a fresh builder (monotonic).
+        EXPECT_EQ(fin.Value()->Metadata().id.value, 1u);
+    };
+    std::vector<std::uint32_t> a, b;
+    std::uint32_t wa = 0, wb = 0;
+    run(a, wa);
+    run(b, wb);
+    EXPECT_EQ(a, b);
+    EXPECT_EQ(wa, wb);
+}
+
+// --- Value-only capture: post-capture source mutation cannot affect snapshot ---
+TEST(SnapshotBuilderStep6, ValueOnlyCapture)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(1);
+    snapshot::SnapshotBuilder builder{snapshot::SnapshotConfiguration{}};
+    FakeEntitySource entities{2};
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+
+    ASSERT_TRUE(builder.BeginBuild(pool, 1).HasValue());
+    ASSERT_TRUE(builder.Capture(entities, players, env).HasValue());
+    const auto fin = builder.Finalize();
+    ASSERT_TRUE(fin.HasValue());
+
+    ASSERT_EQ(fin.Value()->Entities().size(), 2u);
+    // Snapshot holds copied values (the state payload), not a live reference.
+    EXPECT_EQ(fin.Value()->Entities()[0].state, 10u);
+    EXPECT_EQ(fin.Value()->Entities()[1].state, 20u);
+
+    // Mutating the source afterwards does not change the finalized snapshot.
+    entities.SetCount(9);
+    EXPECT_EQ(fin.Value()->Entities().size(), 2u);
+    pool.ReturnToPool(fin.Value());
+}
+
+// --- PoolExhausted is a value outcome (no throw) ------------------------------
+TEST(SnapshotBuilderStep6, PoolExhaustedHandling)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(1); // single buffer shared by two builders
+    snapshot::SnapshotBuilder first{snapshot::SnapshotConfiguration{}};
+    snapshot::SnapshotBuilder second{snapshot::SnapshotConfiguration{}};
+
+    ASSERT_TRUE(first.BeginBuild(pool, 1).HasValue()); // takes the only buffer
+    EXPECT_TRUE(pool.Full());
+
+    const auto over = second.BeginBuild(pool, 2);
+    EXPECT_FALSE(over.HasValue()); // PoolExhausted, not an exception
+    EXPECT_FALSE(second.Building());
+    EXPECT_EQ(pool.InUse(), 1u); // unchanged
+}
+
+// --- Overflow is a value outcome; the pooled buffer is returned (no orphan) ----
+TEST(SnapshotBuilderStep6, OverflowHandling)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(1);
+    snapshot::SnapshotConfiguration cfg{};
+    cfg.maxEntities = 2; // below the source's entity count
+    snapshot::SnapshotBuilder builder{cfg};
+
+    FakeEntitySource entities{3}; // exceeds maxEntities
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+
+    ASSERT_TRUE(builder.BeginBuild(pool, 1).HasValue());
+    const auto captured = builder.Capture(entities, players, env);
+    EXPECT_FALSE(captured.HasValue()); // Overflow value outcome
+    EXPECT_FALSE(builder.Building());  // build aborted
+    EXPECT_EQ(pool.InUse(), 0u);       // buffer returned to the pool (no orphan)
 }
