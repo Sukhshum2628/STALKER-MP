@@ -54,7 +54,7 @@ flowchart LR
     W[World<br/>100] --> ER[EntityRegistry<br/>200] --> PL[PlayerLifecycle<br/>250] --> BUB[Bubble<br/>300] --> TR[Transition<br/>350] --> SN[Snapshot<br/>400] --> NET[Networking<br/>900]
 ```
 
-See the SVG diagrams in `docs/images/` and the Mermaid pipeline above; per-subsystem documentation lives in `Multiplayer/docs/`.
+See the architecture SVG in `docs/images/` and the Mermaid pipeline above; per-subsystem documentation lives in `Multiplayer/docs/`.
 
 ---
 
@@ -90,8 +90,6 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 ---
 
 ## Sprint Roadmap & Progress
-
-![Sprint Roadmap](docs/images/sprint-roadmap.svg)
 
 | Sprint | Subsystem | Status |
 |---|---|---|

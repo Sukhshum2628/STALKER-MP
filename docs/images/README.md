@@ -8,7 +8,6 @@ GitHub). Keep filenames stable so README references do not break.
 | File | Status | Purpose |
 |---|---|---|
 | `architecture-overview.svg` | ✅ present | High-level module/boundary diagram (engine ↔ adapters ↔ subsystems). |
-| `sprint-roadmap.svg` | ✅ present | Sprint roadmap / status timeline. |
 | `frame-tick-order` | inline Mermaid (README) | Deterministic per-frame `tick_order` pipeline (100 → 900). |
 | `snapshot-dataflow` | planned | Sprint-008 snapshot build → publish → consume flow. |
 
