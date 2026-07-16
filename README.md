@@ -102,21 +102,21 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **005** | ALife Transition Layer (online/offline switching) | ✅ Verified (Closed) |
 | **006** | Host Networking Infrastructure (transport, session, wire) | ✅ Verified (Closed) |
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
-| **008** | **Snapshot System (immutable snapshots)** | 🚧 **In progress** — Step 13 / 14 |
-| 009 | Replication Pipeline | ⏳ Planned |
+| **008** | Snapshot System (immutable snapshots) | ✅ Verified (Closed) |
+| 009 | Replication Pipeline | ⏳ Planned (next) |
 | 010 | Client Prediction / Interpolation | ⏳ Planned |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
-**Current focus — Sprint-008 (Snapshot System):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. Architecture and Implementation Plan are frozen; implementation is proceeding one verified step at a time.
+**Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified. **Next focus — Sprint-009 (Replication Pipeline)**, which consumes these snapshots.
 
 ---
 
 ## Current Implementation Status
 
-- **Sprints 001–007:** implemented, independently verified, and closed.
-- **Sprint-008:** value types (Step 1), configuration (Step 2), the immutable `SimulationSnapshot` + `ISnapshotView` (Step 3), the exception-free fixed-capacity `SnapshotPool` (Step 4), the additive engine-free `world::IEntitySnapshotSource` capture seam + null (Step 5), the deterministic value-only `SnapshotBuilder` (Step 6), the single-producer / multi-consumer `SnapshotQueue` (Step 7), the per-tick `SnapshotManager` (`IService` + `ITickable`) at `tick_order::kReplication = 400` (Step 8), the engine-boundary `adapters::EngineEntitySnapshotSource` (the sole new engine TU; value-only ascending capture) with its engine-free marshaling helper (Step 9), the Bootstrap composition-root wiring that registers the `SnapshotManager` and subscribes it to the `FrameDispatcher` at `tick_order::kReplication = 400` with reverse-order teardown (Step 10), the read-only `SnapshotDiagnostics` inspector (statistics, state/queue/memory reporting, snapshot dump, build history, consistency validation) (Step 11), the validation-hardening negative-surface suite across pool/builder/queue/manager/diagnostics — invalid state transitions, null inputs, capacity/ordering/lifecycle/queue/configuration invariants, and deterministic churn stress, every rejection a value outcome (Step 12), and composed-stack integration (multiple synchronous consumers, capture correctness, full-tick replay identity) with the subsystem documentation in `Multiplayer/docs/Snapshots.md` (Step 13) implemented and verified; step 14 (sprint closure) remains.
+- **Sprints 001–008:** implemented, independently verified, and closed.
+- **Sprint-008 (Snapshot System) — closed:** all 14 steps delivered and verified — value types + configuration; the immutable `SimulationSnapshot` + `ISnapshotView`; the exception-free fixed-capacity `SnapshotPool`; the additive engine-free `world::IEntitySnapshotSource` capture seam + null; the deterministic value-only `SnapshotBuilder`; the single-producer / multi-consumer `SnapshotQueue`; the per-tick `SnapshotManager` (`IService` + `ITickable`) at `tick_order::kReplication = 400`; the engine-boundary `adapters::EngineEntitySnapshotSource` (the sole new engine TU) with its engine-free marshaling helper; the Bootstrap composition-root wiring with reverse-order teardown; the read-only `SnapshotDiagnostics` inspector; the validation-hardening negative surface; and composed-stack integration with the subsystem documentation in `Multiplayer/docs/Snapshots.md`. Evidence gates E-G1-S / E-G2-S / E-G3-S passed, E-G4-S confirmed.
 - **Engine boundary:** intact — engine headers confined to `Multiplayer/src/adapters/EngineAdapters.cpp`.
 - **Platform boundary:** intact — OS socket headers confined to `Multiplayer/src/adapters/PlatformSockets.cpp`.
 
