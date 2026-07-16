@@ -144,6 +144,7 @@
     <ClCompile Include="src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="src\replication\ReplicationClientRegistry.cpp" />
     <ClCompile Include="src\replication\BubbleInterestPolicy.cpp" />
+    <ClCompile Include="src\replication\DeltaEncoder.cpp" />
     <ClCompile Include="src\player\PlayerRegistry.cpp" />
     <ClCompile Include="src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="src\player\PlayerSessionObserver.cpp" />
@@ -291,6 +292,7 @@
     <ClInclude Include="include\stalkermp\replication\IInterestPolicy.h" />
     <ClInclude Include="include\stalkermp\replication\IBubbleMembershipSource.h" />
     <ClInclude Include="include\stalkermp\replication\BubbleInterestPolicy.h" />
+    <ClInclude Include="include\stalkermp\replication\DeltaEncoder.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />

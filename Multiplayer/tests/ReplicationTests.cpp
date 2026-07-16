@@ -13,6 +13,7 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/replication/IReplicationView.h"
 #include "stalkermp/replication/BubbleInterestPolicy.h"
+#include "stalkermp/replication/DeltaEncoder.h"
 #include "stalkermp/replication/IBubbleMembershipSource.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
@@ -638,4 +639,129 @@ TEST(InterestStep5, AppendOnlyAndDeterministic)
     {
         EXPECT_EQ(a[i].value, b[i].value);
     }
+}
+
+// ============================================================================
+// Step 6 — Deterministic delta generation
+// ============================================================================
+
+namespace
+{
+    replication::EntityReplicationState ES(std::uint32_t id, float x, std::uint32_t flags, std::uint32_t version)
+    {
+        replication::EntityReplicationState e{};
+        e.id = world::EntityId{id};
+        e.position = world::Vec3{x, 0.0f, 0.0f};
+        e.stateFlags = flags;
+        e.version = version;
+        return e;
+    }
+    replication::PlayerReplicationState PS(std::uint32_t id, float x, std::uint32_t authority, std::uint32_t version)
+    {
+        replication::PlayerReplicationState p{};
+        p.id = player::PlayerId{id};
+        p.position = world::Vec3{x, 0.0f, 0.0f};
+        p.authorityFlags = authority;
+        p.version = version;
+        return p;
+    }
+} // namespace
+
+// --- Added / changed / removed classification; unchanged omitted --------------
+TEST(DeltaStep6, AddedChangedRemovedUnchanged)
+{
+    const std::vector<replication::EntityReplicationState> baseline{
+        ES(1, 1.0f, 10, 3), ES(2, 2.0f, 20, 4), ES(3, 3.0f, 30, 5)};
+    const std::vector<replication::EntityReplicationState> current{
+        ES(2, 2.5f, 20, 0), // changed (position differs)
+        ES(3, 3.0f, 30, 0), // unchanged (tracked fields equal)
+        ES(4, 4.0f, 40, 0)};// added
+
+    const auto r = replication::EncodeEntityDelta(baseline, current, /*maxEntitiesPerUpdate*/ 1024);
+    ASSERT_TRUE(r.HasValue());
+    const auto& cs = r.Value();
+
+    ASSERT_EQ(cs.added.size(), 1u);
+    EXPECT_EQ(cs.added[0].id.value, 4u);
+    EXPECT_EQ(cs.added[0].version, 1u); // added stamped version 1
+
+    ASSERT_EQ(cs.changed.size(), 1u);
+    EXPECT_EQ(cs.changed[0].id.value, 2u);
+    EXPECT_EQ(cs.changed[0].version, 5u); // baseline 4 -> bumped to 5
+
+    ASSERT_EQ(cs.removed.size(), 1u);
+    EXPECT_EQ(cs.removed[0].value, 1u); // in baseline, absent in current
+
+    // Entity 3 unchanged => omitted from added/changed.
+}
+
+// --- Ascending, deterministic output ------------------------------------------
+TEST(DeltaStep6, AscendingAndDeterministic)
+{
+    const std::vector<replication::EntityReplicationState> baseline{ES(2, 2.0f, 20, 1)};
+    const std::vector<replication::EntityReplicationState> current{
+        ES(1, 1.0f, 10, 0), ES(3, 3.0f, 30, 0), ES(5, 5.0f, 50, 0)};
+
+    const auto r1 = replication::EncodeEntityDelta(baseline, current, 1024);
+    const auto r2 = replication::EncodeEntityDelta(baseline, current, 1024);
+    ASSERT_TRUE(r1.HasValue());
+    ASSERT_TRUE(r2.HasValue());
+    ASSERT_EQ(r1.Value().added.size(), 3u);
+    for (std::size_t i = 1; i < r1.Value().added.size(); ++i)
+    {
+        EXPECT_LT(r1.Value().added[i - 1].id.value, r1.Value().added[i].id.value); // ascending
+    }
+    ASSERT_EQ(r1.Value().added.size(), r2.Value().added.size());
+    for (std::size_t i = 0; i < r1.Value().added.size(); ++i)
+    {
+        EXPECT_EQ(r1.Value().added[i].id.value, r2.Value().added[i].id.value); // deterministic
+    }
+    EXPECT_EQ(r1.Value().removed.size(), 1u); // id 2 removed
+    EXPECT_EQ(r1.Value().removed[0].value, 2u);
+}
+
+// --- Overflow handled via value outcome ---------------------------------------
+TEST(DeltaStep6, OverflowValueOutcome)
+{
+    const std::vector<replication::EntityReplicationState> baseline{};
+    const std::vector<replication::EntityReplicationState> current{
+        ES(1, 1.0f, 10, 0), ES(2, 2.0f, 20, 0)}; // 2 added
+
+    EXPECT_FALSE(replication::EncodeEntityDelta(baseline, current, /*max*/ 1).HasValue()); // 2 > 1
+    EXPECT_TRUE(replication::EncodeEntityDelta(baseline, current, /*max*/ 2).HasValue());  // 2 <= 2
+}
+
+// --- Player delta: added + tracked-field changes ------------------------------
+TEST(DeltaStep6, PlayerDelta)
+{
+    const std::vector<replication::PlayerReplicationState> baseline{PS(1, 1.0f, 0, 2), PS(2, 2.0f, 0, 3)};
+    const std::vector<replication::PlayerReplicationState> current{
+        PS(1, 1.0f, 0, 0), // unchanged
+        PS(2, 2.0f, 7, 0), // changed (authorityFlags differ)
+        PS(3, 3.0f, 0, 0)};// added
+
+    const auto changed = replication::EncodePlayerDelta(baseline, current);
+    ASSERT_EQ(changed.size(), 2u);
+    EXPECT_EQ(changed[0].id.value, 2u);
+    EXPECT_EQ(changed[0].version, 4u); // baseline 3 -> 4
+    EXPECT_EQ(changed[1].id.value, 3u);
+    EXPECT_EQ(changed[1].version, 1u); // added
+}
+
+// --- NextEntityBaseline: version carry/bump; removed dropped -------------------
+TEST(DeltaStep6, NextBaseline)
+{
+    const std::vector<replication::EntityReplicationState> baseline{
+        ES(1, 1.0f, 10, 3), ES(2, 2.0f, 20, 4)};
+    const std::vector<replication::EntityReplicationState> current{
+        ES(2, 2.5f, 20, 0), // changed
+        ES(5, 5.0f, 50, 0)};// added; id 1 removed
+
+    const auto next = replication::NextEntityBaseline(baseline, current);
+    ASSERT_EQ(next.size(), 2u);
+    EXPECT_EQ(next[0].id.value, 2u);
+    EXPECT_EQ(next[0].version, 5u); // changed: 4 -> 5
+    EXPECT_EQ(next[1].id.value, 5u);
+    EXPECT_EQ(next[1].version, 1u); // added
+    // id 1 (removed) is dropped from the next baseline.
 }
