@@ -12,10 +12,13 @@
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/replication/IReplicationView.h"
+#include "stalkermp/replication/BubbleInterestPolicy.h"
+#include "stalkermp/replication/IBubbleMembershipSource.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
 #include "stalkermp/replication/ReplicationUpdate.h"
+#include "stalkermp/snapshot/SimulationSnapshot.h"
 
 using namespace stalkermp;
 
@@ -499,4 +502,140 @@ TEST(ReplicationClientRegistryStep4, ConsistencyValid)
     ASSERT_TRUE(registry.Unregister(replication::ClientId{2}).HasValue());
     EXPECT_TRUE(registry.ValidateConsistency()); // still ascending + unique after erase
     EXPECT_EQ(registry.Count(), 2u);
+}
+
+// ============================================================================
+// Step 5 — Interest seam + BubbleInterestPolicy
+// ============================================================================
+
+namespace
+{
+    // Fake bubble membership: the configured ids are Inside; all others Outside.
+    class FakeMembership final : public replication::IBubbleMembershipSource
+    {
+    public:
+        void SetInside(std::uint32_t id) { m_inside.push_back(id); }
+        [[nodiscard]] world::BubbleMembership MembershipOf(world::EntityId id) const noexcept override
+        {
+            for (const std::uint32_t inside : m_inside)
+            {
+                if (inside == id.value)
+                {
+                    return world::BubbleMembership::Inside;
+                }
+            }
+            return world::BubbleMembership::Outside;
+        }
+
+    private:
+        std::vector<std::uint32_t> m_inside;
+    };
+
+    // Build a finalized snapshot with entities id=1..count, each at position x=id.
+    void BuildSnapshot(snapshot::SimulationSnapshot& snap, std::uint32_t count)
+    {
+        snap.BeginBuild(snapshot::SnapshotId{1}, 1, 1);
+        for (std::uint32_t i = 1; i <= count; ++i)
+        {
+            snapshot::EntitySnapshot e{};
+            e.id = world::EntityId{i};
+            e.position = world::Vec3{static_cast<float>(i), 0.0f, 0.0f};
+            (void)snap.AddEntity(e);
+        }
+        (void)snap.Finalize();
+    }
+
+    replication::ClientRecord ClientAt(float x)
+    {
+        replication::ClientRecord c{};
+        c.id = replication::ClientId{1};
+        c.focus.position = world::Vec3{x, 0.0f, 0.0f};
+        return c;
+    }
+} // namespace
+
+// --- Membership-driven relevance: only in-region entities selected ------------
+TEST(InterestStep5, MembershipDrivenSelection)
+{
+    snapshot::SimulationSnapshot snap;
+    BuildSnapshot(snap, 5);
+    FakeMembership membership;
+    membership.SetInside(2);
+    membership.SetInside(4);
+
+    replication::BubbleInterestPolicy policy{membership, /*interestRadiusMeters*/ 0}; // membership only
+    std::vector<world::EntityId> out;
+    policy.SelectRelevant(ClientAt(1000.0f), snap, out); // focus far away -> radius irrelevant
+
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].value, 2u);
+    EXPECT_EQ(out[1].value, 4u);
+}
+
+// --- Ascending, unique output -------------------------------------------------
+TEST(InterestStep5, AscendingUniqueOutput)
+{
+    snapshot::SimulationSnapshot snap;
+    BuildSnapshot(snap, 6);
+    FakeMembership membership;
+    for (std::uint32_t i = 1; i <= 6; ++i) membership.SetInside(i); // all relevant
+
+    replication::BubbleInterestPolicy policy{membership, 0};
+    std::vector<world::EntityId> out;
+    policy.SelectRelevant(ClientAt(0.0f), snap, out);
+
+    ASSERT_EQ(out.size(), 6u);
+    for (std::size_t i = 1; i < out.size(); ++i)
+    {
+        EXPECT_LT(out[i - 1].value, out[i].value); // strictly ascending, unique
+    }
+}
+
+// --- Radius policy: entities within interestRadiusMeters of focus are relevant -
+TEST(InterestStep5, RadiusPolicy)
+{
+    snapshot::SimulationSnapshot snap;
+    BuildSnapshot(snap, 5); // entities at x = 1..5
+    FakeMembership membership; // none Inside
+
+    // Focus at x=1, radius 2 -> entities at x in [1..3] (ids 1,2,3) are within.
+    replication::BubbleInterestPolicy policy{membership, /*radius*/ 2};
+    std::vector<world::EntityId> out;
+    policy.SelectRelevant(ClientAt(1.0f), snap, out);
+
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_EQ(out[0].value, 1u);
+    EXPECT_EQ(out[1].value, 2u);
+    EXPECT_EQ(out[2].value, 3u);
+}
+
+// --- Append-only + deterministic selection ------------------------------------
+TEST(InterestStep5, AppendOnlyAndDeterministic)
+{
+    snapshot::SimulationSnapshot snap;
+    BuildSnapshot(snap, 4);
+    FakeMembership membership;
+    membership.SetInside(2);
+    membership.SetInside(3);
+    replication::BubbleInterestPolicy policy{membership, 0};
+
+    // Append-only: a pre-existing entry is preserved.
+    std::vector<world::EntityId> out;
+    out.push_back(world::EntityId{100});
+    policy.SelectRelevant(ClientAt(0.0f), snap, out);
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_EQ(out[0].value, 100u); // preserved
+    EXPECT_EQ(out[1].value, 2u);
+    EXPECT_EQ(out[2].value, 3u);
+
+    // Deterministic: two fresh selections produce identical results.
+    std::vector<world::EntityId> a;
+    std::vector<world::EntityId> b;
+    policy.SelectRelevant(ClientAt(0.0f), snap, a);
+    policy.SelectRelevant(ClientAt(0.0f), snap, b);
+    ASSERT_EQ(a.size(), b.size());
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        EXPECT_EQ(a[i].value, b[i].value);
+    }
 }

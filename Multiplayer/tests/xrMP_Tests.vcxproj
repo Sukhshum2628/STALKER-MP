@@ -156,6 +156,7 @@
     <ClCompile Include="..\src\replication\ReplicationConfiguration.cpp" />
     <ClCompile Include="..\src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="..\src\replication\ReplicationClientRegistry.cpp" />
+    <ClCompile Include="..\src\replication\BubbleInterestPolicy.cpp" />
     <ClCompile Include="TestMain.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
