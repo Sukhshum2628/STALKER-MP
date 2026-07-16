@@ -16,6 +16,8 @@
 #include "stalkermp/snapshot/SnapshotPool.h"
 #include "stalkermp/snapshot/SnapshotBuilder.h"
 #include "stalkermp/snapshot/SnapshotQueue.h"
+#include "stalkermp/snapshot/SnapshotManager.h"
+#include "stalkermp/adapters/EntitySnapshotMarshal.h"
 #include "stalkermp/adapters/EntitySnapshotSource.h"
 #include "stalkermp/world/IEntitySnapshotSource.h"
 #include "stalkermp/world/IEnvironmentSource.h"
@@ -871,3 +873,244 @@ TEST(SnapshotQueueStep7, DeterministicPublicationBehavior)
     EXPECT_EQ(a.back(), 3u);            // latest-wins current
 }
 // end of Sprint-008 Step-07 tests
+
+// ============================================================================
+// Step 8 — SnapshotManager (per-tick IService + ITickable lifecycle)
+// ============================================================================
+
+namespace
+{
+    // Assemble a SnapshotManager over the Step-6 fakes plus a real (null-gateway)
+    // player surface. `cfg` lets a test shrink the pool to force PoolExhausted.
+    struct ManagerRig
+    {
+        FakeEntitySource entities;
+        FakeEnvSource env;
+        BuilderSpawnGateway gw;
+        net::Session session{8};
+        player::PlayerManager players;
+        snapshot::SnapshotManager manager;
+
+        ManagerRig(const snapshot::SnapshotConfiguration& cfg, std::uint32_t entityCount)
+            : entities(entityCount),
+              players(BuilderPlayerConfig(8), gw, session),
+              manager(cfg, entities, players, env)
+        {
+        }
+    };
+} // namespace
+
+// --- Successful tick lifecycle: one Tick builds + publishes a snapshot --------
+TEST(SnapshotManagerStep8, SuccessfulTickLifecycle)
+{
+    ManagerRig rig{snapshot::SnapshotConfiguration{}, /*entities*/ 3};
+    ASSERT_TRUE(rig.players.RequestJoin(net::ConnectionId{5}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    EXPECT_EQ(rig.manager.Queue().Published(), 0u);
+
+    rig.manager.Tick(0.016);
+    EXPECT_EQ(rig.manager.LastTick(), 1u);
+    EXPECT_EQ(rig.manager.Queue().Published(), 1u);
+    EXPECT_EQ(rig.manager.Queue().Depth(), 1u);
+    EXPECT_EQ(rig.manager.LatestMetadata().simulationTick, 1u);
+    EXPECT_EQ(rig.manager.LatestMetadata().entityCount, 3u);
+    EXPECT_EQ(rig.manager.LatestMetadata().playerCount, 1u);
+
+    const auto stats = rig.manager.Statistics();
+    EXPECT_EQ(stats.built, 1u);
+    EXPECT_EQ(stats.published, 1u);
+    EXPECT_TRUE(rig.manager.ValidateConsistency().IsHealthy());
+}
+
+// --- Exactly one publication per tick -----------------------------------------
+TEST(SnapshotManagerStep8, ExactlyOnePublicationPerTick)
+{
+    ManagerRig rig{snapshot::SnapshotConfiguration{}, /*entities*/ 2};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+
+    for (std::uint64_t i = 1; i <= 5; ++i)
+    {
+        rig.manager.Tick(0.016);
+        EXPECT_EQ(rig.manager.Queue().Published(), i);   // one publication per tick
+        EXPECT_EQ(rig.manager.LastTick(), i);
+        EXPECT_EQ(rig.manager.Queue().Depth(), 1u);      // latest-wins
+    }
+    EXPECT_EQ(rig.manager.Statistics().published, 5u);
+}
+
+// --- Dependency ordering: IService identity + ordering-only dependency list ----
+TEST(SnapshotManagerStep8, DependencyOrdering)
+{
+    ManagerRig rig{snapshot::SnapshotConfiguration{}, 1};
+    core::IService& service = rig.manager;
+    EXPECT_EQ(service.Name(), std::string_view{"SnapshotManager"});
+
+    const std::vector<std::string> expected{"World", "EntityRegistry", "BubbleManager",
+                                            "TransitionManager", "PlayerManager"};
+    EXPECT_EQ(service.Dependencies(), expected);
+
+    // Ticks at the frozen replication slot, strictly after simulation producers.
+    static_assert(snapshot::SnapshotManager::TickOrder() == core::tick_order::kReplication, "kReplication slot");
+    static_assert(core::tick_order::kAlifeTransition < snapshot::SnapshotManager::TickOrder() &&
+                      snapshot::SnapshotManager::TickOrder() < core::tick_order::kPersistence,
+                  "placement between Transition and Persistence");
+    SUCCEED();
+}
+
+// --- Builder/Pool failure handling: PoolExhausted skips the tick --------------
+TEST(SnapshotManagerStep8, BuilderPoolFailureHandling)
+{
+    snapshot::SnapshotConfiguration cfg{};
+    cfg.poolCapacity = 1;              // one buffer; the published snapshot holds it
+    ManagerRig rig{cfg, /*entities*/ 2};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+
+    rig.manager.Tick(0.016);          // tick 1 publishes; the single buffer is held
+    EXPECT_EQ(rig.manager.Queue().Published(), 1u);
+    const auto firstMeta = rig.manager.LatestMetadata();
+
+    rig.manager.Tick(0.016);          // tick 2: BeginBuild -> PoolExhausted -> skip
+    EXPECT_EQ(rig.manager.LastTick(), 2u);        // tick counter still advances
+    EXPECT_EQ(rig.manager.Queue().Published(), 1u); // but NO new publication
+    EXPECT_EQ(rig.manager.LatestMetadata().id.value, firstMeta.id.value); // previous remains valid
+    EXPECT_EQ(rig.manager.Queue().Depth(), 1u);
+}
+
+// --- Deterministic repeated ticks: identical runs => identical results ---------
+TEST(SnapshotManagerStep8, DeterministicRepeatedTicks)
+{
+    auto run = [](std::uint64_t& published, std::uint64_t& lastId, std::uint32_t& entityCount) {
+        ManagerRig rig{snapshot::SnapshotConfiguration{}, /*entities*/ 4};
+        (void)rig.players.RequestJoin(net::ConnectionId{2}, player::PlayerProfile{}, 1);
+        ASSERT_TRUE(rig.manager.Initialize().HasValue());
+        for (int i = 0; i < 3; ++i) rig.manager.Tick(0.016);
+        published = rig.manager.Queue().Published();
+        lastId = rig.manager.LatestMetadata().id.value;
+        entityCount = rig.manager.LatestMetadata().entityCount;
+    };
+    std::uint64_t pubA = 0, pubB = 0, idA = 0, idB = 0;
+    std::uint32_t ecA = 0, ecB = 0;
+    run(pubA, idA, ecA);
+    run(pubB, idB, ecB);
+    EXPECT_EQ(pubA, pubB);
+    EXPECT_EQ(idA, idB);       // deterministic monotonic id sequence
+    EXPECT_EQ(ecA, ecB);
+    EXPECT_EQ(pubA, 3u);
+    EXPECT_EQ(ecA, 4u);
+}
+
+// ============================================================================
+// Step 9 — EngineEntitySnapshotSource marshaling contract
+// ============================================================================
+//
+// The engine adapter (adapters::EngineEntitySnapshotSource) compiles only in the
+// engine build; its capture is smoke-tested on Windows. The deterministic,
+// value-only, append-only, ascending-unique marshaling it delegates to lives in
+// the engine-free adapters::detail::AppendAscendingUnique helper — exercised here
+// so the ordering/value contract is verified on both toolchains without the engine.
+
+namespace
+{
+    // Build a raw captured value the way the engine adapter does (id + transform +
+    // opaque state), with no pointer of any kind.
+    snapshot::EntitySnapshot Raw(std::uint32_t id, float x, std::uint32_t state)
+    {
+        snapshot::EntitySnapshot e{};
+        e.id = world::EntityId{id};
+        e.position = world::Vec3{x, 0.0f, 0.0f};
+        e.state = state;
+        return e;
+    }
+} // namespace
+
+// --- Engine value marshaling: value fields are copied through faithfully -------
+TEST(EngineEntitySnapshotMarshalStep9, EngineValueMarshaling)
+{
+    std::vector<snapshot::EntitySnapshot> raw{Raw(2, 2.5f, 20), Raw(1, 1.5f, 10)};
+    std::vector<snapshot::EntitySnapshot> out;
+    adapters::detail::AppendAscendingUnique(out, raw);
+
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].id.value, 1u);
+    EXPECT_FLOAT_EQ(out[0].position.x, 1.5f); // transform marshaled
+    EXPECT_EQ(out[0].state, 10u);             // opaque state marshaled
+    EXPECT_EQ(out[1].id.value, 2u);
+    EXPECT_FLOAT_EQ(out[1].position.x, 2.5f);
+    EXPECT_EQ(out[1].state, 20u);
+}
+
+// --- Ascending ordering: unsorted engine input becomes ascending by EntityId ---
+TEST(EngineEntitySnapshotMarshalStep9, AscendingOrdering)
+{
+    std::vector<snapshot::EntitySnapshot> raw{Raw(9, 0, 0), Raw(3, 0, 0), Raw(7, 0, 0), Raw(1, 0, 0)};
+    std::vector<snapshot::EntitySnapshot> out;
+    adapters::detail::AppendAscendingUnique(out, raw);
+
+    ASSERT_EQ(out.size(), 4u);
+    for (std::size_t i = 1; i < out.size(); ++i)
+    {
+        EXPECT_LT(out[i - 1].id.value, out[i].id.value); // strictly ascending, unique
+    }
+    // id 0 (reserved none) is dropped; duplicates keep the first occurrence.
+    std::vector<snapshot::EntitySnapshot> raw2{Raw(0, 0, 0), Raw(5, 0, 1), Raw(5, 0, 2)};
+    std::vector<snapshot::EntitySnapshot> out2;
+    adapters::detail::AppendAscendingUnique(out2, raw2);
+    ASSERT_EQ(out2.size(), 1u);
+    EXPECT_EQ(out2[0].id.value, 5u);
+    EXPECT_EQ(out2[0].state, 1u); // first occurrence retained
+}
+
+// --- Value-only + append-only: pre-existing entries preserved; copies not refs --
+TEST(EngineEntitySnapshotMarshalStep9, ValueOnlyAppendOnlyCapture)
+{
+    std::vector<snapshot::EntitySnapshot> out;
+    snapshot::EntitySnapshot pre{};
+    pre.id = world::EntityId{100};
+    out.push_back(pre); // pre-existing consumer content
+
+    std::vector<snapshot::EntitySnapshot> raw{Raw(2, 2.0f, 2), Raw(1, 1.0f, 1)};
+    adapters::detail::AppendAscendingUnique(out, raw);
+
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_EQ(out[0].id.value, 100u); // append-only: prior entry preserved
+    EXPECT_EQ(out[1].id.value, 1u);
+    EXPECT_EQ(out[2].id.value, 2u);
+}
+
+// --- No retained engine references: output survives destruction of the source ---
+TEST(EngineEntitySnapshotMarshalStep9, NoRetainedEngineReferences)
+{
+    std::vector<snapshot::EntitySnapshot> out;
+    {
+        std::vector<snapshot::EntitySnapshot> raw{Raw(1, 1.0f, 11), Raw(2, 2.0f, 22)};
+        adapters::detail::AppendAscendingUnique(out, raw);
+        // Mutate then destroy the raw source: values were copied, nothing aliased.
+        for (auto& e : raw) { e.state = 999; e.position.x = -1.0f; }
+    } // `raw` destroyed here
+
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].state, 11u);          // unaffected by post-capture mutation
+    EXPECT_FLOAT_EQ(out[1].position.x, 2.0f);
+    EXPECT_EQ(out[1].state, 22u);
+}
+
+// --- Deterministic capture behavior: identical input => identical output -------
+TEST(EngineEntitySnapshotMarshalStep9, DeterministicCaptureBehavior)
+{
+    auto capture = [](std::vector<snapshot::EntitySnapshot>& out) {
+        std::vector<snapshot::EntitySnapshot> raw{Raw(4, 4.0f, 4), Raw(2, 2.0f, 2), Raw(8, 8.0f, 8)};
+        adapters::detail::AppendAscendingUnique(out, raw);
+    };
+    std::vector<snapshot::EntitySnapshot> a, b;
+    capture(a);
+    capture(b);
+    ASSERT_EQ(a.size(), b.size());
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        EXPECT_EQ(a[i].id.value, b[i].id.value);
+        EXPECT_EQ(a[i].state, b[i].state);
+        EXPECT_FLOAT_EQ(a[i].position.x, b[i].position.x);
+    }
+}

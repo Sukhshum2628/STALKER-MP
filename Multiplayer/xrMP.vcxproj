@@ -138,6 +138,7 @@
     <ClCompile Include="src\snapshot\SnapshotPool.cpp" />
     <ClCompile Include="src\snapshot\SnapshotBuilder.cpp" />
     <ClCompile Include="src\snapshot\SnapshotQueue.cpp" />
+    <ClCompile Include="src\snapshot\SnapshotManager.cpp" />
     <ClCompile Include="src\player\PlayerRegistry.cpp" />
     <ClCompile Include="src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="src\player\PlayerSessionObserver.cpp" />
@@ -272,8 +273,10 @@
     <ClInclude Include="include\stalkermp\snapshot\SnapshotPool.h" />
     <ClInclude Include="include\stalkermp\world\IEntitySnapshotSource.h" />
     <ClInclude Include="include\stalkermp\adapters\EntitySnapshotSource.h" />
+    <ClInclude Include="include\stalkermp\adapters\EntitySnapshotMarshal.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotBuilder.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotQueue.h" />
+    <ClInclude Include="include\stalkermp\snapshot\SnapshotManager.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />

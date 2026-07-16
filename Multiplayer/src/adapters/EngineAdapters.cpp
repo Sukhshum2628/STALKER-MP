@@ -23,6 +23,12 @@
 #include "stalkermp/adapters/PlayerSpawnGateway.h"
 #include "stalkermp/player/IPlayerSpawnGateway.h"
 
+// Entity snapshot capture seam (Sprint-008, Step 9) — engine-free interface,
+// factory, and the value-only ascending marshaling helper.
+#include "stalkermp/adapters/EntitySnapshotSource.h"
+#include "stalkermp/adapters/EntitySnapshotMarshal.h"
+#include "stalkermp/world/IEntitySnapshotSource.h"
+
 // --- X-Ray Engine headers (adapter layer only) ------------------------------
 #include "stdafx.h"           // xrEngine precompiled-header umbrella.
 #include "IGame_Level.h"      // g_pGameLevel, CObjectList, relcase_(un)register.
@@ -126,6 +132,59 @@ namespace stalkermp::adapters
                 // Lua integration (Sprint-013). See IEnvironmentSource.h.
                 sample.emissionActive = false;
                 return sample;
+            }
+        };
+
+        // ------------------------------------------- Entity snapshot source (Step 9)
+        //
+        // The snapshot-specific capture seam (Architecture §15 clarification:
+        // consumed ONLY by SnapshotBuilder; NOT a general-purpose entity API).
+        // Reads each live engine object's id and transform ON DEMAND into plain
+        // EntitySnapshot VALUES — no CObject pointer is retained (E-G / ADR-008
+        // read-only observation), no engine state is mutated. The deterministic
+        // ascending-by-EntityId, unique, id!=0 ordering and the append-only
+        // contract are delegated to the engine-free detail::AppendAscendingUnique
+        // helper. Values only cross the world::IEntitySnapshotSource seam.
+        class EngineEntitySnapshotSource final : public world::IEntitySnapshotSource
+        {
+        public:
+            void Capture(std::vector<snapshot::EntitySnapshot>& out) const override
+            {
+                if (g_pGameLevel == nullptr)
+                {
+                    return; // no level -> nothing to capture (append-only: out unchanged)
+                }
+
+                // Collect raw per-object values (no pointer retained). Ordering and
+                // uniqueness are applied by the engine-free helper below.
+                std::vector<snapshot::EntitySnapshot> raw;
+                const u32 count = g_pGameLevel->Objects.o_count();
+                raw.reserve(count);
+                for (u32 i = 0; i < count; ++i)
+                {
+                    CObject* object = g_pGameLevel->Objects.o_get_by_iterator(i);
+                    if (object == nullptr)
+                    {
+                        continue;
+                    }
+                    const std::uint32_t id = static_cast<std::uint32_t>(object->ID());
+                    if (id == 0) // reserved null EntityId
+                    {
+                        continue;
+                    }
+
+                    snapshot::EntitySnapshot value{};
+                    value.id = world::EntityId{id};
+                    const Fvector& position = object->Position();
+                    value.position = world::Vec3{position.x, position.y, position.z};
+                    // velocity/state/flags/inventoryRef/runtimeState remain at their
+                    // engine-free zero defaults (0 = none); richer per-entity fields
+                    // are marshaled here as confirmed engine getters are added (they
+                    // are opaque, value-only, and never a retained pointer).
+                    raw.push_back(value); // value copy only
+                }
+
+                detail::AppendAscendingUnique(out, raw); // deterministic, append-only
             }
         };
 
@@ -511,6 +570,14 @@ namespace stalkermp::adapters
     std::unique_ptr<world::IEnvironmentSource> CreateEngineEnvironmentSource()
     {
         return std::make_unique<EngineEnvironmentSource>();
+    }
+
+    // Engine-build definition of the entity snapshot source factory (Sprint-008,
+    // Step 9). The test build links tests/support/NullEntitySnapshotSource.cpp
+    // instead; this definition is compiled only into xrMP (engine headers present).
+    std::unique_ptr<world::IEntitySnapshotSource> CreateEngineEntitySnapshotSource()
+    {
+        return std::make_unique<EngineEntitySnapshotSource>();
     }
 
     core::Expected<std::unique_ptr<IFrameBridge>>
