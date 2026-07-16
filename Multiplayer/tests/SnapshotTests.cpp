@@ -1270,3 +1270,279 @@ TEST(SnapshotDiagnosticsStep11, ReadOnlyGuarantees)
     EXPECT_EQ(rig.manager.Queue().Published(), publishedBefore);
     EXPECT_EQ(rig.manager.Queue().Depth(), depthBefore);
 }
+
+// ============================================================================
+// Step 12 — Validation hardening (negative surface; every rejection is a value
+//           outcome that leaves state unchanged; determinism under stress)
+// ============================================================================
+
+namespace
+{
+    // A deliberately malformed source: emits a duplicate EntityId so the builder's
+    // ascending-unique guard (SimulationSnapshot::AddEntity) must reject it.
+    class DuplicateEntitySource final : public world::IEntitySnapshotSource
+    {
+    public:
+        void Capture(std::vector<snapshot::EntitySnapshot>& out) const override
+        {
+            snapshot::EntitySnapshot a{};
+            a.id = world::EntityId{5};
+            out.push_back(a);
+            snapshot::EntitySnapshot b{};
+            b.id = world::EntityId{5}; // duplicate -> AddEntity rejects
+            out.push_back(b);
+        }
+    };
+
+    // Emits a descending pair so the ascending guard rejects the second entity.
+    class DescendingEntitySource final : public world::IEntitySnapshotSource
+    {
+    public:
+        void Capture(std::vector<snapshot::EntitySnapshot>& out) const override
+        {
+            snapshot::EntitySnapshot a{};
+            a.id = world::EntityId{9};
+            out.push_back(a);
+            snapshot::EntitySnapshot b{};
+            b.id = world::EntityId{4}; // out of order -> AddEntity rejects
+            out.push_back(b);
+        }
+    };
+} // namespace
+
+// --- Invalid input validation: null / wrong-state inputs are value outcomes ---
+TEST(SnapshotHardeningStep12, InvalidInputValidation)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+
+    // Queue: null and non-Finalized publications are rejected (no throw, no change).
+    snapshot::SnapshotQueue queue{pool};
+    EXPECT_FALSE(queue.Publish(nullptr).HasValue());
+    auto building = pool.Acquire();
+    ASSERT_TRUE(building.HasValue());
+    building.Value()->BeginBuild(snapshot::SnapshotId{1}, 1, 1); // Building, not Finalized
+    EXPECT_FALSE(queue.Publish(building.Value()).HasValue());
+    EXPECT_EQ(queue.Published(), 0u);
+    EXPECT_EQ(queue.Depth(), 0u);
+    pool.ReturnToPool(building.Value());
+
+    // Pool: null / unknown handles are benign no-ops; RefCount(unknown) == 0.
+    snapshot::SimulationSnapshot stackSnap; // not owned by any pool
+    pool.AddRef(nullptr);
+    pool.AddRef(&stackSnap);
+    pool.ReturnToPool(nullptr);
+    pool.ReturnToPool(&stackSnap);
+    EXPECT_EQ(pool.RefCount(&stackSnap), 0u);
+    EXPECT_EQ(pool.InUse(), 0u);
+
+    // Builder: Capture / Finalize with no active build are value-outcome rejections.
+    snapshot::SnapshotBuilder builder{snapshot::SnapshotConfiguration{}};
+    FakeEntitySource entities{1};
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+    EXPECT_FALSE(builder.Capture(entities, players, env).HasValue());
+    EXPECT_FALSE(builder.Finalize().HasValue());
+    EXPECT_FALSE(builder.Building());
+}
+
+// --- Lifecycle validation: invalid state transitions rejected -----------------
+TEST(SnapshotHardeningStep12, LifecycleValidation)
+{
+    // Immutability: a finalized snapshot rejects every mutator (regression E-G1-S).
+    snapshot::SimulationSnapshot snap;
+    snap.BeginBuild(snapshot::SnapshotId{1}, 1, 1);
+    ASSERT_TRUE(snap.AddEntity(Ent(1)).HasValue());
+    ASSERT_TRUE(snap.Finalize().HasValue());
+    EXPECT_FALSE(snap.AddEntity(Ent(2)).HasValue());
+    EXPECT_FALSE(snap.AddPlayer(Plr(1, 1)).HasValue());
+    EXPECT_FALSE(snap.SetEnvironment(snapshot::EnvironmentSnapshot{}).HasValue());
+    EXPECT_FALSE(snap.Finalize().HasValue()); // double-finalize rejected
+    EXPECT_EQ(snap.Entities().size(), 1u);
+
+    // Manager: ticking before Initialize (pool unreserved) publishes nothing and
+    // does not crash — the build is skipped as a value outcome.
+    ManagerRig rig{snapshot::SnapshotConfiguration{}, 2};
+    rig.manager.Tick(0.016); // no Initialize() -> pool capacity 0 -> PoolExhausted skip
+    EXPECT_EQ(rig.manager.Queue().Published(), 0u);
+    EXPECT_EQ(rig.manager.LastTick(), 1u); // counter still advances deterministically
+}
+
+// --- Ordering validation: a malformed source is rejected; buffer returned ------
+TEST(SnapshotHardeningStep12, OrderingValidation)
+{
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        snapshot::SnapshotPool pool;
+        pool.Reserve(1);
+        snapshot::SnapshotBuilder builder{snapshot::SnapshotConfiguration{}};
+        ASSERT_TRUE(builder.BeginBuild(pool, 1).HasValue());
+
+        DuplicateEntitySource dup;
+        DescendingEntitySource desc;
+        const world::IEntitySnapshotSource& bad =
+            (variant == 0) ? static_cast<world::IEntitySnapshotSource&>(dup)
+                           : static_cast<world::IEntitySnapshotSource&>(desc);
+
+        EXPECT_FALSE(builder.Capture(bad, players, env).HasValue()); // ordering guard rejects
+        EXPECT_FALSE(builder.Building());                            // build aborted
+        EXPECT_EQ(pool.InUse(), 0u);                                // buffer returned (no orphan)
+    }
+}
+
+// --- Capacity validation: pool/entity/player caps are value outcomes ----------
+TEST(SnapshotHardeningStep12, CapacityValidation)
+{
+    // Reserve(0): every Acquire is PoolExhausted.
+    snapshot::SnapshotPool empty;
+    empty.Reserve(0);
+    EXPECT_EQ(empty.Capacity(), 0u);
+    EXPECT_FALSE(empty.Acquire().HasValue());
+
+    // Pool exhaustion at capacity.
+    snapshot::SnapshotPool pool;
+    pool.Reserve(1);
+    ASSERT_TRUE(pool.Acquire().HasValue());
+    EXPECT_TRUE(pool.Full());
+    EXPECT_FALSE(pool.Acquire().HasValue()); // PoolExhausted, not a throw
+
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+    ASSERT_TRUE(players.RequestJoin(net::ConnectionId{1}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+    ASSERT_TRUE(players.RequestJoin(net::ConnectionId{2}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+    ASSERT_TRUE(players.RequestJoin(net::ConnectionId{3}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+
+    // Entity cap Overflow.
+    {
+        snapshot::SnapshotConfiguration cfg{};
+        cfg.maxEntities = 2;
+        snapshot::SnapshotPool p;
+        p.Reserve(1);
+        snapshot::SnapshotBuilder b{cfg};
+        FakeEntitySource many{3};
+        ASSERT_TRUE(b.BeginBuild(p, 1).HasValue());
+        EXPECT_FALSE(b.Capture(many, players, env).HasValue()); // entity Overflow
+        EXPECT_EQ(p.InUse(), 0u);
+    }
+    // Player cap Overflow (3 active players, snapshot maxPlayers = 2).
+    {
+        snapshot::SnapshotConfiguration cfg{};
+        cfg.maxPlayers = 2;
+        snapshot::SnapshotPool p;
+        p.Reserve(1);
+        snapshot::SnapshotBuilder b{cfg};
+        FakeEntitySource none{0};
+        ASSERT_TRUE(b.BeginBuild(p, 1).HasValue());
+        EXPECT_FALSE(b.Capture(none, players, env).HasValue()); // player Overflow
+        EXPECT_EQ(p.InUse(), 0u);
+    }
+}
+
+// --- Queue invariant validation: retire only at ref 0; unknown release no-op --
+TEST(SnapshotHardeningStep12, QueueInvariantValidation)
+{
+    snapshot::SnapshotPool pool;
+    pool.Reserve(2);
+    snapshot::SnapshotQueue queue{pool};
+
+    auto make = [&pool](std::uint64_t id) {
+        auto a = pool.Acquire();
+        a.Value()->BeginBuild(snapshot::SnapshotId{id}, id, 1);
+        (void)a.Value()->AddEntity(Ent(static_cast<std::uint32_t>(id)));
+        (void)a.Value()->Finalize();
+        return a.Value();
+    };
+
+    const auto* s1 = make(1);
+    ASSERT_TRUE(queue.Publish(s1).HasValue());
+    const auto* held = queue.Acquire();          // consumer holds s1
+    EXPECT_EQ(pool.RefCount(s1), 2u);
+
+    const auto* s2 = make(2);
+    ASSERT_TRUE(queue.Publish(s2).HasValue());   // supersede: s1 publication ref released
+    EXPECT_EQ(pool.RefCount(s1), 1u);            // retained by the consumer, not retired
+    EXPECT_EQ(pool.InUse(), 2u);
+
+    // Releasing an unknown/null handle is a benign no-op (no ref change).
+    snapshot::SimulationSnapshot alien;
+    queue.Release(&alien);
+    queue.Release(nullptr);
+    EXPECT_EQ(pool.RefCount(s1), 1u);
+
+    queue.Release(held);                         // now ref 0 -> retired
+    EXPECT_EQ(pool.RefCount(s1), 0u);
+    EXPECT_EQ(pool.InUse(), 1u);
+    EXPECT_EQ(queue.Published(), 2u);            // monotonic
+}
+
+// --- Configuration validation: cross-field + per-field invariants -------------
+TEST(SnapshotHardeningStep12, ConfigurationValidation)
+{
+    using snapshot::SnapshotConfiguration;
+    {
+        core::ConfigStore s; s.Set("snapshot", "pool_capacity", "1"); // < min 2
+        EXPECT_FALSE(SnapshotConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s; s.Set("snapshot", "version", "0"); // < min 1
+        EXPECT_FALSE(SnapshotConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s; s.Set("snapshot", "max_entities", "0"); // < min 1
+        EXPECT_FALSE(SnapshotConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("snapshot", "pool_capacity", "3");
+        s.Set("snapshot", "queue_depth", "4"); // > pool_capacity
+        EXPECT_FALSE(SnapshotConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s; // equal is allowed; defaults otherwise
+        s.Set("snapshot", "pool_capacity", "4");
+        s.Set("snapshot", "queue_depth", "4");
+        const auto r = SnapshotConfiguration::FromConfig(s);
+        ASSERT_TRUE(r.HasValue());
+        EXPECT_EQ(r.Value().queueDepth, 4u);
+    }
+}
+
+// --- Regression verification: deterministic large-world churn under stress ----
+TEST(SnapshotHardeningStep12, RegressionDeterministicStress)
+{
+    auto run = [](std::uint64_t& published, std::uint64_t& lastId, std::uint32_t& entityCount,
+                  std::uint32_t& poolInUse) {
+        ManagerRig rig{snapshot::SnapshotConfiguration{}, /*entities*/ 512};
+        (void)rig.players.RequestJoin(net::ConnectionId{1}, player::PlayerProfile{}, 1);
+        ASSERT_TRUE(rig.manager.Initialize().HasValue());
+        for (int i = 0; i < 25; ++i) rig.manager.Tick(0.016);
+        published = rig.manager.Queue().Published();
+        lastId = rig.manager.LatestMetadata().id.value;
+        entityCount = rig.manager.LatestMetadata().entityCount;
+        poolInUse = rig.manager.Statistics().poolInUse;
+    };
+    std::uint64_t pubA = 0, pubB = 0, idA = 0, idB = 0;
+    std::uint32_t ecA = 0, ecB = 0, inUseA = 0, inUseB = 0;
+    run(pubA, idA, ecA, inUseA);
+    run(pubB, idB, ecB, inUseB);
+
+    EXPECT_EQ(pubA, 25u);          // one publication per tick, sustained
+    EXPECT_EQ(pubA, pubB);
+    EXPECT_EQ(idA, idB);           // identical monotonic id sequence (replay identity)
+    EXPECT_EQ(ecA, 512u);
+    EXPECT_EQ(ecA, ecB);
+    EXPECT_LE(inUseA, snapshot::SnapshotConfiguration{}.poolCapacity); // bounded memory
+    EXPECT_EQ(inUseA, inUseB);     // deterministic pool occupancy
+}
