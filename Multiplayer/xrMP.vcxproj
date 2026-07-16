@@ -141,6 +141,7 @@
     <ClCompile Include="src\snapshot\SnapshotManager.cpp" />
     <ClCompile Include="src\snapshot\SnapshotDiagnostics.cpp" />
     <ClCompile Include="src\replication\ReplicationConfiguration.cpp" />
+    <ClCompile Include="src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="src\player\PlayerRegistry.cpp" />
     <ClCompile Include="src\player\PlayerLifecycle.cpp" />
     <ClCompile Include="src\player\PlayerSessionObserver.cpp" />
@@ -282,6 +283,8 @@
     <ClInclude Include="include\stalkermp\snapshot\SnapshotDiagnostics.h" />
     <ClInclude Include="include\stalkermp\replication\ReplicationTypes.h" />
     <ClInclude Include="include\stalkermp\replication\ReplicationConfiguration.h" />
+    <ClInclude Include="include\stalkermp\replication\IReplicationView.h" />
+    <ClInclude Include="include\stalkermp\replication\ReplicationUpdate.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />

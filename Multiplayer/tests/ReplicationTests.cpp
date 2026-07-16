@@ -11,10 +11,30 @@
 #include <type_traits>
 
 #include "stalkermp/core/Config.h"
+#include "stalkermp/replication/IReplicationView.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
+#include "stalkermp/replication/ReplicationUpdate.h"
 
 using namespace stalkermp;
+
+namespace
+{
+    replication::EntityReplicationState RE(std::uint32_t id)
+    {
+        replication::EntityReplicationState e{};
+        e.id = world::EntityId{id};
+        e.stateFlags = id * 10u;
+        return e;
+    }
+    replication::PlayerReplicationState RP(std::uint32_t id, std::uint32_t entity)
+    {
+        replication::PlayerReplicationState p{};
+        p.id = player::PlayerId{id};
+        p.entity = world::EntityId{entity};
+        return p;
+    }
+} // namespace
 
 // --- Enum layout: fixed std::uint8_t underlying type (deterministic ABI) -----
 TEST(ReplicationTypesStep1, EnumsHaveUint8UnderlyingType)
@@ -254,4 +274,107 @@ TEST(ReplicationConfigStep2, BoundaryMinimumsAccepted)
     EXPECT_EQ(r.Value().maxClients, 1u);
     EXPECT_EQ(r.Value().retryLimit, 1u);
     EXPECT_EQ(r.Value().version, 1u);
+}
+
+// ============================================================================
+// Step 3 — Immutable ReplicationUpdate + IReplicationView
+// ============================================================================
+
+// --- Build -> Finalize: content captured, counts stamped, state Built ---------
+TEST(ReplicationUpdateStep3, BuildAndFinalize)
+{
+    replication::ReplicationUpdate update;
+    update.BeginBuild(replication::ReplicationId{42}, replication::ClientId{7},
+                      /*sourceSnapshotId*/ 1000, /*sourceSnapshotTick*/ 500);
+    EXPECT_EQ(update.State(), replication::ReplicationState::Pending);
+    EXPECT_FALSE(update.IsFinalized());
+
+    ASSERT_TRUE(update.AddEntity(RE(1)).HasValue());
+    ASSERT_TRUE(update.AddEntity(RE(5)).HasValue());
+    ASSERT_TRUE(update.AddPlayer(RP(1, 1)).HasValue());
+    ASSERT_TRUE(update.SetReliability(replication::ReplicationReliability::Reliable).HasValue());
+
+    ASSERT_TRUE(update.Finalize().HasValue());
+    EXPECT_EQ(update.State(), replication::ReplicationState::Built);
+    EXPECT_TRUE(update.IsFinalized());
+
+    // Consumer surface (const-only) reflects the captured content.
+    const replication::IReplicationView& view = update;
+    EXPECT_EQ(view.Metadata().id.value, 42u);
+    EXPECT_EQ(view.Metadata().client.value, 7u);
+    EXPECT_EQ(view.Metadata().sourceSnapshotId, 1000u);
+    EXPECT_EQ(view.Metadata().sourceSnapshotTick, 500u);
+    EXPECT_EQ(view.Metadata().entityCount, 2u);
+    EXPECT_EQ(view.Metadata().playerCount, 1u);
+    EXPECT_EQ(view.Metadata().reliability, replication::ReplicationReliability::Reliable);
+    ASSERT_EQ(view.Entities().size(), 2u);
+    EXPECT_EQ(view.Entities()[0].id.value, 1u);
+    EXPECT_EQ(view.Entities()[1].id.value, 5u);
+    ASSERT_EQ(view.Players().size(), 1u);
+    EXPECT_EQ(view.Players()[0].id.value, 1u);
+}
+
+// --- Deterministic ordering: non-ascending / duplicate / zero rejected --------
+TEST(ReplicationUpdateStep3, AscendingUniqueEnforced)
+{
+    replication::ReplicationUpdate update;
+    update.BeginBuild(replication::ReplicationId{1}, replication::ClientId{1}, 1, 1);
+    ASSERT_TRUE(update.AddEntity(RE(3)).HasValue());
+    EXPECT_FALSE(update.AddEntity(RE(3)).HasValue()); // duplicate
+    EXPECT_FALSE(update.AddEntity(RE(2)).HasValue()); // out of order
+    EXPECT_FALSE(update.AddEntity(RE(0)).HasValue()); // none id
+    ASSERT_TRUE(update.AddEntity(RE(4)).HasValue());  // ascending ok
+
+    ASSERT_TRUE(update.AddPlayer(RP(2, 20)).HasValue());
+    EXPECT_FALSE(update.AddPlayer(RP(2, 21)).HasValue()); // duplicate
+    EXPECT_FALSE(update.AddPlayer(RP(1, 22)).HasValue()); // out of order
+    EXPECT_FALSE(update.AddPlayer(RP(0, 23)).HasValue()); // none id
+
+    ASSERT_EQ(update.Entities().size(), 2u);
+    ASSERT_EQ(update.Players().size(), 1u);
+}
+
+// --- Immutability: mutating a Finalized update is rejected (E-G1-R) ------------
+TEST(ReplicationUpdateStep3, ImmutableAfterFinalize)
+{
+    replication::ReplicationUpdate update;
+    update.BeginBuild(replication::ReplicationId{1}, replication::ClientId{1}, 1, 1);
+    ASSERT_TRUE(update.AddEntity(RE(1)).HasValue());
+    ASSERT_TRUE(update.Finalize().HasValue());
+
+    // Every mutating operation now fails; content is unchanged.
+    EXPECT_FALSE(update.AddEntity(RE(2)).HasValue());
+    EXPECT_FALSE(update.AddPlayer(RP(1, 1)).HasValue());
+    EXPECT_FALSE(update.SetReliability(replication::ReplicationReliability::Reliable).HasValue());
+    EXPECT_FALSE(update.Finalize().HasValue()); // double-finalize rejected
+    EXPECT_EQ(update.Entities().size(), 1u);
+    EXPECT_EQ(update.State(), replication::ReplicationState::Built);
+}
+
+// --- Deterministic replay: identical build sequence => identical content -------
+TEST(ReplicationUpdateStep3, DeterministicBuild)
+{
+    auto build = [](replication::ReplicationUpdate& u) {
+        u.BeginBuild(replication::ReplicationId{7}, replication::ClientId{3}, 500, 250);
+        (void)u.AddEntity(RE(2));
+        (void)u.AddEntity(RE(9));
+        (void)u.AddPlayer(RP(3, 30));
+        (void)u.SetReliability(replication::ReplicationReliability::Reliable);
+        (void)u.Finalize();
+    };
+    replication::ReplicationUpdate a;
+    replication::ReplicationUpdate b;
+    build(a);
+    build(b);
+    ASSERT_EQ(a.Entities().size(), b.Entities().size());
+    for (std::size_t i = 0; i < a.Entities().size(); ++i)
+    {
+        EXPECT_EQ(a.Entities()[i].id.value, b.Entities()[i].id.value);
+        EXPECT_EQ(a.Entities()[i].stateFlags, b.Entities()[i].stateFlags);
+    }
+    EXPECT_EQ(a.Metadata().id.value, b.Metadata().id.value);
+    EXPECT_EQ(a.Metadata().entityCount, b.Metadata().entityCount);
+    EXPECT_EQ(a.Metadata().reliability, b.Metadata().reliability);
+    // No wall-clock in content identity (timestampWallClock unset).
+    EXPECT_EQ(a.Metadata().timestampWallClock, b.Metadata().timestampWallClock);
 }
