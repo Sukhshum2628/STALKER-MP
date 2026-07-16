@@ -279,6 +279,7 @@
     <ClInclude Include="include\stalkermp\snapshot\SnapshotQueue.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotManager.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotDiagnostics.h" />
+    <ClInclude Include="include\stalkermp\replication\ReplicationTypes.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />

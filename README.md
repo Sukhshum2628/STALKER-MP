@@ -101,13 +101,15 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **006** | Host Networking Infrastructure (transport, session, wire) | ✅ Verified (Closed) |
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
 | **008** | Snapshot System (immutable snapshots) | ✅ Verified (Closed) |
-| 009 | Replication Pipeline | ⏳ Planned (next) |
+| **009** | **Replication Pipeline** | 🚧 **In progress** — Step 1 / 16 |
 | 010 | Client Prediction / Interpolation | ⏳ Planned |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
-**Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified. **Next focus — Sprint-009 (Replication Pipeline)**, which consumes these snapshots.
+**Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified.
+
+**Current focus — Sprint-009 (Replication Pipeline):** the host-authoritative consumer that transforms immutable snapshots into prioritized, delta-encoded, bandwidth-efficient network updates. The complete 16-step implementation plan is frozen (`Documentation/SPRINTS/Sprint-009/Sprint-009-Implementation-Plan.md`); implementation is proceeding one verified step at a time. Replication owns no entities, executes no gameplay, and mutates no simulation.
 
 ---
 
@@ -120,7 +122,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Test Status
 
-- **377 / 377 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
+- **383 / 383 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.
