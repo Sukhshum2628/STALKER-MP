@@ -59,6 +59,10 @@
 #include "stalkermp/player/PlayerDeltaQueue.h"
 #include "stalkermp/player/PlayerManager.h"
 #include "stalkermp/player/PlayerManagerService.h"
+#include "stalkermp/adapters/EntitySnapshotSource.h"     // engine-free factory decl (Sprint-008)
+#include "stalkermp/snapshot/SnapshotConfiguration.h"
+#include "stalkermp/snapshot/SnapshotManager.h"
+#include "stalkermp/world/IEntitySnapshotSource.h"
 #include "stalkermp/world/WorldConfiguration.h"
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
@@ -128,6 +132,12 @@ namespace stalkermp
             std::unique_ptr<world::IEntitySource> entitySource;
             std::unique_ptr<world::IEnvironmentSource> environmentSource;
 
+            // Entity snapshot capture source (Sprint-008, Step 9): the engine
+            // adapter in the engine build (CreateEngineEntitySnapshotSource) and the
+            // null source in tests. Owned here so it outlives the SnapshotManager
+            // (owned by the ServiceRegistry) that references it by const reference.
+            std::unique_ptr<world::IEntitySnapshotSource> entitySnapshotSource;
+
             // ALife switch gateway (Sprint-005). Engine-free seam; the real gateway
             // in the engine build (CreateEngineAlifeSwitchGateway) and the null
             // adapter in tests. Owned here so it outlives the TransitionManagerService,
@@ -181,6 +191,12 @@ namespace stalkermp
             std::unique_ptr<player::PlayerManager> playerManager;
             std::unique_ptr<player::NetworkedPlayerPositionSource> networkedPlayerSource;
             player::PlayerManagerService* playerManagerService = nullptr;
+
+            // Snapshot System (Sprint-008). The SnapshotManager (IService +
+            // ITickable) is owned by the ServiceRegistry; cached here so it can be
+            // subscribed to / unsubscribed from the frame dispatcher at
+            // tick_order::kReplication = 400.
+            snapshot::SnapshotManager* snapshotManager = nullptr;
         };
 
         // The single module-global. See file header for justification.
@@ -546,6 +562,42 @@ namespace stalkermp
                 return subscribed;
             }
 
+            // Snapshot System (Sprint-008 §Step-10). Registered LAST — after every
+            // simulation producer (World, EntityRegistry, Bubble, Transition,
+            // PlayerManager) — so its declared ordering-only dependencies are all
+            // registered earlier and registration-order InitializeAll initializes it
+            // after them (Initialize reserves the pool). Constructed with the
+            // SnapshotConfiguration, the engine-free entity snapshot source (real in
+            // the engine build, null in tests; Runtime-owned), and const references
+            // to the Sprint-007 player surface and the Sprint-002 environment source.
+            auto snapshotConfiguration = snapshot::SnapshotConfiguration::FromConfig(runtime.serverConfig);
+            if (!snapshotConfiguration)
+            {
+                return snapshotConfiguration.GetError();
+            }
+            runtime.entitySnapshotSource = adapters::CreateEngineEntitySnapshotSource();
+            auto snapshotManager = std::make_unique<snapshot::SnapshotManager>(
+                snapshotConfiguration.Value(), *runtime.entitySnapshotSource, *runtime.playerManager,
+                *runtime.environmentSource);
+            snapshot::SnapshotManager* snapshotManagerPtr = snapshotManager.get();
+            if (auto registered = runtime.services.Register(std::move(snapshotManager)); !registered)
+            {
+                return registered;
+            }
+
+            // Single snapshot tick at the reserved tick_order::kReplication = 400,
+            // strictly after the Transition stage (350) and before Networking (900):
+            // one immutable snapshot is published per frame from the completed
+            // simulation state. Uses the single existing FrameDispatcher; no new
+            // engine frame registration.
+            if (auto subscribed = runtime.frameDispatcher.Subscribe(
+                    *snapshotManagerPtr, tick_order::kReplication, "Snapshot");
+                !subscribed)
+            {
+                return subscribed;
+            }
+            runtime.snapshotManager = snapshotManagerPtr;
+
             runtime.worldManager = managerPtr;
             return Success();
         }
@@ -679,6 +731,23 @@ namespace stalkermp
                     Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
                 }
                 g_runtime->entityFeed.reset();
+            }
+
+            // Snapshot System runtime (Sprint-008): unsubscribe from the
+            // (no-longer-driven) dispatcher before ShutdownAll. Removed before the
+            // producer subsystems it observes (reverse of subscription order — it was
+            // subscribed last). The SnapshotManager owns its pool/builder/queue, so
+            // ShutdownAll's reverse-order Shutdown + destruction returns every pooled
+            // buffer; the Runtime-owned entity snapshot source outlives ShutdownAll
+            // and is destroyed with the Runtime (same pattern as the other sources).
+            if (g_runtime->snapshotManager != nullptr)
+            {
+                if (auto unsubscribed = g_runtime->frameDispatcher.Unsubscribe(*g_runtime->snapshotManager);
+                    !unsubscribed && IsLogAvailable())
+                {
+                    Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
+                }
+                g_runtime->snapshotManager = nullptr;
             }
 
             // Host Networking runtime (Sprint-006): unsubscribe FIRST among the
