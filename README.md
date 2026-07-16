@@ -102,7 +102,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **005** | ALife Transition Layer (online/offline switching) | ✅ Verified (Closed) |
 | **006** | Host Networking Infrastructure (transport, session, wire) | ✅ Verified (Closed) |
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
-| **008** | **Snapshot System (immutable snapshots)** | 🚧 **In progress** — Step 12 / 14 |
+| **008** | **Snapshot System (immutable snapshots)** | 🚧 **In progress** — Step 13 / 14 |
 | 009 | Replication Pipeline | ⏳ Planned |
 | 010 | Client Prediction / Interpolation | ⏳ Planned |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
@@ -116,13 +116,13 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 ## Current Implementation Status
 
 - **Sprints 001–007:** implemented, independently verified, and closed.
-- **Sprint-008:** value types (Step 1), configuration (Step 2), the immutable `SimulationSnapshot` + `ISnapshotView` (Step 3), the exception-free fixed-capacity `SnapshotPool` (Step 4), the additive engine-free `world::IEntitySnapshotSource` capture seam + null (Step 5), the deterministic value-only `SnapshotBuilder` (Step 6), the single-producer / multi-consumer `SnapshotQueue` (Step 7), the per-tick `SnapshotManager` (`IService` + `ITickable`) at `tick_order::kReplication = 400` (Step 8), the engine-boundary `adapters::EngineEntitySnapshotSource` (the sole new engine TU; value-only ascending capture) with its engine-free marshaling helper (Step 9), the Bootstrap composition-root wiring that registers the `SnapshotManager` and subscribes it to the `FrameDispatcher` at `tick_order::kReplication = 400` with reverse-order teardown (Step 10), the read-only `SnapshotDiagnostics` inspector (statistics, state/queue/memory reporting, snapshot dump, build history, consistency validation) (Step 11), and the validation-hardening negative-surface suite across pool/builder/queue/manager/diagnostics — invalid state transitions, null inputs, capacity/ordering/lifecycle/queue/configuration invariants, and deterministic churn stress, every rejection a value outcome (Step 12) implemented and verified; steps 13–14 (integration, closure) remain.
+- **Sprint-008:** value types (Step 1), configuration (Step 2), the immutable `SimulationSnapshot` + `ISnapshotView` (Step 3), the exception-free fixed-capacity `SnapshotPool` (Step 4), the additive engine-free `world::IEntitySnapshotSource` capture seam + null (Step 5), the deterministic value-only `SnapshotBuilder` (Step 6), the single-producer / multi-consumer `SnapshotQueue` (Step 7), the per-tick `SnapshotManager` (`IService` + `ITickable`) at `tick_order::kReplication = 400` (Step 8), the engine-boundary `adapters::EngineEntitySnapshotSource` (the sole new engine TU; value-only ascending capture) with its engine-free marshaling helper (Step 9), the Bootstrap composition-root wiring that registers the `SnapshotManager` and subscribes it to the `FrameDispatcher` at `tick_order::kReplication = 400` with reverse-order teardown (Step 10), the read-only `SnapshotDiagnostics` inspector (statistics, state/queue/memory reporting, snapshot dump, build history, consistency validation) (Step 11), the validation-hardening negative-surface suite across pool/builder/queue/manager/diagnostics — invalid state transitions, null inputs, capacity/ordering/lifecycle/queue/configuration invariants, and deterministic churn stress, every rejection a value outcome (Step 12), and composed-stack integration (multiple synchronous consumers, capture correctness, full-tick replay identity) with the subsystem documentation in `Multiplayer/docs/Snapshots.md` (Step 13) implemented and verified; step 14 (sprint closure) remains.
 - **Engine boundary:** intact — engine headers confined to `Multiplayer/src/adapters/EngineAdapters.cpp`.
 - **Platform boundary:** intact — OS socket headers confined to `Multiplayer/src/adapters/PlatformSockets.cpp`.
 
 ## Test Status
 
-- **374 / 374 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
+- **377 / 377 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.

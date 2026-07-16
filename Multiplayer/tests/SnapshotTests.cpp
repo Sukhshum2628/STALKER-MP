@@ -1546,3 +1546,116 @@ TEST(SnapshotHardeningStep12, RegressionDeterministicStress)
     EXPECT_LE(inUseA, snapshot::SnapshotConfiguration{}.poolCapacity); // bounded memory
     EXPECT_EQ(inUseA, inUseB);     // deterministic pool occupancy
 }
+
+// ============================================================================
+// Step 13 — Integration (composed stack behind the seams; no behavior change)
+// ============================================================================
+
+// --- Multiple synchronous consumers read the same published snapshot safely ---
+TEST(SnapshotIntegrationStep13, MultipleConsumersReadSamePublishedSnapshot)
+{
+    // Compose the real pipeline by hand (pool + builder + queue) driven by the
+    // fakes — the exact data path the SnapshotManager runs internally.
+    snapshot::SnapshotConfiguration cfg{};
+    snapshot::SnapshotPool pool;
+    pool.Reserve(cfg.poolCapacity);
+    snapshot::SnapshotBuilder builder{cfg};
+    snapshot::SnapshotQueue queue{pool};
+
+    FakeEntitySource entities{3};
+    FakeEnvSource env;
+    BuilderSpawnGateway gw;
+    net::Session session(8);
+    player::PlayerManager players(BuilderPlayerConfig(8), gw, session);
+    ASSERT_TRUE(players.RequestJoin(net::ConnectionId{5}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+
+    ASSERT_TRUE(builder.BeginBuild(pool, 1).HasValue());
+    ASSERT_TRUE(builder.Capture(entities, players, env).HasValue());
+    const auto finalized = builder.Finalize();
+    ASSERT_TRUE(finalized.HasValue());
+    ASSERT_TRUE(queue.Publish(finalized.Value()).HasValue());
+
+    // Three synchronous consumers acquire the current published snapshot.
+    const snapshot::SimulationSnapshot* c1 = queue.Acquire();
+    const snapshot::SimulationSnapshot* c2 = queue.Acquire();
+    const snapshot::SimulationSnapshot* c3 = queue.Acquire();
+    ASSERT_NE(c1, nullptr);
+    EXPECT_EQ(c1, c2); // the same immutable snapshot for every consumer
+    EXPECT_EQ(c2, c3);
+    EXPECT_EQ(pool.RefCount(c1), 4u); // publication + three consumers
+
+    // Every consumer observes identical, immutable content.
+    const snapshot::ISnapshotView& v1 = *c1;
+    const snapshot::ISnapshotView& v2 = *c2;
+    EXPECT_EQ(v1.Entities().size(), 3u);
+    EXPECT_EQ(v1.Players().size(), 1u);
+    EXPECT_EQ(v1.Metadata().id.value, v2.Metadata().id.value);
+    EXPECT_EQ(v1.Environment().weatherId, v2.Environment().weatherId);
+
+    queue.Release(c1);
+    queue.Release(c2);
+    queue.Release(c3);
+    EXPECT_EQ(pool.RefCount(finalized.Value()), 1u); // publication reference remains
+    EXPECT_EQ(queue.Depth(), 1u);
+}
+
+// --- World/Registry/Player captured correctly through the composed stack -------
+TEST(SnapshotIntegrationStep13, ComposedStackCaptureCorrectness)
+{
+    ManagerRig rig{snapshot::SnapshotConfiguration{}, /*entities*/ 5};
+    ASSERT_TRUE(rig.players.RequestJoin(net::ConnectionId{2}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+    ASSERT_TRUE(rig.players.RequestJoin(net::ConnectionId{7}, player::PlayerProfile{}, 1) ==
+                player::JoinOutcome::Accepted);
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.manager.Tick(0.016);
+
+    const snapshot::SimulationSnapshot* snap = rig.manager.Queue().Current();
+    ASSERT_NE(snap, nullptr);
+
+    // Entities captured from the source: ascending 1..5 with their value payload.
+    ASSERT_EQ(snap->Entities().size(), 5u);
+    for (std::uint32_t i = 0; i < 5; ++i)
+    {
+        EXPECT_EQ(snap->Entities()[i].id.value, i + 1);
+        EXPECT_EQ(snap->Entities()[i].state, (i + 1) * 10u);
+    }
+    // Players captured from the composed PlayerManager, ascending PlayerId.
+    ASSERT_EQ(snap->Players().size(), 2u);
+    EXPECT_LT(snap->Players()[0].id.value, snap->Players()[1].id.value);
+    // Environment captured from the source.
+    EXPECT_NE(snap->Environment().weatherId, 0u);
+    // Metadata counts agree with captured content.
+    EXPECT_EQ(snap->Metadata().entityCount, 5u);
+    EXPECT_EQ(snap->Metadata().playerCount, 2u);
+}
+
+// --- Full-tick replay identity through the composed manager --------------------
+TEST(SnapshotIntegrationStep13, FullTickReplayIdentity)
+{
+    auto run = [](std::vector<std::uint32_t>& ents, std::vector<std::uint32_t>& plrs,
+                  std::uint32_t& weather, std::uint64_t& id) {
+        ManagerRig rig{snapshot::SnapshotConfiguration{}, /*entities*/ 6};
+        (void)rig.players.RequestJoin(net::ConnectionId{3}, player::PlayerProfile{}, 1);
+        (void)rig.players.RequestJoin(net::ConnectionId{9}, player::PlayerProfile{}, 1);
+        ASSERT_TRUE(rig.manager.Initialize().HasValue());
+        for (int i = 0; i < 4; ++i) rig.manager.Tick(0.016);
+        const snapshot::SimulationSnapshot* s = rig.manager.Queue().Current();
+        ASSERT_NE(s, nullptr);
+        for (const auto& e : s->Entities()) ents.push_back(e.id.value);
+        for (const auto& p : s->Players()) plrs.push_back(p.id.value);
+        weather = s->Environment().weatherId;
+        id = s->Metadata().id.value;
+    };
+    std::vector<std::uint32_t> eA, eB, pA, pB;
+    std::uint32_t wA = 0, wB = 0;
+    std::uint64_t iA = 0, iB = 0;
+    run(eA, pA, wA, iA);
+    run(eB, pB, wB, iB);
+
+    EXPECT_EQ(eA, eB); // identical entity content + order
+    EXPECT_EQ(pA, pB); // identical player content + order
+    EXPECT_EQ(wA, wB); // identical environment
+    EXPECT_EQ(iA, iB); // identical snapshot id sequence (deterministic)
+}
