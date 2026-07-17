@@ -495,28 +495,32 @@ docs(replication): freeze Sprint-009 Step-09 spec (packet assembly + additive wi
 
 # Step-10 — Replication Worker (synchronous consumer pipeline)
 
-**Objective.** Define the worker that consumes an immutable snapshot and drives the full pipeline (interest → build update → delta → classify → enqueue → assemble → hand to transport) for every active client, **without creating a thread** and without mutating simulation.
+**Objective.** Define the worker that consumes an immutable snapshot and drives the full pipeline (interest → delta → classify → queue → assemble) for every active client, **producing per-client packets** into a result — **without creating a thread**, without sending, and without mutating simulation. (Refined: the worker does NOT touch the transport, a session, sockets, or acks — sending the produced packets is the composition root's job at Step 11/12. This keeps the worker engine/OS/network-free and its `Execute` deterministic and directly unit-testable.)
 
-**Scope — In.** `include/stalkermp/replication/ReplicationWorker.h` (+ `.cpp`): `ProcessSnapshot(const snapshot::ISnapshotView&)` running the per-client pipeline; `StartWorker()`/`StopWorker()`/`FlushQueues()` defined as synchronous lifecycle hooks (no thread spawned — designed for a future worker thread behind the snapshot seam, ADR-011); consumes snapshots via the Sprint-008 `SnapshotQueue` `Acquire`/`Release`; hands assembled payloads to the Sprint-006 session/host send seam. Read-only w.r.t. snapshot and simulation.
-**Scope — Out.** Service/tick integration (Step-11); Bootstrap wiring (Step-12); real OS threading (future sprint).
+**Scope — In.** `include/stalkermp/replication/ReplicationWorker.h` (+ `.cpp`):
+- `ReplicationExecuteResult` — value-only summary: `clientsProcessed`, `reliablePackets`, `unreliablePackets`, `recordsQueued`, `bytesAssembled`, and `std::vector<ReplicationPacket> packets` (assembled, ready for the transport step; not sent here).
+- `ReplicationWorker(const ReplicationConfiguration&, const ReplicationClientRegistry&, const IInterestPolicy&)` — owns the scratch `ReplicationQueues`, the `ReplicationPacketBuilder`, and the per-client entity baselines.
+- `Execute(const snapshot::ISnapshotView&) -> core::Expected<ReplicationExecuteResult>` — runs the frozen pipeline for every active client (ascending, one at a time): interest-select → build current relevant states from the snapshot → `EncodeEntityDelta` vs the client's baseline → `EnqueueChangeSet` (classify + route, §7.A) → `BuildPacket` reliable + unreliable → accumulate; then advance the client's baseline via `NextEntityBaseline`.
+- `StartWorker()`/`StopWorker()`/`FlushQueues()` — synchronous inert lifecycle hooks (no thread spawned; future-thread readiness only). `Running()` observer.
+**Scope — Out.** Service/tick integration (Step-11); Bootstrap wiring + sending (Step-12); ack handling (Step-11); real OS threading (future sprint).
 
-**Functional Requirements.** FR-1 for each active client: interest-select → build `ReplicationUpdate` (values only) → delta vs baseline → classify → enqueue → assemble packet → send via the Sprint-006 seam. FR-2 consumes only immutable snapshots (`Acquire`/`Release`); never mutates a snapshot or simulation (E-G1-R/E-G5-R). FR-3 no thread created; `StartWorker`/`StopWorker`/`FlushQueues` are synchronous and deterministic. FR-4 respects per-tick byte budget and per-update caps (Overflow → drop lowest priority, counter). FR-5 deterministic given identical snapshot + client baselines. FR-6 handles all pipeline value outcomes without throwing.
+**Functional Requirements.** FR-1 for each active client, in ascending order, one at a time: interest → delta (vs baseline) → classify/queue → assemble reliable + unreliable packets → accumulate into the result. FR-2 reads the immutable snapshot read-only; never mutates a snapshot or simulation (E-G1-R/E-G5-R). FR-3 **no thread created**, no scheduling, no send, no socket, no ack; `Execute` runs on the calling thread. FR-4 respects per-update caps (a per-client delta Overflow skips that client this pass — value outcome, baseline unchanged) and the byte budget (bandwidth shaping — packets carry what fits; the rest catch up next pass). FR-5 deterministic given identical registry + snapshot + baselines (byte-for-byte packets). FR-6 returns value outcomes only; handles every pipeline stage without throwing.
 
-**Non-Functional Requirements.** ADR-007/008/011; deterministic; engine/OS-free (transport via existing seam); additive.
+**Non-Functional Requirements.** ADR-007/008/011; deterministic; engine/OS/network-free; additive.
 
-**Public Interfaces.** `class ReplicationWorker { ReplicationWorker(config, clientRegistry, interestPolicy, deltaEncoder-or-inline, queues, packetBuilder, sendSeam); ReplicationOutcome ProcessSnapshot(const snapshot::ISnapshotView&); void StartWorker(); void StopWorker(); void FlushQueues(); ReplicationStatistics Statistics() const; };` (exact collaborator injection finalized in this spec; all by reference, non-owning).
+**Public Interfaces.** `ReplicationExecuteResult`; `ReplicationWorker(config, clientRegistry, interestPolicy)`; `Execute(const snapshot::ISnapshotView&) -> Expected<ReplicationExecuteResult>`; `StartWorker`/`StopWorker`/`FlushQueues`/`Running` (all by reference, non-owning collaborators).
 
-**Integration Points.** Consumes `snapshot::ISnapshotView` + `snapshot::SnapshotQueue` (Sprint-008), `ReplicationClientRegistry` (04), `IInterestPolicy` (05), `DeltaEncoder` (06), `ReplicationClassifier` (07), `ReplicationQueues` (08), `ReplicationPacketBuilder` (09), and the Sprint-006 session/host send seam. No engine TU; no thread.
+**Integration Points.** Consumes `snapshot::ISnapshotView` (Sprint-008, read-only), `ReplicationClientRegistry` (04), `IInterestPolicy` (05), `DeltaEncoder` (06), the §7.A classifier via `ReplicationQueues` (07/08), and `ReplicationPacketBuilder` (09). No transport, no session, no socket, no engine TU, no thread. Produced packets are returned for the Step-11/12 send.
 
-**Validation Requirements.** Unit tests via the composed engine-free stack + a loopback/mock send seam: pipeline runs; snapshot unmutated (const); only relevant entities sent; delta minimization; classification honored; deterministic output across two runs; budget/overflow handled.
+**Validation Requirements.** Unit tests via the composed engine-free stack: end-to-end pipeline (relevant entities → reliable spawn packet); interest filtering; delta minimization (unchanged second pass → no packets); deterministic byte-for-byte output across two fresh workers; snapshot immutability (const, unchanged) + budget shaping.
 
 **Evidence Gates.** **E-G1-R** (immutable consumption) and **E-G5-R** (no simulation mutation) confirmed.
 
-**Acceptance Criteria.** Worker present; consumes immutable snapshots; no thread; no mutation; deterministic; tests pass GCC + MSVC; suite green; no prior API change.
+**Acceptance Criteria.** Worker present; consumes immutable snapshots read-only; no thread/send/socket/ack; deterministic; value outcomes only; tests pass GCC + MSVC; suite green; no prior API change.
 
-**Files Created/Modified.** Create `ReplicationWorker.h`/`.cpp`; test support (mock send seam); tests to `ReplicationTests.cpp`; register in both vcxprojs.
+**Files Created/Modified.** Create `ReplicationWorker.h`/`.cpp`; tests to `ReplicationTests.cpp`; register in both vcxprojs.
 
-**Test Requirements.** `WorkerStep10`: pipeline end-to-end, immutability, interest, delta, classification, determinism, budget.
+**Test Requirements.** `WorkerStep10`: pipeline end-to-end, interest filtering, delta minimization, determinism, snapshot immutability + budget.
 
 **Documentation Updates.** Local status/log. No README/graphics/ADR change.
 

@@ -20,6 +20,7 @@
 #include "stalkermp/replication/ReplicationClassifier.h"
 #include "stalkermp/replication/ReplicationPacketBuilder.h"
 #include "stalkermp/replication/ReplicationQueues.h"
+#include "stalkermp/replication/ReplicationWorker.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
@@ -1112,4 +1113,135 @@ TEST(PacketStep9, EmptyPacket)
     EXPECT_EQ(p.Value().recordCount, 0u);
     EXPECT_EQ(p.Value().PacketSize(), kHdr + kChk); // header + checksum only
     EXPECT_EQ(p.Value().reliability, replication::ReplicationReliability::Unreliable);
+}
+
+// ============================================================================
+// Step 10 — Replication worker (synchronous end-to-end pipeline)
+// ============================================================================
+
+namespace
+{
+    // A registry with one client (focus at x) and a membership set; reuses the
+    // Step-4/Step-5 fakes (FakeMembership, BuildSnapshot, Focus) in this TU.
+    struct WorkerRig
+    {
+        FakeMembership membership;
+        snapshot::SimulationSnapshot snap;
+        replication::ReplicationClientRegistry registry{8};
+        replication::BubbleInterestPolicy policy;
+
+        WorkerRig(std::uint32_t entityCount, std::uint32_t radius)
+            : policy(membership, radius)
+        {
+            BuildSnapshot(snap, entityCount);
+        }
+    };
+} // namespace
+
+// --- End-to-end pipeline: relevant entities become reliable spawn packets -----
+TEST(WorkerStep10, PipelineEndToEnd)
+{
+    WorkerRig rig{5, /*radius*/ 0};
+    for (std::uint32_t i = 1; i <= 5; ++i) rig.membership.SetInside(i); // all relevant
+    ASSERT_TRUE(rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f)).HasValue());
+
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationWorker worker{cfg, rig.registry, rig.policy};
+    const auto r = worker.Execute(rig.snap);
+    ASSERT_TRUE(r.HasValue());
+    EXPECT_EQ(r.Value().clientsProcessed, 1u);
+    EXPECT_EQ(r.Value().recordsQueued, 5u);           // 5 added (new to client)
+    EXPECT_EQ(r.Value().reliablePackets, 1u);         // spawns are reliable
+    EXPECT_EQ(r.Value().unreliablePackets, 0u);
+    ASSERT_EQ(r.Value().packets.size(), 1u);
+    EXPECT_EQ(r.Value().packets[0].recordCount, 5u);
+    EXPECT_GT(r.Value().bytesAssembled, 0u);
+}
+
+// --- Interest filtering: only relevant entities are replicated ----------------
+TEST(WorkerStep10, InterestFiltering)
+{
+    WorkerRig rig{5, 0};
+    rig.membership.SetInside(2);
+    rig.membership.SetInside(4);
+    ASSERT_TRUE(rig.registry.Register(net::ConnectionId{1}, Focus(1, 1000.0f)).HasValue());
+
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationWorker worker{cfg, rig.registry, rig.policy};
+    const auto r = worker.Execute(rig.snap);
+    ASSERT_TRUE(r.HasValue());
+    ASSERT_EQ(r.Value().packets.size(), 1u);
+    EXPECT_EQ(r.Value().packets[0].recordCount, 2u); // only ids 2 and 4
+}
+
+// --- Delta minimization: an unchanged second pass produces no packets ---------
+TEST(WorkerStep10, DeltaMinimization)
+{
+    WorkerRig rig{5, 0};
+    for (std::uint32_t i = 1; i <= 5; ++i) rig.membership.SetInside(i);
+    ASSERT_TRUE(rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f)).HasValue());
+
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationWorker worker{cfg, rig.registry, rig.policy};
+
+    const auto first = worker.Execute(rig.snap);
+    ASSERT_TRUE(first.HasValue());
+    EXPECT_EQ(first.Value().reliablePackets, 1u); // initial spawns
+
+    const auto second = worker.Execute(rig.snap); // same snapshot -> baseline == current
+    ASSERT_TRUE(second.HasValue());
+    EXPECT_EQ(second.Value().recordsQueued, 0u);   // nothing changed
+    EXPECT_EQ(second.Value().reliablePackets, 0u);
+    EXPECT_EQ(second.Value().unreliablePackets, 0u);
+    EXPECT_TRUE(second.Value().packets.empty());
+}
+
+// --- Deterministic output for identical inputs --------------------------------
+TEST(WorkerStep10, Deterministic)
+{
+    auto run = [](std::vector<std::uint8_t>& firstPacketBytes, std::uint32_t& reliablePackets) {
+        WorkerRig rig{6, 0};
+        for (std::uint32_t i = 1; i <= 6; ++i) rig.membership.SetInside(i);
+        (void)rig.registry.Register(net::ConnectionId{3}, Focus(3, 0.0f));
+        replication::ReplicationConfiguration cfg{};
+        replication::ReplicationWorker worker{cfg, rig.registry, rig.policy};
+        const auto r = worker.Execute(rig.snap);
+        ASSERT_TRUE(r.HasValue());
+        reliablePackets = r.Value().reliablePackets;
+        ASSERT_FALSE(r.Value().packets.empty());
+        firstPacketBytes = r.Value().packets[0].bytes;
+    };
+    std::vector<std::uint8_t> a, b;
+    std::uint32_t ra = 0, rb = 0;
+    run(a, ra);
+    run(b, rb);
+    EXPECT_EQ(ra, rb);
+    EXPECT_TRUE(a == b); // byte-for-byte identical
+}
+
+// --- Snapshot immutability + budget shaping -----------------------------------
+TEST(WorkerStep10, SnapshotImmutabilityAndBudget)
+{
+    WorkerRig rig{5, 0};
+    for (std::uint32_t i = 1; i <= 5; ++i) rig.membership.SetInside(i);
+    ASSERT_TRUE(rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f)).HasValue());
+
+    const std::size_t entitiesBefore = rig.snap.Entities().size();
+    const std::uint64_t idBefore = rig.snap.Metadata().id.value;
+
+    // Budget fits only one record per packet (bandwidth shaping).
+    replication::ReplicationConfiguration cfg{};
+    cfg.bandwidthBudgetBytesPerTick = static_cast<std::uint32_t>(
+        replication::ReplicationPacketBuilder::kHeaderBytes +
+        replication::ReplicationPacketBuilder::kRecordBytes +
+        replication::ReplicationPacketBuilder::kChecksumBytes);
+    replication::ReplicationWorker worker{cfg, rig.registry, rig.policy};
+    const auto r = worker.Execute(rig.snap);
+    ASSERT_TRUE(r.HasValue());
+    ASSERT_EQ(r.Value().packets.size(), 1u);
+    EXPECT_EQ(r.Value().packets[0].recordCount, 1u); // shaped to one record
+
+    // The snapshot was consumed read-only (unchanged).
+    EXPECT_EQ(rig.snap.Entities().size(), entitiesBefore);
+    EXPECT_EQ(rig.snap.Metadata().id.value, idBefore);
 }
