@@ -63,6 +63,13 @@
 #include "stalkermp/snapshot/SnapshotConfiguration.h"
 #include "stalkermp/snapshot/SnapshotManager.h"
 #include "stalkermp/world/IEntitySnapshotSource.h"
+#include "stalkermp/replication/BubbleInterestPolicy.h"    // Sprint-009 replication wiring
+#include "stalkermp/replication/BubbleMembershipAdapter.h"
+#include "stalkermp/replication/IBubbleMembershipSource.h"
+#include "stalkermp/replication/IInterestPolicy.h"
+#include "stalkermp/replication/ReplicationClientRegistry.h"
+#include "stalkermp/replication/ReplicationConfiguration.h"
+#include "stalkermp/replication/ReplicationManager.h"
 #include "stalkermp/world/WorldConfiguration.h"
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
@@ -197,6 +204,16 @@ namespace stalkermp
             // subscribed to / unsubscribed from the frame dispatcher at
             // tick_order::kReplication = 400.
             snapshot::SnapshotManager* snapshotManager = nullptr;
+
+            // Replication Pipeline (Sprint-009). The client registry, the Bubble
+            // membership adapter, and the interest policy are Runtime-owned so they
+            // outlive the ServiceRegistry-owned ReplicationManager that references
+            // them. Only the ReplicationManager ticks (at kReplicationPipeline = 450);
+            // cached here for frame subscription/teardown. All engine-free; no transport.
+            std::unique_ptr<replication::ReplicationClientRegistry> replicationClients;
+            std::unique_ptr<replication::IBubbleMembershipSource> bubbleMembership;
+            std::unique_ptr<replication::IInterestPolicy> interestPolicy;
+            replication::ReplicationManager* replicationManager = nullptr;
         };
 
         // The single module-global. See file header for justification.
@@ -598,6 +615,45 @@ namespace stalkermp
             }
             runtime.snapshotManager = snapshotManagerPtr;
 
+            // Replication Pipeline (Sprint-009). Registered AFTER the SnapshotManager
+            // (its snapshot source) and every simulation producer, so registration-
+            // order InitializeAll initializes it last. Consumes the Sprint-008
+            // snapshot queue read-only, the Sprint-004 Bubble activation (via the
+            // engine-free membership adapter) for interest, and its own client
+            // registry; it produces packets but OWNS no transport (send is future).
+            auto replicationConfiguration = replication::ReplicationConfiguration::FromConfig(runtime.serverConfig);
+            if (!replicationConfiguration)
+            {
+                return replicationConfiguration.GetError();
+            }
+            runtime.replicationClients =
+                std::make_unique<replication::ReplicationClientRegistry>(replicationConfiguration.Value().maxClients);
+            runtime.bubbleMembership =
+                std::make_unique<replication::BubbleMembershipAdapter>(bubbleServicePtr->Manager());
+            runtime.interestPolicy = std::make_unique<replication::BubbleInterestPolicy>(
+                *runtime.bubbleMembership, replicationConfiguration.Value().interestRadiusMeters);
+
+            auto replicationManager = std::make_unique<replication::ReplicationManager>(
+                replicationConfiguration.Value(), *runtime.replicationClients, *runtime.interestPolicy,
+                snapshotManagerPtr->Queue());
+            replication::ReplicationManager* replicationManagerPtr = replicationManager.get();
+            if (auto registered = runtime.services.Register(std::move(replicationManager)); !registered)
+            {
+                return registered;
+            }
+
+            // Single replication tick at the reserved tick_order::kReplicationPipeline
+            // = 450, strictly after Snapshot (400) and before Persistence (500)/
+            // Networking (900): consumes the just-published snapshot and assembles
+            // per-client packets. Uses the single existing FrameDispatcher.
+            if (auto subscribed = runtime.frameDispatcher.Subscribe(
+                    *replicationManagerPtr, tick_order::kReplicationPipeline, "Replication");
+                !subscribed)
+            {
+                return subscribed;
+            }
+            runtime.replicationManager = replicationManagerPtr;
+
             runtime.worldManager = managerPtr;
             return Success();
         }
@@ -731,6 +787,23 @@ namespace stalkermp
                     Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
                 }
                 g_runtime->entityFeed.reset();
+            }
+
+            // Replication Pipeline runtime (Sprint-009): unsubscribe from the
+            // (no-longer-driven) dispatcher before ShutdownAll. Removed before the
+            // SnapshotManager it consumes (reverse of subscription order — it was
+            // subscribed last, at kReplicationPipeline = 450). The Runtime-owned
+            // client registry / membership adapter / interest policy outlive
+            // ShutdownAll and are destroyed with the Runtime; the manager never
+            // dereferences them at destruction.
+            if (g_runtime->replicationManager != nullptr)
+            {
+                if (auto unsubscribed = g_runtime->frameDispatcher.Unsubscribe(*g_runtime->replicationManager);
+                    !unsubscribed && IsLogAvailable())
+                {
+                    Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
+                }
+                g_runtime->replicationManager = nullptr;
             }
 
             // Snapshot System runtime (Sprint-008): unsubscribe from the

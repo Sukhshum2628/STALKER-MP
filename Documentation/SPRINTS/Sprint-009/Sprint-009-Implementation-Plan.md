@@ -586,7 +586,7 @@ docs(replication): freeze Sprint-009 Step-11 spec (ReplicationManager at kReplic
 
 **Acceptance Criteria.** Wiring present; subscriber count 8; placement asserted; reverse-order teardown; tests pass GCC + MSVC (Bootstrap link/execution on Windows per prior sprints); suite green; no prior behavior change.
 
-**Files Created/Modified.** Modify `src/core/Bootstrap.cpp`, `tests/BootstrapTests.cpp`, and both vcxprojs (add the manager + collaborator TUs).
+**Files Created/Modified.** Modify `src/core/Bootstrap.cpp`, `tests/BootstrapTests.cpp`, and both vcxprojs. Two minimal enabling additions (additive; no behavior/simulation change): (a) a non-const `snapshot::SnapshotManager::Queue()` overload returning `SnapshotQueue&` (the synchronous same-frame replication consumer calls `Acquire`/`Release`); (b) a new engine-free header `include/stalkermp/replication/BubbleMembershipAdapter.h` binding the Step-5 `IBubbleMembershipSource` seam to `world::BubbleManager::MembershipOf` (read-only; Preserve Before Replace). Runtime owns the client registry, membership adapter, and interest policy so they outlive the ServiceRegistry-owned `ReplicationManager`.
 
 **Test Requirements.** `Bootstrap.ReplicationManagerWiredAtPipelineSlot`; updated subscriber-count assertions.
 

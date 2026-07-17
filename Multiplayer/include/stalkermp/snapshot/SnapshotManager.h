@@ -75,6 +75,10 @@ namespace stalkermp::snapshot
         [[nodiscard]] SnapshotStatistics Statistics() const noexcept;
         [[nodiscard]] SnapshotConsistency ValidateConsistency() const noexcept;
         [[nodiscard]] const SnapshotQueue& Queue() const noexcept { return m_queue; }
+        // Mutable access for a synchronous same-frame consumer (Sprint-009
+        // ReplicationManager Acquire/Release at kReplicationPipeline = 450).
+        // Additive accessor only — no behavior change.
+        [[nodiscard]] SnapshotQueue& Queue() noexcept { return m_queue; }
         [[nodiscard]] std::uint64_t LastTick() const noexcept { return m_tick; }
 
         // The frozen ordering slot this manager ticks at (Bootstrap subscribes here

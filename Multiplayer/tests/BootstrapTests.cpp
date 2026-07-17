@@ -134,10 +134,10 @@ TEST(Bootstrap, WorldSubsystemWiredThroughCompositionRoot)
 
     ASSERT_TRUE(stalkermp::Initialize(params));
 
-    // Sprint-008: exactly seven frame subscribers are wired — World (100),
+    // Sprint-009: exactly eight frame subscribers are wired — World (100),
     // EntityRegistry feed (200), PlayerLifecycle (250), BubbleManager (300),
-    // TransitionManager (350), Snapshot (400), Networking (900, the highest key,
-    // networking-last).
+    // TransitionManager (350), Snapshot (400), Replication (450), Networking (900,
+    // the highest key, networking-last).
     static_assert(stalkermp::core::tick_order::kNetworking > stalkermp::core::tick_order::kPlugins,
                   "networking must be the highest tick_order key");
     // PlayerLifecycle ticks strictly between EntityRegistry and Bubble so a joined
@@ -150,9 +150,15 @@ TEST(Bootstrap, WorldSubsystemWiredThroughCompositionRoot)
     static_assert(stalkermp::core::tick_order::kAlifeTransition < stalkermp::core::tick_order::kReplication &&
                       stalkermp::core::tick_order::kReplication < stalkermp::core::tick_order::kPersistence,
                   "Snapshot must tick between Transition and Persistence");
+    // Replication consumes the snapshot: it ticks strictly between Snapshot (400)
+    // and Persistence (500), and before Networking (900) (Sprint-009).
+    static_assert(stalkermp::core::tick_order::kReplication < stalkermp::core::tick_order::kReplicationPipeline &&
+                      stalkermp::core::tick_order::kReplicationPipeline < stalkermp::core::tick_order::kPersistence &&
+                      stalkermp::core::tick_order::kReplicationPipeline < stalkermp::core::tick_order::kNetworking,
+                  "Replication must tick between Snapshot and Persistence, before Networking");
     auto* dispatcher = stalkermp::detail::GetModuleFrameDispatcher();
     ASSERT_NE(dispatcher, nullptr);
-    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(7));
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
 
     // Driving frames through the dispatcher is safe and repeatable
     // (stands in for the engine bridge, Milestone W2). Networking ticks last each
@@ -162,16 +168,16 @@ TEST(Bootstrap, WorldSubsystemWiredThroughCompositionRoot)
     dispatcher->Dispatch(0.016);
     dispatcher->Dispatch(0.0);
 
-    // Sprint-008 Step-10 integration: the composed subsystem (incl. the snapshot
-    // manager at kReplication) is stable across repeated frames — the wiring is
-    // unchanged (still seven subscribers) and driving many frames is a deterministic
-    // no-op with no active connections; the snapshot manager publishes once per
-    // frame from the (empty) simulation state without error.
+    // Sprint-009 integration: the composed subsystem (incl. the snapshot manager
+    // at 400 and the replication manager at 450) is stable across repeated frames —
+    // the wiring is unchanged (still eight subscribers) and driving many frames is a
+    // deterministic no-op with no active clients; the replication manager consumes
+    // the published snapshot and assembles packets (none, empty world) without error.
     for (int i = 0; i < 8; ++i)
     {
         dispatcher->Dispatch(0.016);
     }
-    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(7));
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
 
     stalkermp::Shutdown();
     EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
@@ -186,31 +192,72 @@ TEST(Bootstrap, SnapshotManagerWiredAtReplicationSlot)
     auto* dispatcher = stalkermp::detail::GetModuleFrameDispatcher();
     ASSERT_NE(dispatcher, nullptr);
 
-    // Registration + initialization: the snapshot manager brought the subscriber
-    // count to seven (World, EntityRegistry, PlayerLifecycle, Bubble, Transition,
-    // Snapshot, Networking) and Initialize succeeded (else Initialize() is false).
-    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(7));
+    // Registration + initialization: the snapshot + replication managers brought
+    // the subscriber count to eight (World, EntityRegistry, PlayerLifecycle, Bubble,
+    // Transition, Snapshot, Replication, Networking) and Initialize succeeded.
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
 
     // Tick subscription at kReplication = 400 (after Transition, before Networking):
     // driving frames dispatches the snapshot tick deterministically with no error.
     dispatcher->Dispatch(0.016);
     dispatcher->Dispatch(0.016);
     dispatcher->Dispatch(0.0);
-    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(7)); // wiring stable
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8)); // wiring stable
 
-    // Reverse-order shutdown + unsubscription during teardown: the snapshot manager
-    // is unsubscribed before ShutdownAll and the whole runtime (dispatcher included)
+    // Reverse-order shutdown + unsubscription during teardown: the managers are
+    // unsubscribed before ShutdownAll and the whole runtime (dispatcher included)
     // is torn down cleanly.
     stalkermp::Shutdown();
     EXPECT_FALSE(stalkermp::IsInitialized());
     EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
 
-    // Re-initialize + shut down again: teardown fully unsubscribed the snapshot
-    // manager (no stale subscriber) so a fresh composition wires exactly seven again.
+    // Re-initialize + shut down again: teardown fully unsubscribed both managers
+    // (no stale subscriber) so a fresh composition wires exactly eight again.
     ASSERT_TRUE(stalkermp::Initialize(params));
     auto* dispatcher2 = stalkermp::detail::GetModuleFrameDispatcher();
     ASSERT_NE(dispatcher2, nullptr);
-    EXPECT_EQ(dispatcher2->SubscriberCount(), static_cast<std::size_t>(7));
+    EXPECT_EQ(dispatcher2->SubscriberCount(), static_cast<std::size_t>(8));
+    stalkermp::Shutdown();
+    EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
+}
+
+// --- Sprint-009 Step-12: ReplicationManager composition-root wiring -----------
+TEST(Bootstrap, ReplicationManagerWiredAtPipelineSlot)
+{
+    const auto params = MakeParams("replication_wiring");
+
+    ASSERT_TRUE(stalkermp::Initialize(params));
+    auto* dispatcher = stalkermp::detail::GetModuleFrameDispatcher();
+    ASSERT_NE(dispatcher, nullptr);
+
+    // Registration + initialization: the replication manager brought the subscriber
+    // count to eight and Initialize succeeded (single instance; no duplicate reg).
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
+
+    // Placement: Replication ticks at kReplicationPipeline = 450, after Snapshot
+    // (400) and before Persistence (500)/Networking (900).
+    static_assert(stalkermp::core::tick_order::kReplication <
+                          stalkermp::core::tick_order::kReplicationPipeline &&
+                      stalkermp::core::tick_order::kReplicationPipeline <
+                          stalkermp::core::tick_order::kNetworking,
+                  "Replication ticks between Snapshot and Networking");
+
+    // Driving frames dispatches Snapshot (400) then Replication (450) each frame,
+    // deterministically, with no error and stable wiring.
+    dispatcher->Dispatch(0.016);
+    dispatcher->Dispatch(0.016);
+    dispatcher->Dispatch(0.0);
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
+
+    // Reverse-order teardown fully unsubscribes the replication manager.
+    stalkermp::Shutdown();
+    EXPECT_FALSE(stalkermp::IsInitialized());
+    EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
+
+    ASSERT_TRUE(stalkermp::Initialize(params));
+    auto* dispatcher2 = stalkermp::detail::GetModuleFrameDispatcher();
+    ASSERT_NE(dispatcher2, nullptr);
+    EXPECT_EQ(dispatcher2->SubscriberCount(), static_cast<std::size_t>(8)); // no stale subscriber
     stalkermp::Shutdown();
     EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
 }
