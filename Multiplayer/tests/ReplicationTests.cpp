@@ -19,8 +19,12 @@
 #include "stalkermp/net/ReplicationMessageIds.h"
 #include "stalkermp/replication/ReplicationClassifier.h"
 #include "stalkermp/replication/ReplicationPacketBuilder.h"
+#include "stalkermp/replication/ReplicationManager.h"
 #include "stalkermp/replication/ReplicationQueues.h"
 #include "stalkermp/replication/ReplicationWorker.h"
+#include "stalkermp/snapshot/SnapshotPool.h"
+#include "stalkermp/snapshot/SnapshotQueue.h"
+#include "stalkermp/net/ByteCursor.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
@@ -1244,4 +1248,169 @@ TEST(WorkerStep10, SnapshotImmutabilityAndBudget)
     // The snapshot was consumed read-only (unchanged).
     EXPECT_EQ(rig.snap.Entities().size(), entitiesBefore);
     EXPECT_EQ(rig.snap.Metadata().id.value, idBefore);
+}
+
+// ============================================================================
+// Step 11 — Replication manager (tick integration + ack processing)
+// ============================================================================
+
+namespace
+{
+    // A manager rig: a pool+queue with one published snapshot (entities 1..count),
+    // a registry, and a bubble interest policy. Reuses the Step-5 FakeMembership.
+    struct ManagerRig
+    {
+        FakeMembership membership;
+        snapshot::SnapshotPool pool;
+        snapshot::SnapshotQueue queue{pool};
+        replication::ReplicationClientRegistry registry{8};
+        replication::BubbleInterestPolicy policy;
+
+        ManagerRig(std::uint32_t entityCount, std::uint32_t radius, bool publish)
+            : policy(membership, radius)
+        {
+            pool.Reserve(4);
+            if (publish)
+            {
+                auto acq = pool.Acquire();
+                snapshot::SimulationSnapshot* s = acq.Value();
+                s->BeginBuild(snapshot::SnapshotId{1}, /*tick*/ 100, /*version*/ 1);
+                for (std::uint32_t i = 1; i <= entityCount; ++i)
+                {
+                    snapshot::EntitySnapshot e{};
+                    e.id = world::EntityId{i};
+                    e.position = world::Vec3{static_cast<float>(i), 0.0f, 0.0f};
+                    (void)s->AddEntity(e);
+                }
+                (void)s->Finalize();
+                (void)queue.Publish(s);
+            }
+        }
+    };
+
+    // Assemble a ReplicationAck wire payload (0x0201) into `out`.
+    std::size_t BuildAckBytes(std::uint8_t* out, std::size_t size, std::uint64_t client,
+                              std::uint64_t replId, std::uint64_t tick)
+    {
+        net::ByteWriter w(out, size);
+        (void)w.WriteU16(stalkermp::net::kMsgReplicationAck.value);
+        (void)w.WriteU32(static_cast<std::uint32_t>(client & 0xFFFFFFFFu));
+        (void)w.WriteU32(static_cast<std::uint32_t>((client >> 32) & 0xFFFFFFFFu));
+        (void)w.WriteU32(static_cast<std::uint32_t>(replId & 0xFFFFFFFFu));
+        (void)w.WriteU32(static_cast<std::uint32_t>((replId >> 32) & 0xFFFFFFFFu));
+        (void)w.WriteU32(static_cast<std::uint32_t>(tick & 0xFFFFFFFFu));
+        (void)w.WriteU32(static_cast<std::uint32_t>((tick >> 32) & 0xFFFFFFFFu));
+        return w.BytesWritten();
+    }
+} // namespace
+
+// --- Tick lifecycle: one worker pass per tick; delta minimization -------------
+TEST(ReplicationManagerStep11, TickLifecycleOneWorkerPerTick)
+{
+    ManagerRig rig{5, /*radius*/ 0, /*publish*/ true};
+    for (std::uint32_t i = 1; i <= 5; ++i) rig.membership.SetInside(i);
+    ASSERT_TRUE(rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f)).HasValue());
+
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationManager manager{cfg, rig.registry, rig.policy, rig.queue};
+    ASSERT_TRUE(manager.Initialize().HasValue());
+
+    manager.Update();
+    EXPECT_EQ(manager.Ticks(), 1u);
+    EXPECT_EQ(manager.LastResult().clientsProcessed, 1u);
+    EXPECT_EQ(manager.LastResult().reliablePackets, 1u); // initial spawns
+    EXPECT_FALSE(manager.LastResult().packets.empty());
+
+    manager.Update(); // same snapshot -> baseline == current -> no packets
+    EXPECT_EQ(manager.Ticks(), 2u);
+    EXPECT_EQ(manager.LastResult().recordsQueued, 0u);
+    EXPECT_TRUE(manager.LastResult().packets.empty());
+}
+
+// --- Dependency ordering + placement at kReplicationPipeline = 450 -------------
+TEST(ReplicationManagerStep11, DependencyOrderingAndPlacement)
+{
+    ManagerRig rig{1, 0, true};
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationManager manager{cfg, rig.registry, rig.policy, rig.queue};
+
+    core::IService& service = manager;
+    EXPECT_EQ(service.Name(), std::string_view{"Replication"});
+    const std::vector<std::string> expected{"World",           "EntityRegistry", "BubbleManager",
+                                             "TransitionManager", "PlayerManager",  "Networking",
+                                             "SnapshotManager"};
+    EXPECT_EQ(service.Dependencies(), expected);
+
+    static_assert(replication::ReplicationManager::TickOrder() == core::tick_order::kReplicationPipeline,
+                  "kReplicationPipeline slot");
+    static_assert(core::tick_order::kReplication < replication::ReplicationManager::TickOrder() &&
+                      replication::ReplicationManager::TickOrder() < core::tick_order::kPersistence,
+                  "Replication ticks between Snapshot (400) and Persistence (500)");
+    static_assert(replication::ReplicationManager::TickOrder() < core::tick_order::kNetworking,
+                  "Replication ticks before Networking (900)");
+    SUCCEED();
+}
+
+// --- Safe skip when no snapshot is published ----------------------------------
+TEST(ReplicationManagerStep11, SafeSkipNoSnapshot)
+{
+    ManagerRig rig{5, 0, /*publish*/ false}; // nothing published
+    (void)rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f));
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationManager manager{cfg, rig.registry, rig.policy, rig.queue};
+
+    manager.Update(); // no snapshot -> skip; no crash
+    EXPECT_EQ(manager.Ticks(), 1u);
+    EXPECT_EQ(manager.LastResult().clientsProcessed, 0u);
+    EXPECT_TRUE(manager.LastResult().packets.empty());
+}
+
+// --- Ack processing: apply, ignore stale/duplicate, unknown client ------------
+TEST(ReplicationManagerStep11, AckProcessing)
+{
+    ManagerRig rig{1, 0, true};
+    const auto id = rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f));
+    ASSERT_TRUE(id.HasValue());
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationManager manager{cfg, rig.registry, rig.policy, rig.queue};
+
+    // Apply a fresh ack.
+    ASSERT_TRUE(manager.HandleReplicationAck(replication::ReplicationAck{id.Value(), 10, 100}).HasValue());
+    EXPECT_EQ(manager.AcksApplied(), 1u);
+    EXPECT_EQ(rig.registry.FindById(id.Value())->lastAckedReplicationId, 10u);
+
+    // Duplicate + stale acks are ignored (monotonic).
+    ASSERT_TRUE(manager.HandleReplicationAck(replication::ReplicationAck{id.Value(), 10, 999}).HasValue());
+    ASSERT_TRUE(manager.HandleReplicationAck(replication::ReplicationAck{id.Value(), 5, 999}).HasValue());
+    EXPECT_EQ(manager.AcksIgnored(), 2u);
+    EXPECT_EQ(rig.registry.FindById(id.Value())->lastAckedReplicationId, 10u); // unchanged
+
+    // A newer ack advances again.
+    ASSERT_TRUE(manager.HandleReplicationAck(replication::ReplicationAck{id.Value(), 15, 150}).HasValue());
+    EXPECT_EQ(manager.AcksApplied(), 2u);
+    EXPECT_EQ(rig.registry.FindById(id.Value())->lastAckedReplicationId, 15u);
+
+    // Unknown client => value outcome.
+    EXPECT_FALSE(manager.HandleReplicationAck(replication::ReplicationAck{replication::ClientId{999}, 1, 1}).HasValue());
+}
+
+// --- Ack wire parse (additive 0x0201) -----------------------------------------
+TEST(ReplicationManagerStep11, AckWireParse)
+{
+    ManagerRig rig{1, 0, true};
+    const auto id = rig.registry.Register(net::ConnectionId{1}, Focus(1, 0.0f));
+    ASSERT_TRUE(id.HasValue());
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationManager manager{cfg, rig.registry, rig.policy, rig.queue};
+
+    std::uint8_t buffer[64] = {};
+    const std::size_t n = BuildAckBytes(buffer, sizeof(buffer), id.Value().value, /*replId*/ 20, /*tick*/ 200);
+    net::ByteReader reader(buffer, n);
+    ASSERT_TRUE(manager.HandleReplicationAck(reader).HasValue());
+    EXPECT_EQ(rig.registry.FindById(id.Value())->lastAckedReplicationId, 20u);
+
+    // A payload with the wrong message id is rejected (value outcome).
+    std::uint8_t wrong[8] = {0x00, 0x01}; // 0x0100, not 0x0201
+    net::ByteReader wrongReader(wrong, sizeof(wrong));
+    EXPECT_FALSE(manager.HandleReplicationAck(wrongReader).HasValue());
 }
