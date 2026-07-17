@@ -15,7 +15,10 @@
 #include "stalkermp/replication/BubbleInterestPolicy.h"
 #include "stalkermp/replication/DeltaEncoder.h"
 #include "stalkermp/replication/IBubbleMembershipSource.h"
+#include "stalkermp/net/ProtocolConstants.h"
+#include "stalkermp/net/ReplicationMessageIds.h"
 #include "stalkermp/replication/ReplicationClassifier.h"
+#include "stalkermp/replication/ReplicationPacketBuilder.h"
 #include "stalkermp/replication/ReplicationQueues.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
@@ -975,4 +978,138 @@ TEST(QueuesStep8, ChangeSetRoutingAndBudget)
     EXPECT_EQ(tight.EnqueueChangeSet(changes), replication::ReplicationOutcome::Overflow);
     EXPECT_EQ(tight.Reliable().Size(), 1u);   // only the first reliable record fit
     EXPECT_EQ(tight.Unreliable().Size(), 1u); // unreliable unaffected (independent)
+}
+
+// ============================================================================
+// Step 9 — Replication packet assembly (additive wire ids)
+// ============================================================================
+
+namespace
+{
+    replication::ReplicationConfiguration PacketCfg(std::uint32_t byteBudget, std::uint32_t maxRecords)
+    {
+        replication::ReplicationConfiguration c{};
+        c.bandwidthBudgetBytesPerTick = byteBudget;
+        c.maxEntitiesPerUpdate = maxRecords;
+        return c;
+    }
+    void FillQueue(replication::FixedRecordQueue& q, std::uint32_t count)
+    {
+        for (std::uint32_t i = 1; i <= count; ++i)
+        {
+            (void)q.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, i,
+                               replication::ReplicationReliability::Reliable));
+        }
+    }
+    constexpr std::size_t kHdr = replication::ReplicationPacketBuilder::kHeaderBytes;
+    constexpr std::size_t kRec = replication::ReplicationPacketBuilder::kRecordBytes;
+    constexpr std::size_t kChk = replication::ReplicationPacketBuilder::kChecksumBytes;
+} // namespace
+
+// --- Deterministic layout + size + additive DATA-range id ---------------------
+TEST(PacketStep9, DeterministicLayoutAndId)
+{
+    replication::ReplicationPacketBuilder builder{PacketCfg(/*budget*/ 0, /*maxRecords*/ 64)};
+
+    replication::FixedRecordQueue qa{8};
+    replication::FixedRecordQueue qb{8};
+    FillQueue(qa, 3);
+    FillQueue(qb, 3);
+
+    const auto pa = builder.BuildPacket(qa, replication::ReplicationReliability::Reliable,
+                                        replication::ClientId{5}, /*tick*/ 100);
+    const auto pb = builder.BuildPacket(qb, replication::ReplicationReliability::Reliable,
+                                        replication::ClientId{5}, 100);
+    ASSERT_TRUE(pa.HasValue());
+    ASSERT_TRUE(pb.HasValue());
+
+    EXPECT_EQ(pa.Value().recordCount, 3u);
+    EXPECT_EQ(pa.Value().PacketSize(), kHdr + 3u * kRec + kChk);
+    EXPECT_FALSE(pa.Value().Empty());
+    // Additive DATA-range id (ADR-010); distinct from Sprint-007 player block.
+    EXPECT_EQ(pa.Value().messageId.value, stalkermp::net::kMsgReplicationUpdate.value);
+    EXPECT_EQ(pa.Value().messageId.value, 0x0200u);
+    EXPECT_TRUE(stalkermp::net::IsDataId(pa.Value().messageId));
+
+    // Identical input -> identical bytes (deterministic, byte-for-byte).
+    ASSERT_EQ(pa.Value().bytes.size(), pb.Value().bytes.size());
+    EXPECT_TRUE(pa.Value().bytes == pb.Value().bytes);
+}
+
+// --- Little-endian header layout ----------------------------------------------
+TEST(PacketStep9, LittleEndianHeader)
+{
+    replication::ReplicationPacketBuilder builder{PacketCfg(0, 64)};
+    replication::FixedRecordQueue q{4};
+    FillQueue(q, 2);
+    const auto p = builder.BuildPacket(q, replication::ReplicationReliability::Reliable,
+                                       replication::ClientId{0x11223344}, /*tick*/ 0);
+    ASSERT_TRUE(p.HasValue());
+    const auto& b = p.Value().bytes;
+    ASSERT_GE(b.size(), kHdr);
+    // messageId 0x0200 little-endian: low byte 0x00, high byte 0x02.
+    EXPECT_EQ(b[0], 0x00u);
+    EXPECT_EQ(b[1], 0x02u);
+    // clientId low 32 bits little-endian: 0x44,0x33,0x22,0x11.
+    EXPECT_EQ(b[2], 0x44u);
+    EXPECT_EQ(b[3], 0x33u);
+    EXPECT_EQ(b[4], 0x22u);
+    EXPECT_EQ(b[5], 0x11u);
+    // reliability byte (Reliable = 1) at offset 18 (2+8+8), count (2) LE at 19..20.
+    EXPECT_EQ(b[18], 1u);
+    EXPECT_EQ(b[19], 2u); // recordCount low byte
+    EXPECT_EQ(b[20], 0u); // recordCount high byte
+}
+
+// --- Budget enforcement: overflow value outcome + partial drain ---------------
+TEST(PacketStep9, BudgetOverflowAndLimit)
+{
+    // Budget below an empty frame (header+checksum) -> Overflow value outcome.
+    {
+        replication::ReplicationPacketBuilder builder{PacketCfg(/*budget*/ 10, /*maxRecords*/ 64)};
+        replication::FixedRecordQueue q{4};
+        FillQueue(q, 2);
+        EXPECT_FALSE(builder.BuildPacket(q, replication::ReplicationReliability::Reliable,
+                                         replication::ClientId{1}, 0)
+                         .HasValue());
+        EXPECT_EQ(q.Size(), 2u); // no partial drain on overflow
+    }
+    // Budget fitting exactly one record; the rest remain in the queue.
+    {
+        const std::uint32_t budget = static_cast<std::uint32_t>(kHdr + kRec + kChk);
+        replication::ReplicationPacketBuilder builder{PacketCfg(budget, /*maxRecords*/ 64)};
+        replication::FixedRecordQueue q{4};
+        FillQueue(q, 3);
+        const auto p = builder.BuildPacket(q, replication::ReplicationReliability::Reliable,
+                                           replication::ClientId{1}, 0);
+        ASSERT_TRUE(p.HasValue());
+        EXPECT_EQ(p.Value().recordCount, 1u);
+        EXPECT_EQ(p.Value().PacketSize(), budget);
+        EXPECT_EQ(q.Size(), 2u); // remaining records left for the next packet
+    }
+    // maxRecords cap applies even with unbounded byte budget.
+    {
+        replication::ReplicationPacketBuilder builder{PacketCfg(/*budget*/ 0, /*maxRecords*/ 2)};
+        replication::FixedRecordQueue q{8};
+        FillQueue(q, 5);
+        const auto p = builder.BuildPacket(q, replication::ReplicationReliability::Reliable,
+                                           replication::ClientId{1}, 0);
+        ASSERT_TRUE(p.HasValue());
+        EXPECT_EQ(p.Value().recordCount, 2u);
+        EXPECT_EQ(q.Size(), 3u);
+    }
+}
+
+// --- Empty queue: a valid empty frame -----------------------------------------
+TEST(PacketStep9, EmptyPacket)
+{
+    replication::ReplicationPacketBuilder builder{PacketCfg(0, 64)};
+    replication::FixedRecordQueue q{4}; // empty
+    const auto p = builder.BuildPacket(q, replication::ReplicationReliability::Unreliable,
+                                       replication::ClientId{2}, 0);
+    ASSERT_TRUE(p.HasValue());
+    EXPECT_TRUE(p.Value().Empty());
+    EXPECT_EQ(p.Value().recordCount, 0u);
+    EXPECT_EQ(p.Value().PacketSize(), kHdr + kChk); // header + checksum only
+    EXPECT_EQ(p.Value().reliability, replication::ReplicationReliability::Unreliable);
 }
