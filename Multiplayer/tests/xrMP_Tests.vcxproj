@@ -158,6 +158,7 @@
     <ClCompile Include="..\src\replication\ReplicationClientRegistry.cpp" />
     <ClCompile Include="..\src\replication\BubbleInterestPolicy.cpp" />
     <ClCompile Include="..\src\replication\DeltaEncoder.cpp" />
+    <ClCompile Include="..\src\replication\ReplicationQueues.cpp" />
     <ClCompile Include="TestMain.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

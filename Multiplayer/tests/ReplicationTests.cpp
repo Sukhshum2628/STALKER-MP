@@ -16,6 +16,7 @@
 #include "stalkermp/replication/DeltaEncoder.h"
 #include "stalkermp/replication/IBubbleMembershipSource.h"
 #include "stalkermp/replication/ReplicationClassifier.h"
+#include "stalkermp/replication/ReplicationQueues.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
@@ -851,4 +852,127 @@ TEST(ClassifierStep7, PriorityOrderingTotal)
     using P = replication::ReplicationPriority;
     EXPECT_GT(static_cast<int>(P::High), static_cast<int>(P::Medium));
     EXPECT_GT(static_cast<int>(P::Medium), static_cast<int>(P::Low));
+}
+
+// ============================================================================
+// Step 8 — Replication queues
+// ============================================================================
+
+namespace
+{
+    replication::QueuedRecord QR(replication::ReplicationChangeKind kind, std::uint32_t id,
+                                 replication::ReplicationReliability reliability)
+    {
+        replication::QueuedRecord r{};
+        r.kind = kind;
+        r.entity.id = world::EntityId{id};
+        r.reliability = reliability;
+        return r;
+    }
+    replication::ReplicationConfiguration QueueCfg(std::uint32_t reliableDepth, std::uint32_t unreliableDepth)
+    {
+        replication::ReplicationConfiguration c{};
+        c.reliableQueueDepth = reliableDepth;
+        c.unreliableQueueDepth = unreliableDepth;
+        return c;
+    }
+} // namespace
+
+// --- FIFO ordering, capacity, and overflow value outcome ----------------------
+TEST(QueuesStep8, FifoCapacityOverflow)
+{
+    replication::FixedRecordQueue queue{3};
+    EXPECT_EQ(queue.Capacity(), 3u);
+    EXPECT_TRUE(queue.Empty());
+
+    EXPECT_EQ(queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 1,
+                               replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Ok);
+    EXPECT_EQ(queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 2,
+                               replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Ok);
+    EXPECT_EQ(queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 3,
+                               replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Ok);
+    EXPECT_TRUE(queue.Full());
+    EXPECT_EQ(queue.Size(), 3u);
+
+    // Overflow is a value outcome; the queue is unchanged.
+    EXPECT_EQ(queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 4,
+                               replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Overflow);
+    EXPECT_EQ(queue.Size(), 3u);
+
+    // FIFO dequeue order: 1, 2, 3.
+    EXPECT_EQ(queue.Dequeue()->entity.id.value, 1u);
+    EXPECT_EQ(queue.Dequeue()->entity.id.value, 2u);
+    EXPECT_EQ(queue.Dequeue()->entity.id.value, 3u);
+    EXPECT_TRUE(queue.Empty());
+    EXPECT_FALSE(queue.Dequeue().has_value()); // empty -> nullopt
+}
+
+// --- Ring reuse: no allocation, indices wrap ----------------------------------
+TEST(QueuesStep8, RingReuse)
+{
+    replication::FixedRecordQueue queue{2};
+    (void)queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 1, replication::ReplicationReliability::Reliable));
+    (void)queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 2, replication::ReplicationReliability::Reliable));
+    EXPECT_EQ(queue.Dequeue()->entity.id.value, 1u);
+    // Re-enqueue wraps into the freed slot; capacity unchanged.
+    EXPECT_EQ(queue.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 3, replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Ok);
+    EXPECT_EQ(queue.Capacity(), 2u);
+    EXPECT_EQ(queue.Dequeue()->entity.id.value, 2u);
+    EXPECT_EQ(queue.Dequeue()->entity.id.value, 3u);
+}
+
+// --- Independent reliable / unreliable routing --------------------------------
+TEST(QueuesStep8, IndependentRouting)
+{
+    replication::ReplicationQueues queues{QueueCfg(8, 8)};
+    EXPECT_TRUE(queues.Empty());
+
+    EXPECT_EQ(queues.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 1,
+                                replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Ok);
+    EXPECT_EQ(queues.Enqueue(QR(replication::ReplicationChangeKind::Position, 2,
+                                replication::ReplicationReliability::Unreliable)),
+              replication::ReplicationOutcome::Ok);
+
+    EXPECT_EQ(queues.Reliable().Size(), 1u);   // reliable record routed here
+    EXPECT_EQ(queues.Unreliable().Size(), 1u); // unreliable record routed here
+    EXPECT_EQ(queues.Size(), 2u);
+    EXPECT_FALSE(queues.Empty());
+
+    queues.Clear();
+    EXPECT_TRUE(queues.Empty());
+    EXPECT_EQ(queues.Reliable().Size(), 0u);
+    EXPECT_EQ(queues.Unreliable().Size(), 0u);
+}
+
+// --- Change-set routing + budget enforcement (deterministic) ------------------
+TEST(QueuesStep8, ChangeSetRoutingAndBudget)
+{
+    replication::ReplicationChangeSet changes;
+    changes.added.push_back(ES(1, 1.0f, 10, 0));   // EntitySpawn -> reliable
+    changes.added.push_back(ES(2, 2.0f, 20, 0));   // EntitySpawn -> reliable
+    changes.changed.push_back(ES(3, 3.0f, 30, 0)); // Position    -> unreliable
+    changes.removed.push_back(world::EntityId{9}); // EntityRemove-> reliable
+
+    // Ample capacity: everything is routed; Ok.
+    replication::ReplicationQueues ok{QueueCfg(8, 8)};
+    EXPECT_EQ(ok.EnqueueChangeSet(changes), replication::ReplicationOutcome::Ok);
+    EXPECT_EQ(ok.Reliable().Size(), 3u);   // 2 added + 1 removed
+    EXPECT_EQ(ok.Unreliable().Size(), 1u); // 1 changed
+
+    // Deterministic order within reliable queue: removed(9), added(1), added(2).
+    EXPECT_EQ(ok.Reliable().Dequeue()->entity.id.value, 9u);
+    EXPECT_EQ(ok.Reliable().Dequeue()->entity.id.value, 1u);
+    EXPECT_EQ(ok.Reliable().Dequeue()->entity.id.value, 2u);
+
+    // Tight reliable budget (1) overflows; value outcome, unreliable still fills.
+    replication::ReplicationQueues tight{QueueCfg(1, 8)};
+    EXPECT_EQ(tight.EnqueueChangeSet(changes), replication::ReplicationOutcome::Overflow);
+    EXPECT_EQ(tight.Reliable().Size(), 1u);   // only the first reliable record fit
+    EXPECT_EQ(tight.Unreliable().Size(), 1u); // unreliable unaffected (independent)
 }

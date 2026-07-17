@@ -423,28 +423,32 @@ docs(replication): freeze Sprint-009 Step-07 spec (reliability & priority classi
 
 # Step-08 — Replication queues
 
-**Objective.** Define the exception-free, fixed-capacity queue set (reliable / unreliable / priority / retry / outgoing) with deterministic priority ordering and bounded memory.
+**Objective.** Define **two independent, fixed-capacity, FIFO** outgoing queues — one reliable, one unreliable — with capacity bounded by `ReplicationConfiguration` and overflow reported as a value outcome. (Refined from an earlier single priority-queue + retry design: within-queue ordering is FIFO/deterministic; reliable-vs-unreliable selection across the two queues is the consumer's concern in a later step; retry handling is deferred to the worker/manager step. Records carry their §7.A classification for that later cross-queue ordering.)
 
-**Scope — In.** `include/stalkermp/replication/ReplicationQueues.h` (+ `.cpp`): a `QueuedRecord` (metadata + reliability + priority + retry count); `Enqueue(QueuedRecord) -> ReplicationOutcome` (Overflow when full); `DequeueNext()` returning the highest-priority, then FIFO-within-band, then reliable-before-unreliable record; retry-queue handling (`RequeueForRetry`, bounded by `retryLimit`); `Depth()`/`Full()`; pre-reserved storage (no steady-state allocation).
-**Scope — Out.** Packet assembly/transport; snapshot/worker.
+**Scope — In.** `include/stalkermp/replication/ReplicationQueues.h` (+ `.cpp`):
+- `QueuedRecord` — value-only: `ReplicationChangeKind kind`, `EntityReplicationState entity` (payload; for a removal `entity.id` is the removed id and other fields are zero), `ReplicationReliability reliability`, `ReplicationPriority priority`.
+- `FixedRecordQueue` — a fixed-capacity FIFO **ring buffer** with `Enqueue(record) -> ReplicationOutcome` (Overflow when full, queue unchanged), `Dequeue() -> std::optional<QueuedRecord>` (FIFO; nullopt when empty), `Clear()`, `Empty()`, `Full()`, `Size()`, `Capacity()`. No allocation after construction.
+- `ReliableQueue` / `UnreliableQueue` — named `final` queue types (the two independent queues).
+- `ReplicationQueues` — owns one reliable + one unreliable queue (depths from `reliableQueueDepth` / `unreliableQueueDepth`); `Enqueue(record)` routes by `reliability`; `EnqueueChangeSet(const ReplicationChangeSet&)` classifies each change via §7.A and enqueues in deterministic order (removed → EntityRemove, added → EntitySpawn, changed → Position), returning the first Overflow (records that fit remain queued); `Reliable()`/`Unreliable()` accessors; `Clear()`/`Empty()`/`Size()`.
+**Scope — Out.** Packet assembly/serialization/transport; snapshot/worker; retry logic; cross-queue (priority) ordering.
 
-**Functional Requirements.** FR-1 deterministic dequeue order: priority band (High→Low), then FIFO within band, reliable ahead of unreliable at equal priority. FR-2 capacity from config; Overflow value outcome; no throw. FR-3 retry requeue bounded by `retryLimit`; exceeding → Dropped (counter). FR-4 pre-reserved; no steady-state heap allocation. FR-5 all operations value outcomes.
+**Functional Requirements.** FR-1 FIFO ordering within each queue; deterministic dequeue order. FR-2 the reliable and unreliable queues are **independent** (an overflow or drain of one does not affect the other). FR-3 capacity bounded by `ReplicationConfiguration`; Overflow is a value outcome (`ReplicationOutcome`); no throw. FR-4 **no dynamic allocation during queue operations** — storage is pre-reserved once at construction (ring buffer). FR-5 pure value semantics. FR-6 `EnqueueChangeSet` routes each change to its queue via the §7.A classifier deterministically (removed, added, changed order); category→kind mapping documented in-code.
 
 **Non-Functional Requirements.** ADR-007 (exception-free bounded memory); deterministic; engine/OS-free; additive.
 
-**Public Interfaces.** `QueuedRecord`, the queue class with `Reserve`, `Enqueue`, `DequeueNext`, `RequeueForRetry`, `Depth`, `Full`, `Dropped`.
+**Public Interfaces.** `QueuedRecord`; `FixedRecordQueue` (`Enqueue`/`Dequeue`/`Clear`/`Empty`/`Full`/`Size`/`Capacity`); `ReliableQueue`; `UnreliableQueue`; `ReplicationQueues` (`Enqueue`/`EnqueueChangeSet`/`Reliable`/`Unreliable`/`Clear`/`Empty`/`Size`).
 
-**Integration Points.** Consumes Step-01 types + Step-07 classification + config depths. No transport.
+**Integration Points.** Consumes Step-02 `ReplicationConfiguration` (depths), Step-06 `ReplicationChangeSet`, and the Step-07 §7.A classifier. No transport, no worker.
 
-**Validation Requirements.** Unit tests: priority/FIFO/reliable ordering; overflow; retry bound + drop; bounded memory; deterministic sequence.
+**Validation Requirements.** Unit tests: FIFO ordering + capacity + overflow value outcome (queue unchanged); ring reuse (no allocation, index wrap); independent reliable/unreliable routing; change-set routing + budget enforcement + deterministic order.
 
 **Evidence Gates.** None directly (supports E-G4-R ordering + E-G5-R independence).
 
-**Acceptance Criteria.** Queues present, exception-free, bounded, deterministic; tests pass GCC + MSVC; suite green; no prior API change.
+**Acceptance Criteria.** Queues present, exception-free, bounded, FIFO, independent, deterministic; no allocation during ops; tests pass GCC + MSVC; suite green; no prior API change.
 
 **Files Created/Modified.** Create `ReplicationQueues.h`/`.cpp`; tests to `ReplicationTests.cpp`; register in both vcxprojs.
 
-**Test Requirements.** `QueuesStep8`: ordering, overflow, retry/drop, bounded, determinism.
+**Test Requirements.** `QueuesStep8`: FIFO/capacity/overflow, ring reuse, independent routing, change-set routing + budget.
 
 **Documentation Updates.** Local status/log. No README/graphics/ADR change.
 
