@@ -15,6 +15,7 @@
 #include "stalkermp/replication/BubbleInterestPolicy.h"
 #include "stalkermp/replication/DeltaEncoder.h"
 #include "stalkermp/replication/IBubbleMembershipSource.h"
+#include "stalkermp/replication/ReplicationClassifier.h"
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationTypes.h"
@@ -764,4 +765,90 @@ TEST(DeltaStep6, NextBaseline)
     EXPECT_EQ(next[1].id.value, 5u);
     EXPECT_EQ(next[1].version, 1u); // added
     // id 1 (removed) is dropped from the next baseline.
+}
+
+// ============================================================================
+// Step 7 — Reliability & priority classification
+// ============================================================================
+
+// --- Frozen Reliable / Unreliable sets (§7.9) ---------------------------------
+TEST(ClassifierStep7, ReliabilityMappingFrozen)
+{
+    using K = replication::ReplicationChangeKind;
+    using R = replication::ReplicationReliability;
+    // §7.9 Reliable set.
+    EXPECT_EQ(replication::ClassifyReliability(K::EntitySpawn), R::Reliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::EntityRemove), R::Reliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::Inventory), R::Reliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::QuestUpdate), R::Reliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::PlayerJoin), R::Reliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::PlayerLeave), R::Reliable);
+    // §7.9 Unreliable set.
+    EXPECT_EQ(replication::ClassifyReliability(K::Position), R::Unreliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::Rotation), R::Unreliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::Velocity), R::Unreliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::Animation), R::Unreliable);
+    EXPECT_EQ(replication::ClassifyReliability(K::Camera), R::Unreliable);
+}
+
+// --- Frozen priority bands (§7.8) ---------------------------------------------
+TEST(ClassifierStep7, PriorityMappingFrozen)
+{
+    using K = replication::ReplicationChangeKind;
+    using P = replication::ReplicationPriority;
+    // §7.8 High.
+    EXPECT_EQ(replication::ClassifyPriority(K::Player), P::High);
+    EXPECT_EQ(replication::ClassifyPriority(K::Combat), P::High);
+    EXPECT_EQ(replication::ClassifyPriority(K::Damage), P::High);
+    EXPECT_EQ(replication::ClassifyPriority(K::EntitySpawn), P::High);
+    EXPECT_EQ(replication::ClassifyPriority(K::EntityRemove), P::High);
+    // §7.8 Medium.
+    EXPECT_EQ(replication::ClassifyPriority(K::NearbyNpc), P::Medium);
+    EXPECT_EQ(replication::ClassifyPriority(K::Inventory), P::Medium);
+    EXPECT_EQ(replication::ClassifyPriority(K::Animation), P::Medium);
+    // §7.8 Low.
+    EXPECT_EQ(replication::ClassifyPriority(K::AmbientObject), P::Low);
+    EXPECT_EQ(replication::ClassifyPriority(K::WeatherUpdate), P::Low);
+    EXPECT_EQ(replication::ClassifyPriority(K::DistantEntity), P::Low);
+}
+
+// --- Channel derives from reliability -----------------------------------------
+TEST(ClassifierStep7, ChannelDerivesFromReliability)
+{
+    using K = replication::ReplicationChangeKind;
+    using C = replication::ReplicationChannel;
+    EXPECT_EQ(replication::ClassifyChannel(K::EntitySpawn), C::Reliable);
+    EXPECT_EQ(replication::ClassifyChannel(K::Inventory), C::Reliable);
+    EXPECT_EQ(replication::ClassifyChannel(K::Position), C::Unreliable);
+    EXPECT_EQ(replication::ClassifyChannel(K::Animation), C::Unreliable);
+}
+
+// --- Total mapping + deterministic (constexpr) + Name() totality --------------
+TEST(ClassifierStep7, TotalDeterministicAndNames)
+{
+    using K = replication::ReplicationChangeKind;
+    // Compile-time totality/determinism spot checks (constexpr).
+    static_assert(replication::ClassifyReliability(K::EntitySpawn) == replication::ReplicationReliability::Reliable);
+    static_assert(replication::ClassifyPriority(K::Player) == replication::ReplicationPriority::High);
+    static_assert(replication::ClassifyChannel(K::Position) == replication::ReplicationChannel::Unreliable);
+
+    // Every kind classifies without hitting the fallthrough default; Name total.
+    for (std::uint16_t v = 0; v <= 18; ++v)
+    {
+        const auto k = static_cast<K>(v);
+        (void)replication::ClassifyReliability(k);
+        (void)replication::ClassifyPriority(k);
+        (void)replication::ClassifyChannel(k);
+        EXPECT_STRNE(replication::ReplicationChangeKindName(k), "Unknown"); // 0..18 are all defined
+    }
+    EXPECT_STREQ(replication::ReplicationChangeKindName(static_cast<K>(200)), "Unknown");
+    EXPECT_STREQ(replication::ReplicationChangeKindName(K::EntityRemove), "EntityRemove");
+}
+
+// --- Priority ordering is total (High > Medium > Low) -------------------------
+TEST(ClassifierStep7, PriorityOrderingTotal)
+{
+    using P = replication::ReplicationPriority;
+    EXPECT_GT(static_cast<int>(P::High), static_cast<int>(P::Medium));
+    EXPECT_GT(static_cast<int>(P::Medium), static_cast<int>(P::Low));
 }

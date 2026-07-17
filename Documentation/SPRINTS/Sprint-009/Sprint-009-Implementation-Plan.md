@@ -361,12 +361,40 @@ docs(replication): freeze Sprint-009 Step-06 spec (deterministic delta generatio
 
 # Step-07 — Reliability & priority classification
 
-**Objective.** Define the pure, total classifier that assigns a reliability channel and priority band to each replication record per the frozen §7.8/§7.9 tables.
+**Objective.** Define the pure, total classifier that assigns exactly one Reliability, Priority, and Channel to every `ReplicationChangeKind`, per the **complete, authoritative classification table (§7.A below)**. The Sprint-009 design tables §7.8 (priority) and §7.9 (reliability) do not define a full cross-product; §7.A completes them here so the mapping is total and unambiguous. This table is FROZEN — the classifier encodes it verbatim and invents no defaults.
 
-**Scope — In.** `include/stalkermp/replication/ReplicationClassifier.h` (+ `.cpp`): a `ReplicationChangeKind` enum (EntitySpawn/EntityRemove/Position/Animation/PlayerJoin/PlayerLeave/Inventory/…) and pure functions `ClassifyReliability(kind) -> ReplicationReliability`, `ClassifyPriority(kind) -> ReplicationPriority`, `ClassifyChannel(kind) -> ReplicationChannel`; a total mapping with deterministic ordering.
+**Scope — In.** `include/stalkermp/replication/ReplicationClassifier.h` (pure `constexpr`, header-only — a total constexpr mapping belongs in the header; no `.cpp` is emitted): the `ReplicationChangeKind` enum with a total `Name()`, and the pure `constexpr` functions `ClassifyReliability(kind) -> ReplicationReliability`, `ClassifyPriority(kind) -> ReplicationPriority`, `ClassifyChannel(kind) -> ReplicationChannel`, each returning exactly the §7.A value.
 **Scope — Out.** Queue behavior/packets; any state.
 
-**Functional Requirements.** FR-1 reliable set = {EntitySpawn, EntityRemove, Inventory, Quest, PlayerJoin, PlayerLeave}; unreliable set = {Position, Rotation, Velocity, Animation, Camera} (frozen). FR-2 priority bands per §7.8 (players/combat/spawn/destruction = High; nearby NPCs/inventory/animation = Medium; ambient/weather/distant = Low). FR-3 total mapping — every kind classified; deterministic; pure (no state). FR-4 priority ordering total (`High > Medium > Low`).
+**§7.A Frozen classification table (authoritative; every kind assigned exactly once).**
+
+`ReplicationChannel` is derived: `Reliable` reliability → `ReplicationChannel::Reliable`; `Unreliable` reliability → `ReplicationChannel::Unreliable` (the `Control` channel is reserved for future control messages and is assigned to no data kind). Priority underlying order is total: `High (2) > Medium (1) > Low (0)`.
+
+| ReplicationChangeKind | Reliability | Priority | Channel | Source |
+|---|---|---|---|---|
+| `None` (0, sentinel) | Unreliable | Low | Unreliable | Neutral sentinel (no data) |
+| `Player` | Unreliable | High | Unreliable | Priority §7.8 (Players=High); reliability frozen here (continuous player state → Unreliable) |
+| `Combat` | Reliable | High | Reliable | Priority §7.8 (Combat=High); reliability frozen here (must arrive → Reliable) |
+| `Damage` | Reliable | High | Reliable | Priority §7.8 (Damage=High); reliability frozen here (must arrive → Reliable) |
+| `EntitySpawn` | Reliable | High | Reliable | §7.8 High + §7.9 Reliable |
+| `EntityRemove` | Reliable | High | Reliable | §7.8 High (Entity Destruction) + §7.9 Reliable (Entity Removal) |
+| `NearbyNpc` | Unreliable | Medium | Unreliable | Priority §7.8 (Nearby NPCs=Medium); reliability frozen here (frequent state → Unreliable) |
+| `Inventory` | Reliable | Medium | Reliable | §7.8 Medium + §7.9 Reliable |
+| `Animation` | Unreliable | Medium | Unreliable | §7.8 Medium + §7.9 Unreliable |
+| `AmbientObject` | Unreliable | Low | Unreliable | Priority §7.8 (Ambient=Low); reliability frozen here (cosmetic → Unreliable) |
+| `WeatherUpdate` | Unreliable | Low | Unreliable | Priority §7.8 (Weather=Low); reliability frozen here (cosmetic → Unreliable) |
+| `DistantEntity` | Unreliable | Low | Unreliable | Priority §7.8 (Distant=Low); reliability frozen here (frequent state → Unreliable) |
+| `Position` | Unreliable | Medium | Unreliable | Reliability §7.9 (Unreliable); priority frozen here (movement → Medium) |
+| `Rotation` | Unreliable | Medium | Unreliable | Reliability §7.9 (Unreliable); priority frozen here (movement → Medium) |
+| `Velocity` | Unreliable | Medium | Unreliable | Reliability §7.9 (Unreliable); priority frozen here (movement → Medium) |
+| `Camera` | Unreliable | Low | Unreliable | Reliability §7.9 (Unreliable); priority frozen here (least critical → Low) |
+| `QuestUpdate` | Reliable | Medium | Reliable | Reliability §7.9 (Reliable); priority frozen here (gameplay, non-urgent → Medium) |
+| `PlayerJoin` | Reliable | High | Reliable | Reliability §7.9 (Reliable); priority frozen here (player lifecycle → High) |
+| `PlayerLeave` | Reliable | High | Reliable | Reliability §7.9 (Reliable); priority frozen here (player lifecycle → High) |
+
+Rows sourced purely from §7.8/§7.9 are the original frozen design; rows marked "frozen here" complete the missing dimension and are now equally authoritative. `ReplicationChangeKind` enumerators are appended, never renumbered; adding a future kind requires adding its §7.A row (no silent default).
+
+**Functional Requirements.** FR-1 the reliable set is exactly {EntitySpawn, EntityRemove, Inventory, QuestUpdate, PlayerJoin, PlayerLeave, Combat, Damage}; the unreliable set is exactly {None, Player, NearbyNpc, Animation, AmbientObject, WeatherUpdate, DistantEntity, Position, Rotation, Velocity, Camera} (per §7.A). FR-2 priority bands per §7.A: High = {Player, Combat, Damage, EntitySpawn, EntityRemove, PlayerJoin, PlayerLeave}; Medium = {NearbyNpc, Inventory, Animation, Position, Rotation, Velocity, QuestUpdate}; Low = {None, AmbientObject, WeatherUpdate, DistantEntity, Camera}. FR-3 total mapping — every kind classified by the §7.A table; deterministic; pure (no state); no invented default. FR-4 priority ordering total (`High > Medium > Low`). FR-5 channel derives from reliability exactly as stated above.
 
 **Non-Functional Requirements.** ADR-007; deterministic (E-G4-R); engine/OS-free; additive.
 
@@ -380,9 +408,9 @@ docs(replication): freeze Sprint-009 Step-06 spec (deterministic delta generatio
 
 **Acceptance Criteria.** Classifier present, pure, total, deterministic; tests pass GCC + MSVC; suite green; no prior API change.
 
-**Files Created/Modified.** Create `ReplicationClassifier.h`/`.cpp`; tests to `ReplicationTests.cpp`; register in both vcxprojs.
+**Files Created/Modified.** Create `ReplicationClassifier.h` (header-only, pure `constexpr`; no `.cpp`); tests to `ReplicationTests.cpp`; register the header in `xrMP.vcxproj`.
 
-**Test Requirements.** `ClassifierStep7`: per-kind reliability/priority/channel, totality, ordering, determinism.
+**Test Requirements.** `ClassifierStep7`: per-kind reliability/priority/channel matches §7.A for **every** kind; the full §7.A table (all 19 kinds) is asserted; totality (`Name()` total, no fallthrough), determinism (`constexpr` `static_assert`), priority ordering.
 
 **Documentation Updates.** Local status/log. No README/graphics/ADR change.
 
