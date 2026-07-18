@@ -288,6 +288,7 @@
     <ClInclude Include="include\stalkermp\snapshot\SnapshotPool.h" />
     <ClInclude Include="include\stalkermp\world\IEntitySnapshotSource.h" />
     <ClInclude Include="include\stalkermp\adapters\EntitySnapshotSource.h" />
+    <ClInclude Include="include\stalkermp\adapters\PredictionSeams.h" />
     <ClInclude Include="include\stalkermp\adapters\EntitySnapshotMarshal.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotBuilder.h" />
     <ClInclude Include="include\stalkermp\snapshot\SnapshotQueue.h" />

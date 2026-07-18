@@ -22,6 +22,7 @@
 #include "stalkermp/prediction/InterpolationManager.h"
 #include "stalkermp/prediction/PredictionDiagnostics.h"
 #include "stalkermp/prediction/ClientPresentationDriver.h"
+#include "stalkermp/adapters/PredictionSeams.h"
 #include "stalkermp/prediction/IAuthoritativeStateSource.h"
 #include "stalkermp/prediction/ILocalInputSource.h"
 #include "stalkermp/prediction/IPresentationSink.h"
@@ -1635,4 +1636,52 @@ TEST(ClientDriverStep14, Deterministic)
         EXPECT_EQ(sinkA.remote[k].id.value, sinkB.remote[k].id.value);
         EXPECT_FLOAT_EQ(sinkA.remote[k].position.x, sinkB.remote[k].position.x);
     }
+}
+
+// ============================================================================
+// Step 15 — Engine adapter seams (null-path; engine build smoke is Antigravity's)
+// ============================================================================
+
+// --- The null factories supply usable, inert seams ----------------------------
+TEST(EngineSeamsStep15, NullFactoriesProvideInertSeams)
+{
+    auto input = adapters::CreateEngineLocalInputSource();
+    auto sink = adapters::CreateEnginePresentationSink();
+    ASSERT_NE(input, nullptr);
+    ASSERT_NE(sink, nullptr);
+
+    // Null input source never yields input (leaves out unchanged).
+    prediction::InputCommand cmd{};
+    cmd.sequence = 55u;
+    EXPECT_FALSE(input->PollInput(cmd));
+    EXPECT_EQ(cmd.sequence, 55u);
+
+    // Null presentation sink accepts applies without effect or error.
+    prediction::PredictedState local{};
+    local.id = world::EntityId{3};
+    prediction::InterpolatedState remote{};
+    remote.id = world::EntityId{4};
+    sink->ApplyLocal(local);
+    sink->ApplyRemote(remote);
+    SUCCEED();
+}
+
+// --- The null seams drive the driver end-to-end without an engine -------------
+TEST(EngineSeamsStep15, NullSeamsComposeWithDriver)
+{
+    auto input = adapters::CreateEngineLocalInputSource();
+    auto sink = adapters::CreateEnginePresentationSink();
+
+    FakeAuthoritativeSource auth;
+    auth.Queue(DriverFrame(10, 0, {{1, 0.0f}, {2, 4.0f}}, 1, 0.0f));
+    auth.Queue(DriverFrame(20, 0, {{1, 2.0f}, {2, 8.0f}}, 1, 1.0f));
+
+    // Real engine-free seams (null input + null sink) feeding the real driver.
+    prediction::ClientPresentationDriver driver{InterpConfig(0), *input, auth, *sink};
+    EXPECT_EQ(driver.Advance(15, 0.016), prediction::PredictionOutcome::Ok);
+
+    // The pass ran deterministically (null sink absorbed the presented values);
+    // interpolation still buffered and produced remote states internally.
+    EXPECT_EQ(driver.Diagnostics().Snapshot().predictionsRun, 1u);
+    EXPECT_EQ(driver.Diagnostics().Snapshot().interpolations, 2u);
 }

@@ -29,6 +29,13 @@
 #include "stalkermp/adapters/EntitySnapshotMarshal.h"
 #include "stalkermp/world/IEntitySnapshotSource.h"
 
+// Client prediction seams (Sprint-010, Step 15) — engine-free interfaces + factories.
+#include <cmath>
+#include "stalkermp/adapters/PredictionSeams.h"
+#include "stalkermp/prediction/ILocalInputSource.h"
+#include "stalkermp/prediction/IPresentationSink.h"
+#include "stalkermp/prediction/PredictionTypes.h"
+
 // --- X-Ray Engine headers (adapter layer only) ------------------------------
 #include "stdafx.h"           // xrEngine precompiled-header umbrella.
 #include "IGame_Level.h"      // g_pGameLevel, CObjectList, relcase_(un)register.
@@ -602,5 +609,101 @@ namespace stalkermp::adapters
     std::unique_ptr<player::IPlayerSpawnGateway> CreatePlayerSpawnGateway()
     {
         return std::make_unique<EnginePlayerSpawnGateway>();
+    }
+
+    // ----------------------------------- Client prediction seams (Sprint-010) ---
+    namespace
+    {
+        // Resolve an engine object by EntityId. Value-only: returns a borrowed
+        // pointer used transiently within the call; NEVER retained across the seam.
+        [[nodiscard]] CObject* FindObjectById(const std::uint32_t id)
+        {
+            if (g_pGameLevel == nullptr)
+            {
+                return nullptr; // no level loaded
+            }
+            const u32 count = g_pGameLevel->Objects.o_count();
+            for (u32 i = 0; i < count; ++i)
+            {
+                CObject* object = g_pGameLevel->Objects.o_get_by_iterator(i);
+                if (object != nullptr && static_cast<std::uint32_t>(object->ID()) == id)
+                {
+                    return object;
+                }
+            }
+            return nullptr;
+        }
+
+        // Reads the local actor's input each tick into an engine-free InputCommand.
+        // Read-only observation of engine state (never mutates it); values only cross
+        // the seam. The movement/action intent is bound by the engine input layer;
+        // this step captures the actor's identity + facing and stamps a monotonic
+        // sequence/tick so prediction can advance deterministically.
+        class EngineLocalInputSource final : public prediction::ILocalInputSource
+        {
+        public:
+            [[nodiscard]] bool PollInput(prediction::InputCommand& out) const override
+            {
+                CObject* actor = g_pGameLevel != nullptr ? g_pGameLevel->CurrentViewEntity() : nullptr;
+                if (actor == nullptr)
+                {
+                    return false; // no local actor this frame (out unchanged)
+                }
+                out.sequence = ++m_sequence;                                       // monotonic per client
+                out.tick = m_sequence;                                             // one input per polled tick
+                const Fvector& direction = actor->Direction();
+                out.yaw = std::atan2(direction.x, direction.z);                    // facing about the up axis
+                out.move = world::Vec3{};                                          // engine input layer (reserved)
+                out.actionBits = 0;                                                // stance/interaction (reserved)
+                return true;
+            }
+
+        private:
+            mutable std::uint64_t m_sequence = 0; // const-poll advances the monotonic counter
+        };
+
+        // Applies the client-visual presentation transforms. IMPORTANT (ADR-008):
+        // this writes ONLY the object's render/visual transform for the current
+        // frame — it NEVER routes into authoritative ALife/server/simulation state.
+        // On the host (identity mode) the driver supplies authoritative positions,
+        // so the write is a client-visual no-op relative to the authoritative state.
+        class EnginePresentationSink final : public prediction::IPresentationSink
+        {
+        public:
+            void ApplyLocal(const prediction::PredictedState& state) override
+            {
+                ApplyVisual(state.id.value, state.position);
+            }
+            void ApplyRemote(const prediction::InterpolatedState& state) override
+            {
+                ApplyVisual(state.id.value, state.position);
+            }
+
+        private:
+            static void ApplyVisual(const std::uint32_t id, const world::Vec3& position)
+            {
+                CObject* object = FindObjectById(id);
+                if (object == nullptr)
+                {
+                    return; // entity not present this frame -> nothing to render
+                }
+                // Client-visual render transform ONLY (never authoritative state).
+                Fmatrix& xform = object->XFORM();
+                xform.c.set(position.x, position.y, position.z);
+            }
+        };
+    } // namespace
+
+    // Engine-build definitions of the prediction seam factories (Sprint-010,
+    // Step 15). The test build links tests/support/NullPredictionSeams.cpp instead;
+    // these definitions are compiled only into xrMP (engine headers present).
+    std::unique_ptr<prediction::ILocalInputSource> CreateEngineLocalInputSource()
+    {
+        return std::make_unique<EngineLocalInputSource>();
+    }
+
+    std::unique_ptr<prediction::IPresentationSink> CreateEnginePresentationSink()
+    {
+        return std::make_unique<EnginePresentationSink>();
     }
 } // namespace stalkermp::adapters

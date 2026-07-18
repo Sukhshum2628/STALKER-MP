@@ -126,6 +126,7 @@
     <ClCompile Include="support\NullPlatformTransport.cpp" />
     <ClCompile Include="support\NullPlayerSpawnGateway.cpp" />
     <ClCompile Include="support\NullEntitySnapshotSource.cpp" />
+    <ClCompile Include="support\NullPredictionSeams.cpp" />
     <ClCompile Include="..\src\common\FileSystemUtil.cpp" />
     <ClCompile Include="..\src\common\StringUtil.cpp" />
     <ClCompile Include="..\src\common\Time.cpp" />
