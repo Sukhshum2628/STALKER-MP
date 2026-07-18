@@ -208,8 +208,16 @@ namespace stalkermp::replication
         std::uint64_t bytesSent = 0;
         std::uint32_t entitiesReplicated = 0;
         std::uint32_t playersReplicated = 0;
-        std::uint32_t activeClients = 0;
+        std::uint32_t activeClients = 0;      // gauge: clients processed in the last tick
         std::uint64_t lastBuildDurationTicks = 0;
+        // Diagnostic collector counters (Sprint-009, Step 13; additive, POD, 0 =
+        // none). Monotonic across RecordTick/RecordPacket/RecordAck/RecordOverflow.
+        std::uint64_t ticks = 0;
+        std::uint64_t reliablePackets = 0;
+        std::uint64_t unreliablePackets = 0;
+        std::uint64_t acksApplied = 0;
+        std::uint64_t acksIgnored = 0;
+        std::uint64_t overflows = 0;
     };
 
     // Read-only consistency report; the value shape is fixed here and populated by

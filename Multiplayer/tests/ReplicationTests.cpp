@@ -19,6 +19,7 @@
 #include "stalkermp/net/ReplicationMessageIds.h"
 #include "stalkermp/replication/ReplicationClassifier.h"
 #include "stalkermp/replication/ReplicationPacketBuilder.h"
+#include "stalkermp/replication/ReplicationDiagnostics.h"
 #include "stalkermp/replication/ReplicationManager.h"
 #include "stalkermp/replication/ReplicationQueues.h"
 #include "stalkermp/replication/ReplicationWorker.h"
@@ -1413,4 +1414,98 @@ TEST(ReplicationManagerStep11, AckWireParse)
     std::uint8_t wrong[8] = {0x00, 0x01}; // 0x0100, not 0x0201
     net::ByteReader wrongReader(wrong, sizeof(wrong));
     EXPECT_FALSE(manager.HandleReplicationAck(wrongReader).HasValue());
+}
+
+// ============================================================================
+// Step 13 — Replication diagnostics (non-invasive collector)
+// ============================================================================
+
+// --- Record* fold onto the immutable statistics snapshot ----------------------
+TEST(ReplicationDiagnosticsStep13, RecordAndSnapshot)
+{
+    replication::ReplicationDiagnostics diag;
+    EXPECT_EQ(diag.Snapshot().ticks, 0u); // initial
+
+    replication::ReplicationExecuteResult r;
+    r.clientsProcessed = 2;
+    r.recordsQueued = 5;
+    diag.RecordTick(r);
+    diag.RecordPacket(replication::ReplicationReliability::Reliable, 100);
+    diag.RecordPacket(replication::ReplicationReliability::Unreliable, 50);
+    diag.RecordAck(/*applied*/ true);
+    diag.RecordAck(/*applied*/ false);
+    diag.RecordOverflow();
+
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.ticks, 1u);
+    EXPECT_EQ(s.activeClients, 2u);
+    EXPECT_EQ(s.entitiesReplicated, 5u);
+    EXPECT_EQ(s.updatesBuilt, 2u);
+    EXPECT_EQ(s.updatesSent, 2u);
+    EXPECT_EQ(s.bytesSent, 150u);
+    EXPECT_EQ(s.reliablePackets, 1u);
+    EXPECT_EQ(s.unreliablePackets, 1u);
+    EXPECT_EQ(s.acksApplied, 1u);
+    EXPECT_EQ(s.acksIgnored, 1u);
+    EXPECT_EQ(s.overflows, 1u);
+    EXPECT_EQ(s.updatesDropped, 1u);
+}
+
+// --- Reset restores the initial (all-zero) state ------------------------------
+TEST(ReplicationDiagnosticsStep13, ResetRestoresInitial)
+{
+    replication::ReplicationDiagnostics diag;
+    replication::ReplicationExecuteResult r;
+    r.clientsProcessed = 3;
+    diag.RecordTick(r);
+    diag.RecordPacket(replication::ReplicationReliability::Reliable, 10);
+    diag.RecordOverflow();
+    ASSERT_NE(diag.Snapshot().ticks, 0u);
+
+    diag.Reset();
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.ticks, 0u);
+    EXPECT_EQ(s.updatesBuilt, 0u);
+    EXPECT_EQ(s.bytesSent, 0u);
+    EXPECT_EQ(s.overflows, 0u);
+    EXPECT_EQ(s.activeClients, 0u);
+}
+
+// --- Monotonic counters; deterministic accumulation ---------------------------
+TEST(ReplicationDiagnosticsStep13, MonotonicCounters)
+{
+    replication::ReplicationDiagnostics diag;
+    std::uint64_t prevBuilt = 0;
+    std::uint64_t prevBytes = 0;
+    std::uint64_t prevAcks = 0;
+    for (int i = 0; i < 10; ++i)
+    {
+        diag.RecordPacket(replication::ReplicationReliability::Reliable, 7);
+        diag.RecordAck(true);
+        const auto s = diag.Snapshot();
+        EXPECT_GE(s.updatesBuilt, prevBuilt); // never decreases
+        EXPECT_GE(s.bytesSent, prevBytes);
+        EXPECT_GE(s.acksApplied, prevAcks);
+        prevBuilt = s.updatesBuilt;
+        prevBytes = s.bytesSent;
+        prevAcks = s.acksApplied;
+    }
+    EXPECT_EQ(diag.Snapshot().updatesBuilt, 10u);
+    EXPECT_EQ(diag.Snapshot().bytesSent, 70u);
+    EXPECT_EQ(diag.Snapshot().acksApplied, 10u);
+}
+
+// --- Snapshot is an immutable value copy (non-invasive) -----------------------
+TEST(ReplicationDiagnosticsStep13, SnapshotIsImmutableCopy)
+{
+    replication::ReplicationDiagnostics diag;
+    diag.RecordPacket(replication::ReplicationReliability::Reliable, 5);
+
+    auto s = diag.Snapshot();
+    s.updatesBuilt = 999;      // mutate the returned copy
+    s.bytesSent = 999;
+    EXPECT_EQ(s.updatesBuilt, 999u); // the copy reflects the local mutation
+    // The collector is unaffected by mutations to the returned value.
+    EXPECT_EQ(diag.Snapshot().updatesBuilt, 1u);
+    EXPECT_EQ(diag.Snapshot().bytesSent, 5u);
 }

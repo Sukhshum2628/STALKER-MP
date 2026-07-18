@@ -601,28 +601,28 @@ docs(replication): freeze Sprint-009 Step-12 spec (Bootstrap wiring at kReplicat
 
 # Step-13 — `ReplicationDiagnostics`
 
-**Objective.** Define the read-only, replay-stable diagnostics inspector over the `ReplicationManager`.
+**Objective.** Define a pure, non-invasive diagnostic **collector** that accumulates monotonic counters from the Step-10 worker results and the Step-11 acknowledgement events and returns an immutable value snapshot on demand. (Refined from a read-only inspector-over-the-manager to a standalone collector, so diagnostics are decoupled from — and cannot influence — the replication pipeline.)
 
-**Scope — In.** `include/stalkermp/replication/ReplicationDiagnostics.h` (+ `.cpp`): read-only `Statistics()`, `DescribeState()`, `DumpUpdate(ReplicationId)`, `PacketView()`, `BandwidthReport()`, `PriorityStatistics()`, `DroppedPacketCounter()`, `ClientStatistics()`. iostream-free (`common::Format`). Bandwidth/latency/worker timing fields explicitly diagnostic.
-**Scope — Out.** Any mutation; new telemetry/logging beyond this interface.
+**Scope — In.** `include/stalkermp/replication/ReplicationDiagnostics.h` (header-only, pure inline; no `.cpp`): `Reset()` (restore initial state); `Snapshot() -> replication::ReplicationStatistics` (an immutable value copy); and the collection methods `RecordTick(const ReplicationExecuteResult&)` (folds tick count, `activeClients` gauge, and entities routed), `RecordPacket(ReplicationReliability, byteCount)` (per assembled packet — `updatesBuilt`/`updatesSent`/`bytesSent`/reliable-or-unreliable bin), `RecordAck(bool applied)` (`acksApplied`/`acksIgnored`), `RecordOverflow()` (`overflows`/`updatesDropped`). The immutable value is the existing `replication::ReplicationStatistics`, **extended additively** (Step 13; POD, `0 = none`) with the collector counters `ticks`, `reliablePackets`, `unreliablePackets`, `acksApplied`, `acksIgnored`, `overflows` — additive fields only, no behavior change, trivially-copyable preserved (Step-01 tests unaffected).
+**Scope — Out.** Any mutation of the pipeline; any reference to the manager/worker/queues; new telemetry/logging/output; networking/transport/scheduling/threading/simulation/engine work.
 
-**Functional Requirements.** FR-1 all accessors read-only; derive from the manager's const surface + queues + client registry. FR-2 `DumpUpdate` returns the current/last update for an id or `available=false`. FR-3 bandwidth/priority/dropped/client reports derive from `ReplicationStatistics` + queue state. FR-4 deterministic except explicitly-diagnostic timing/wall-clock. FR-5 iostream-free.
+**Functional Requirements.** FR-1 pure diagnostic collection only — no influence on replication behavior (holds no pipeline reference). FR-2 deterministic; all Record-driven counters monotonic (`activeClients` is an explicitly-documented gauge). FR-3 `Snapshot()` returns an immutable value object (a copy; mutating it cannot affect the collector). FR-4 `Reset()` restores the initial (all-zero) state. FR-5 tracks only the metrics defined here; consumes only Step-10 results and Step-11 ack events.
 
-**Non-Functional Requirements.** ADR-007; read-only; engine/OS-free; additive.
+**Non-Functional Requirements.** ADR-007; engine/OS-free; additive; header-only.
 
-**Public Interfaces.** The seven+ accessors above and their small read-only value structs (`BandwidthReport`, `PriorityStatistics`, `ClientReport`, `PacketView`, `UpdateDump`).
+**Public Interfaces.** `ReplicationDiagnostics` with `Reset`, `Snapshot`, `RecordTick`, `RecordPacket`, `RecordAck`, `RecordOverflow`; the additively-extended `ReplicationStatistics` value.
 
-**Integration Points.** Consumes `ReplicationManager` const surface only (Statistics/Queues/ClientRegistry view). No mutation.
+**Integration Points.** Consumes a `ReplicationExecuteResult` (Step-10) and ack-applied events (Step-11) passed in by the caller. No pipeline reference; no mutation.
 
-**Validation Requirements.** Unit tests: statistics correctness; bandwidth/priority/dropped/client reporting; update dump correctness (current vs unknown id); read-only guarantees (manager/queue state unchanged across diagnostic calls); pre-first-pass edge state.
+**Validation Requirements.** Unit tests: Record* fold onto the snapshot correctly; Reset restores initial state; counters monotonic + deterministic accumulation; Snapshot is an immutable value copy (mutating it leaves the collector unchanged).
 
 **Evidence Gates.** None (observability).
 
-**Acceptance Criteria.** Diagnostics present, read-only, iostream-free; tests pass GCC + MSVC; suite green; no prior API change.
+**Acceptance Criteria.** Collector present, non-invasive, deterministic, monotonic; Snapshot immutable value; Reset restores initial; tests pass GCC + MSVC; suite green; Step-01 tests unaffected by the additive extension.
 
-**Files Created/Modified.** Create `ReplicationDiagnostics.h`/`.cpp`; tests to `ReplicationTests.cpp`; register in both vcxprojs.
+**Files Created/Modified.** Create `ReplicationDiagnostics.h` (header-only); extend `ReplicationStatistics` in `ReplicationTypes.h` (additive fields); tests to `ReplicationTests.cpp`; register the header in `xrMP.vcxproj`.
 
-**Test Requirements.** `ReplicationDiagnosticsStep13`: statistics, bandwidth, priority, dropped, client, dump, read-only.
+**Test Requirements.** `ReplicationDiagnosticsStep13`: record-and-snapshot correctness, reset-restores-initial, monotonic counters, snapshot-is-immutable-copy.
 
 **Documentation Updates.** Local status/log. No README/graphics/ADR change.
 
