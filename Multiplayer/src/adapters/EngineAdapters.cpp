@@ -32,6 +32,7 @@
 // Client prediction seams (Sprint-010, Step 15) — engine-free interfaces + factories.
 #include <cmath>
 #include "stalkermp/adapters/PredictionSeams.h"
+#include "stalkermp/prediction/ClientPresentationPhase.h" // detail::AdvanceClientPresentation (Step 16)
 #include "stalkermp/prediction/ILocalInputSource.h"
 #include "stalkermp/prediction/IPresentationSink.h"
 #include "stalkermp/prediction/PredictionTypes.h"
@@ -209,7 +210,12 @@ namespace stalkermp::adapters
 
             void _BCL OnFrame() override
             {
-                m_dispatcher.Dispatch(static_cast<double>(Device.fTimeDelta));
+                const double dt = static_cast<double>(Device.fTimeDelta);
+                m_dispatcher.Dispatch(dt);
+                // Client-presentation phase (Sprint-010): runs AFTER Dispatch, within
+                // the frame bridge — not a FrameDispatcher subscriber (no new
+                // tick_order key; networking-last preserved).
+                stalkermp::detail::AdvanceClientPresentation(dt);
             }
 
         private:

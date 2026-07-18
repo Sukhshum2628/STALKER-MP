@@ -1685,3 +1685,145 @@ TEST(EngineSeamsStep15, NullSeamsComposeWithDriver)
     EXPECT_EQ(driver.Diagnostics().Snapshot().predictionsRun, 1u);
     EXPECT_EQ(driver.Diagnostics().Snapshot().interpolations, 2u);
 }
+
+// ============================================================================
+// Step 16 — Composed integration (prediction + replication frames, with fakes)
+// ============================================================================
+
+// --- Prediction + replication frames: host agrees -> small correction ---------
+TEST(PredictionIntegrationStep16, PredictionWithAgreeingFrames)
+{
+    FakeInputSource in;
+    in.Queue(MoveInput(1, 1, 1.0f, 0.0f, 0.0f));
+
+    FakeAuthoritativeSource auth;
+    // Host agrees with the client's origin baseline; acked 0.
+    auth.Queue(DriverFrame(10, 0, {{1, 0.0f}, {2, 100.0f}}, 1, 0.0f));
+    auth.Queue(DriverFrame(20, 0, {{1, 10.0f}, {2, 200.0f}}, 1, 0.0f));
+
+    FakePresentationSink sink;
+    prediction::ClientPresentationDriver driver{InterpConfig(0), in, auth, sink};
+
+    EXPECT_EQ(driver.Advance(15, 0.016), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(driver.Prediction().Current().id.value, 1u);
+    ASSERT_EQ(sink.remote.size(), 2u);
+    EXPECT_FLOAT_EQ(sink.remote[0].position.x, 5.0f);   // entity 1 midpoint
+    EXPECT_FLOAT_EQ(sink.remote[1].position.x, 150.0f); // entity 2 midpoint
+    // Host agrees (baseline 0, prediction small) -> no snap.
+    EXPECT_NE(driver.Prediction().LastCorrection(), prediction::CorrectionKind::Snapped);
+}
+
+// --- Host disagreement -> reconciliation snaps to authoritative ---------------
+TEST(PredictionIntegrationStep16, HostDisagreementReconciles)
+{
+    FakeInputSource in;
+    in.Queue(MoveInput(1, 1, 5.0f, 0.0f, 0.0f)); // client predicts a big move
+
+    FakeAuthoritativeSource auth; // no authoritative frame yet
+    FakePresentationSink sink;
+    prediction::ClientPresentationDriver driver{InterpConfig(0), in, auth, sink};
+
+    // Pass 1: client predicts the move forward (no frame to reconcile against).
+    EXPECT_EQ(driver.Advance(1, 0.016), prediction::PredictionOutcome::Ok);
+    EXPECT_FLOAT_EQ(driver.Prediction().Current().position.x, 5.0f);
+
+    // Pass 2: the host frame arrives disagreeing (origin) and acknowledges input 1
+    // -> reconciliation snaps to authoritative (x=0); host authority wins.
+    auth.Queue(DriverFrame(10, /*acked*/ 1, {{1, 0.0f}}, /*local*/ 1, /*localX*/ 0.0f));
+    EXPECT_EQ(driver.Advance(10, 0.016), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(driver.Prediction().LastCorrection(), prediction::CorrectionKind::Snapped);
+    EXPECT_FLOAT_EQ(driver.Prediction().Current().position.x, 0.0f);
+    ASSERT_FALSE(sink.local.empty());
+    EXPECT_FLOAT_EQ(sink.local.back().position.x, 0.0f); // host authority presented
+}
+
+// --- Remote smoothing across successive render ticks --------------------------
+TEST(PredictionIntegrationStep16, RemoteSmoothingAcrossTicks)
+{
+    FakeInputSource in; // no local input for this test
+    FakeAuthoritativeSource auth;
+    auth.Queue(EntFrame(10, {{5, 0.0f}}));
+    auth.Queue(EntFrame(30, {{5, 20.0f}})); // entity 5 moves 0 -> 20 over ticks 10..30
+
+    FakePresentationSink sink;
+    prediction::ClientPresentationDriver driver{InterpConfig(0), in, auth, sink};
+
+    // Successive render ticks interpolate the buffered frames monotonically.
+    EXPECT_EQ(driver.Advance(15, 0.016), prediction::PredictionOutcome::Ok); // factor .25 -> 5
+    EXPECT_EQ(driver.Advance(20, 0.016), prediction::PredictionOutcome::Ok); // factor .50 -> 10
+    EXPECT_EQ(driver.Advance(25, 0.016), prediction::PredictionOutcome::Ok); // factor .75 -> 15
+
+    ASSERT_EQ(sink.remote.size(), 3u);
+    EXPECT_FLOAT_EQ(sink.remote[0].position.x, 5.0f);
+    EXPECT_FLOAT_EQ(sink.remote[1].position.x, 10.0f);
+    EXPECT_FLOAT_EQ(sink.remote[2].position.x, 15.0f);
+}
+
+// --- Simulated latency / packet delay / loss: no extrapolation, then recover ---
+TEST(PredictionIntegrationStep16, LatencyDelayAndLossRecovery)
+{
+    FakeInputSource in;
+    FakeAuthoritativeSource auth;
+    auth.Queue(EntFrame(10, {{5, 0.0f}})); // only the first frame has arrived
+
+    FakePresentationSink sink;
+    prediction::ClientPresentationDriver driver{InterpConfig(0), in, auth, sink};
+
+    // Next frame is delayed/lost: render ticks beyond the newest frame must clamp
+    // (no extrapolation past x=0), not overshoot.
+    EXPECT_EQ(driver.Advance(15, 0.016), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(driver.Advance(50, 0.016), prediction::PredictionOutcome::Ok);
+    ASSERT_EQ(sink.remote.size(), 2u);
+    EXPECT_FLOAT_EQ(sink.remote[0].position.x, 0.0f); // clamped to frame 10
+    EXPECT_FLOAT_EQ(sink.remote[1].position.x, 0.0f); // still clamped (no extrapolation)
+
+    // The delayed frame finally arrives: interpolation resumes deterministically.
+    auth.Queue(EntFrame(60, {{5, 60.0f}}));
+    EXPECT_EQ(driver.Advance(35, 0.016), prediction::PredictionOutcome::Ok); // between 10 and 60
+    ASSERT_EQ(sink.remote.size(), 3u);
+    EXPECT_FLOAT_EQ(sink.remote[2].position.x, 30.0f); // (35-10)/(60-10)=0.5 -> 30
+}
+
+// --- Determinism / replay: identical scripts -> identical presentation --------
+TEST(PredictionIntegrationStep16, DeterministicReplayUnderScriptedDelivery)
+{
+    auto script = [](FakeInputSource& in, FakeAuthoritativeSource& auth,
+                     prediction::ClientPresentationDriver& d) {
+        in.Queue(MoveInput(1, 1, 0.5f, 0.25f, 0.1f));
+        auth.Queue(DriverFrame(10, 0, {{1, 0.0f}, {2, 4.0f}}, 1, 0.0f));
+        (void)d.Advance(12, 0.016);
+        in.Queue(MoveInput(2, 2, 0.5f, 0.25f, 0.2f));
+        auth.Queue(DriverFrame(20, 1, {{1, 2.0f}, {2, 8.0f}}, 1, 1.0f));
+        (void)d.Advance(15, 0.016);
+        (void)d.Advance(18, 0.016); // no new frame (delay); must stay deterministic
+    };
+
+    FakeInputSource inA;
+    FakeAuthoritativeSource authA;
+    FakePresentationSink sinkA;
+    prediction::ClientPresentationDriver a{InterpConfig(1), inA, authA, sinkA};
+
+    FakeInputSource inB;
+    FakeAuthoritativeSource authB;
+    FakePresentationSink sinkB;
+    prediction::ClientPresentationDriver b{InterpConfig(1), inB, authB, sinkB};
+
+    script(inA, authA, a);
+    script(inB, authB, b);
+
+    ASSERT_EQ(sinkA.local.size(), sinkB.local.size());
+    for (std::size_t k = 0; k < sinkA.local.size(); ++k)
+    {
+        EXPECT_FLOAT_EQ(sinkA.local[k].position.x, sinkB.local[k].position.x);
+        EXPECT_FLOAT_EQ(sinkA.local[k].position.z, sinkB.local[k].position.z);
+        EXPECT_FLOAT_EQ(sinkA.local[k].yaw, sinkB.local[k].yaw);
+    }
+    ASSERT_EQ(sinkA.remote.size(), sinkB.remote.size());
+    for (std::size_t k = 0; k < sinkA.remote.size(); ++k)
+    {
+        EXPECT_EQ(sinkA.remote[k].id.value, sinkB.remote[k].id.value);
+        EXPECT_FLOAT_EQ(sinkA.remote[k].position.x, sinkB.remote[k].position.x);
+    }
+    EXPECT_EQ(a.Prediction().ConfirmedSequence(), b.Prediction().ConfirmedSequence());
+    EXPECT_EQ(a.Diagnostics().Snapshot().predictionsRun, b.Diagnostics().Snapshot().predictionsRun);
+}

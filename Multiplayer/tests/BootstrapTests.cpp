@@ -9,6 +9,8 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/core/FrameDispatcher.h"
 #include "stalkermp/common/FileSystemUtil.h"
+#include "stalkermp/prediction/ClientPresentationDriver.h"
+#include "stalkermp/prediction/ClientPresentationPhase.h"
 
 namespace
 {
@@ -181,6 +183,39 @@ TEST(Bootstrap, WorldSubsystemWiredThroughCompositionRoot)
 
     stalkermp::Shutdown();
     EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
+}
+
+// --- Sprint-010 Step-16: ClientPresentationDriver composition-root wiring ------
+TEST(Bootstrap, ClientPresentationDriverWiredInIdentityMode)
+{
+    const auto params = MakeParams("prediction_wiring");
+
+    ASSERT_TRUE(stalkermp::Initialize(params));
+
+    // The driver is wired and, on the host, runs in identity mode.
+    const auto* driver = stalkermp::detail::GetModuleClientPresentationDriver();
+    ASSERT_NE(driver, nullptr);
+    EXPECT_TRUE(driver->IsIdentityMode());
+
+    // It is NOT a FrameDispatcher subscriber (no new tick_order key; networking-last
+    // preserved) — the subscriber count is unchanged (eight).
+    auto* dispatcher = stalkermp::detail::GetModuleFrameDispatcher();
+    ASSERT_NE(dispatcher, nullptr);
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
+
+    // The client-presentation phase runs after Dispatch (as the engine frame bridge
+    // does), deterministically and without error, adding no subscribers.
+    for (int i = 0; i < 4; ++i)
+    {
+        dispatcher->Dispatch(0.016);
+        stalkermp::detail::AdvanceClientPresentation(0.016);
+    }
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(8));
+    // Identity mode on the host: no local prediction ran.
+    EXPECT_EQ(driver->Diagnostics().Snapshot().predictionsRun, 0u);
+
+    stalkermp::Shutdown();
+    EXPECT_EQ(stalkermp::detail::GetModuleClientPresentationDriver(), nullptr);
 }
 
 // --- Sprint-008 Step-10: SnapshotManager composition-root wiring --------------

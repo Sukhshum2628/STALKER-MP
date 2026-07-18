@@ -74,6 +74,11 @@
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
 #include "stalkermp/world/WorldQueryService.h"
+#include "stalkermp/adapters/PredictionSeams.h"                 // Sprint-010 prediction seam factories
+#include "stalkermp/prediction/ClientPresentationDriver.h"      // Sprint-010 client-presentation driver
+#include "stalkermp/prediction/ClientPresentationPhase.h"       // Sprint-010 post-dispatch phase hook
+#include "stalkermp/prediction/IAuthoritativeStateSource.h"
+#include "stalkermp/prediction/PredictionConfiguration.h"
 
 namespace stalkermp
 {
@@ -120,7 +125,20 @@ namespace stalkermp
             "; Client settings arrive with Sprint-007 (Player Connections).\n"
             "\n"
             "[meta]\n"
-            "config_version = 1\n";
+            "config_version = 1\n"
+            "\n"
+            "; Client prediction & interpolation (Sprint-010). Depths/delays are tick\n"
+            "; counts; correction thresholds are fixed-point (mm / mrad). All optional\n"
+            "; (defaults shown). Ignored on the host (identity mode).\n"
+            "[prediction]\n"
+            "input_buffer_depth = 128\n"
+            "state_buffer_depth = 128\n"
+            "interpolation_delay_ticks = 2\n"
+            "max_prediction_ticks = 8\n"
+            "position_correction_threshold_mm = 250\n"
+            "rotation_correction_threshold_mrad = 100\n"
+            "velocity_correction_threshold_mm = 500\n"
+            "version = 1\n";
 
         struct Runtime
         {
@@ -214,6 +232,20 @@ namespace stalkermp
             std::unique_ptr<replication::IBubbleMembershipSource> bubbleMembership;
             std::unique_ptr<replication::IInterestPolicy> interestPolicy;
             replication::ReplicationManager* replicationManager = nullptr;
+
+            // Client Prediction & Interpolation (Sprint-010). The three engine-free
+            // seams (engine adapters in the engine build, null/empty in tests) are
+            // Runtime-owned and declared BEFORE the driver so the driver — which holds
+            // references to them — is destroyed first (reverse member-destruction).
+            // The driver is NOT a FrameDispatcher subscriber; it runs in the
+            // client-presentation phase after Dispatch (no new tick_order key;
+            // networking-last preserved). `clientPresentationTick` is the monotonic
+            // per-frame counter passed to Advance.
+            std::unique_ptr<prediction::ILocalInputSource> localInputSource;
+            std::unique_ptr<prediction::IAuthoritativeStateSource> authoritativeStateSource;
+            std::unique_ptr<prediction::IPresentationSink> presentationSink;
+            std::unique_ptr<prediction::ClientPresentationDriver> clientPresentationDriver;
+            std::uint64_t clientPresentationTick = 0;
         };
 
         // The single module-global. See file header for justification.
@@ -658,6 +690,49 @@ namespace stalkermp
             return Success();
         }
 
+        // Engine-free authoritative source that yields no frames. The client receive
+        // + decode pipeline (a future sprint) will replace this behind the same seam;
+        // until then the driver has no authoritative frames to consume, and the host
+        // renders authoritative state directly (identity mode).
+        class EmptyAuthoritativeStateSource final : public prediction::IAuthoritativeStateSource
+        {
+        public:
+            [[nodiscard]] bool NextFrame(prediction::SnapshotFrame&) const override { return false; }
+        };
+
+        // Sprint-010: construct + wire the client-presentation driver (prediction +
+        // interpolation). It is NOT a FrameDispatcher subscriber — the frame bridge
+        // invokes Advance in the client-presentation phase AFTER Dispatch (no new
+        // tick_order key; networking-last preserved). Identity mode is selected
+        // because this composition IS the host (it owns the authoritative simulation
+        // and replication); a client build would set identity mode false and supply a
+        // receive-decoded authoritative source behind the same seam.
+        [[nodiscard]] Expected<void> RegisterClientPresentation(Runtime& runtime)
+        {
+            auto predictionConfiguration = prediction::PredictionConfiguration::FromConfig(runtime.clientConfig);
+            if (!predictionConfiguration)
+            {
+                return predictionConfiguration.GetError();
+            }
+
+            // Engine-free seams (real engine adapters in the engine build, null/empty
+            // in tests). Owned by the Runtime so they outlive the driver.
+            runtime.localInputSource = adapters::CreateEngineLocalInputSource();
+            runtime.presentationSink = adapters::CreateEnginePresentationSink();
+            runtime.authoritativeStateSource = std::make_unique<EmptyAuthoritativeStateSource>();
+
+            runtime.clientPresentationDriver = std::make_unique<prediction::ClientPresentationDriver>(
+                predictionConfiguration.Value(), *runtime.localInputSource, *runtime.authoritativeStateSource,
+                *runtime.presentationSink);
+
+            // Host authority: render authoritative state directly (no prediction/
+            // interpolation on the host).
+            runtime.clientPresentationDriver->SetIdentityMode(true);
+
+            runtime.logger.Info(kLogCategory, "Client-presentation driver wired (host identity mode)");
+            return Success();
+        }
+
         [[nodiscard]] Expected<void> RegisterModules(Runtime& runtime)
         {
             // Sprint-001 §7.10 — declared now, implemented by later sprints.
@@ -724,6 +799,14 @@ namespace stalkermp
                 return worldServices;
             }
 
+            // 4b. Client Prediction & Interpolation (Sprint-010). Constructed after
+            //     the simulation/replication services it presents; NOT a dispatcher
+            //     subscriber — invoked in the client-presentation phase after Dispatch.
+            if (auto presentation = RegisterClientPresentation(runtime); !presentation)
+            {
+                return presentation;
+            }
+
             // 5. Service initialization in registration order.
             if (auto services = runtime.services.InitializeAll(); !services)
             {
@@ -775,6 +858,12 @@ namespace stalkermp
             // removed FIRST so no engine callback can reach a
             // shutting-down module (remove-first, Design Review §5).
             g_runtime->frameBridge.reset();
+
+            // Client-presentation driver (Sprint-010) next: the frame bridge that
+            // drove it (via the post-Dispatch phase) is gone, so no further Advance
+            // can run. Destroyed before its Runtime-owned seams (which follow with the
+            // Runtime) since it holds references to them.
+            g_runtime->clientPresentationDriver.reset();
 
             // Engine feed next: unsubscribe from the (no-longer-driven) dispatcher
             // and destroy it before the ServiceRegistry that owns the registry it
@@ -965,5 +1054,23 @@ namespace stalkermp::detail
     core::FrameDispatcher* GetModuleFrameDispatcher() noexcept
     {
         return g_runtime ? &g_runtime->frameDispatcher : nullptr;
+    }
+
+    // Client-presentation phase (Sprint-010): runs the driver once per frame, after
+    // FrameDispatcher::Dispatch. No-op when uninitialized or no driver is wired.
+    // Deterministic (tick-driven); deltaSeconds is not used in control flow.
+    void AdvanceClientPresentation(double deltaSeconds) noexcept
+    {
+        if (!g_runtime || !g_runtime->clientPresentationDriver)
+        {
+            return;
+        }
+        ++g_runtime->clientPresentationTick;
+        (void)g_runtime->clientPresentationDriver->Advance(g_runtime->clientPresentationTick, deltaSeconds);
+    }
+
+    const prediction::ClientPresentationDriver* GetModuleClientPresentationDriver() noexcept
+    {
+        return g_runtime ? g_runtime->clientPresentationDriver.get() : nullptr;
     }
 } // namespace stalkermp::detail
