@@ -20,6 +20,7 @@
 #include "stalkermp/prediction/PredictionStep.h"
 #include "stalkermp/prediction/InterpolationStep.h"
 #include "stalkermp/prediction/InterpolationManager.h"
+#include "stalkermp/prediction/PredictionDiagnostics.h"
 #include "stalkermp/prediction/IAuthoritativeStateSource.h"
 #include "stalkermp/prediction/ILocalInputSource.h"
 #include "stalkermp/prediction/IPresentationSink.h"
@@ -1413,4 +1414,103 @@ TEST(PredictionHardeningStep12, LargeEntityChurnReplayIdentity)
             }
         }
     }
+}
+
+// ============================================================================
+// Step 13 — PredictionDiagnostics
+// ============================================================================
+
+// --- Record then snapshot: counters + aggregates reflect the records ----------
+TEST(PredictionDiagnosticsStep13, RecordAndSnapshot)
+{
+    prediction::PredictionDiagnostics diag;
+    diag.RecordPrediction();      // +1
+    diag.RecordPrediction(3);     // +3 -> 4
+    diag.RecordInterpolation(2);  // 2
+    diag.RecordOverflow();        // 1
+    diag.RecordCorrection(100);
+    diag.RecordCorrection(300);   // max 300, sum 400, avg 200
+
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.predictionsRun, 4u);
+    EXPECT_EQ(s.interpolations, 2u);
+    EXPECT_EQ(s.overflows, 1u);
+    EXPECT_EQ(s.corrections, 2u);
+    EXPECT_EQ(s.lastCorrectionMagnitude, 300u);
+    EXPECT_EQ(s.maxCorrectionMagnitude, 300u);
+    EXPECT_EQ(diag.CorrectionMagnitudeSum(), 400u);
+    EXPECT_EQ(diag.AverageCorrectionMagnitude(), 200u);
+}
+
+// --- Reset restores the initial (all-zero) state ------------------------------
+TEST(PredictionDiagnosticsStep13, ResetRestoresInitial)
+{
+    prediction::PredictionDiagnostics diag;
+    diag.RecordPrediction(5);
+    diag.RecordCorrection(999);
+    diag.RecordTimestamp(123456789u);
+
+    diag.Reset();
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.predictionsRun, 0u);
+    EXPECT_EQ(s.corrections, 0u);
+    EXPECT_EQ(s.maxCorrectionMagnitude, 0u);
+    EXPECT_EQ(s.timestampWallClock, 0u);
+    EXPECT_EQ(diag.CorrectionMagnitudeSum(), 0u);
+    EXPECT_EQ(diag.AverageCorrectionMagnitude(), 0u);
+}
+
+// --- Counters are monotonic; max never decreases ------------------------------
+TEST(PredictionDiagnosticsStep13, MonotonicCountersAndMax)
+{
+    prediction::PredictionDiagnostics diag;
+    diag.RecordCorrection(500); // max 500
+    diag.RecordCorrection(100); // smaller -> max stays 500, last = 100
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.maxCorrectionMagnitude, 500u);
+    EXPECT_EQ(s.lastCorrectionMagnitude, 100u);
+    EXPECT_EQ(s.corrections, 2u);
+
+    std::uint64_t prev = 0;
+    for (int i = 0; i < 10; ++i)
+    {
+        diag.RecordPrediction();
+        const std::uint64_t now = diag.Snapshot().predictionsRun;
+        EXPECT_TRUE(now > prev); // strictly increasing
+        prev = now;
+    }
+}
+
+// --- Snapshot is an immutable value copy (decoupled from the collector) --------
+TEST(PredictionDiagnosticsStep13, SnapshotIsImmutableCopy)
+{
+    prediction::PredictionDiagnostics diag;
+    diag.RecordPrediction(2);
+    prediction::PredictionStatistics early = diag.Snapshot();
+
+    // Mutating the copy does not affect the collector.
+    early.predictionsRun = 9999u;
+    EXPECT_EQ(diag.Snapshot().predictionsRun, 2u);
+
+    // Later records do not retroactively change an earlier snapshot.
+    diag.RecordPrediction(5);
+    EXPECT_EQ(early.predictionsRun, 9999u);         // the local copy is untouched
+    EXPECT_EQ(diag.Snapshot().predictionsRun, 7u);  // collector advanced to 7
+
+    // Timestamp is captured in the value but is diagnostic-only.
+    diag.RecordTimestamp(42u);
+    EXPECT_EQ(diag.Snapshot().timestampWallClock, 42u);
+}
+
+// --- Average is deterministic (integer division), 0 when no corrections --------
+TEST(PredictionDiagnosticsStep13, DeterministicAverage)
+{
+    prediction::PredictionDiagnostics diag;
+    EXPECT_EQ(diag.AverageCorrectionMagnitude(), 0u); // none yet
+
+    diag.RecordCorrection(10);
+    diag.RecordCorrection(20);
+    diag.RecordCorrection(31); // sum 61 / 3 = 20 (integer)
+    EXPECT_EQ(diag.CorrectionMagnitudeSum(), 61u);
+    EXPECT_EQ(diag.AverageCorrectionMagnitude(), 20u);
 }
