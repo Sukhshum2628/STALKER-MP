@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "stalkermp/core/Config.h"
+#include "stalkermp/prediction/PredictionConfiguration.h"
 #include "stalkermp/prediction/PredictionTypes.h"
 
 using namespace stalkermp;
@@ -102,4 +104,111 @@ TEST(PredictionTypesStep1, CorrectionNamesTotal)
     EXPECT_STREQ(prediction::CorrectionKindName(prediction::CorrectionKind::Smoothed), "Smoothed");
     EXPECT_STREQ(prediction::CorrectionKindName(prediction::CorrectionKind::Snapped), "Snapped");
     EXPECT_STREQ(prediction::CorrectionKindName(static_cast<prediction::CorrectionKind>(200)), "Unknown");
+}
+
+// ============================================================================
+// Step 2 — PredictionConfiguration::FromConfig
+// ============================================================================
+
+// --- Missing [prediction] section => all documented defaults ------------------
+TEST(PredictionConfigStep2, DefaultsWhenSectionAbsent)
+{
+    core::ConfigStore store;
+    const auto r = prediction::PredictionConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.inputBufferDepth, 128u);
+    EXPECT_EQ(c.stateBufferDepth, 128u);
+    EXPECT_EQ(c.interpolationDelayTicks, 2u);
+    EXPECT_EQ(c.maxPredictionTicks, 8u);
+    EXPECT_EQ(c.positionCorrectionThresholdMm, 250u);
+    EXPECT_EQ(c.rotationCorrectionThresholdMrad, 100u);
+    EXPECT_EQ(c.velocityCorrectionThresholdMm, 500u);
+    EXPECT_EQ(c.version, 1u);
+}
+
+// --- Each field parses a valid supplied value (override) ----------------------
+TEST(PredictionConfigStep2, OverridesParsed)
+{
+    core::ConfigStore store;
+    store.Set("prediction", "input_buffer_depth", "256");
+    store.Set("prediction", "state_buffer_depth", "64");
+    store.Set("prediction", "interpolation_delay_ticks", "3");
+    store.Set("prediction", "max_prediction_ticks", "16");
+    store.Set("prediction", "position_correction_threshold_mm", "500");
+    store.Set("prediction", "rotation_correction_threshold_mrad", "200");
+    store.Set("prediction", "velocity_correction_threshold_mm", "750");
+    store.Set("prediction", "version", "2");
+    const auto r = prediction::PredictionConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.inputBufferDepth, 256u);
+    EXPECT_EQ(c.stateBufferDepth, 64u);
+    EXPECT_EQ(c.interpolationDelayTicks, 3u);
+    EXPECT_EQ(c.maxPredictionTicks, 16u);
+    EXPECT_EQ(c.positionCorrectionThresholdMm, 500u);
+    EXPECT_EQ(c.rotationCorrectionThresholdMrad, 200u);
+    EXPECT_EQ(c.velocityCorrectionThresholdMm, 750u);
+    EXPECT_EQ(c.version, 2u);
+}
+
+// --- Threshold / delay fields accept 0 (advisory) -----------------------------
+TEST(PredictionConfigStep2, ZeroableFieldsAcceptZero)
+{
+    core::ConfigStore store;
+    store.Set("prediction", "interpolation_delay_ticks", "0");
+    store.Set("prediction", "position_correction_threshold_mm", "0");
+    store.Set("prediction", "rotation_correction_threshold_mrad", "0");
+    store.Set("prediction", "velocity_correction_threshold_mm", "0");
+    const auto r = prediction::PredictionConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    EXPECT_EQ(r.Value().interpolationDelayTicks, 0u);
+    EXPECT_EQ(r.Value().positionCorrectionThresholdMm, 0u);
+    EXPECT_EQ(r.Value().rotationCorrectionThresholdMrad, 0u);
+    EXPECT_EQ(r.Value().velocityCorrectionThresholdMm, 0u);
+}
+
+// --- Invalid per-field values are rejected (value outcome) --------------------
+TEST(PredictionConfigStep2, InvalidValuesRejected)
+{
+    {
+        core::ConfigStore s;
+        s.Set("prediction", "input_buffer_depth", "0"); // below min 1
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("prediction", "state_buffer_depth", "0"); // below min 1
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("prediction", "max_prediction_ticks", "0"); // below min 1
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("prediction", "version", "0"); // below min 1
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("prediction", "input_buffer_depth", "-5"); // negative
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(s).HasValue());
+    }
+}
+
+// --- Boundary minimums (== 1) are accepted ------------------------------------
+TEST(PredictionConfigStep2, BoundaryMinimumsAccepted)
+{
+    core::ConfigStore store;
+    store.Set("prediction", "input_buffer_depth", "1");
+    store.Set("prediction", "state_buffer_depth", "1");
+    store.Set("prediction", "max_prediction_ticks", "1");
+    store.Set("prediction", "version", "1");
+    const auto r = prediction::PredictionConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    EXPECT_EQ(r.Value().inputBufferDepth, 1u);
+    EXPECT_EQ(r.Value().maxPredictionTicks, 1u);
+    EXPECT_EQ(r.Value().version, 1u);
 }

@@ -141,6 +141,7 @@
     <ClCompile Include="src\snapshot\SnapshotManager.cpp" />
     <ClCompile Include="src\snapshot\SnapshotDiagnostics.cpp" />
     <ClCompile Include="src\replication\ReplicationConfiguration.cpp" />
+    <ClCompile Include="src\prediction\PredictionConfiguration.cpp" />
     <ClCompile Include="src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="src\replication\ReplicationClientRegistry.cpp" />
     <ClCompile Include="src\replication\BubbleInterestPolicy.cpp" />
@@ -306,6 +307,7 @@
     <ClInclude Include="include\stalkermp\replication\BubbleMembershipAdapter.h" />
     <ClInclude Include="include\stalkermp\replication\ReplicationDiagnostics.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionTypes.h" />
+    <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />
