@@ -1509,3 +1509,192 @@ TEST(ReplicationDiagnosticsStep13, SnapshotIsImmutableCopy)
     EXPECT_EQ(diag.Snapshot().updatesBuilt, 1u);
     EXPECT_EQ(diag.Snapshot().bytesSent, 5u);
 }
+
+// ============================================================================
+// Step 14 — Validation hardening (negative surface; value outcomes only)
+// ============================================================================
+
+// --- Compile-time invariants (value-type ABI + tick-order placement) ----------
+TEST(ReplicationHardeningStep14, CompileTimeInvariants)
+{
+    static_assert(std::is_trivially_copyable_v<replication::QueuedRecord>, "QueuedRecord POD");
+    static_assert(std::is_trivially_copyable_v<replication::ClientRecord>, "ClientRecord POD");
+    static_assert(std::is_trivially_copyable_v<replication::ReplicationStatistics>, "stats POD");
+    static_assert(std::is_same_v<std::underlying_type_t<replication::ReplicationChangeKind>, std::uint8_t>,
+                  "ReplicationChangeKind : uint8_t");
+    static_assert(core::tick_order::kReplication < core::tick_order::kReplicationPipeline &&
+                      core::tick_order::kReplicationPipeline < core::tick_order::kPersistence &&
+                      core::tick_order::kReplicationPipeline < core::tick_order::kNetworking,
+                  "Replication tick placement");
+    static_assert(replication::ReplicationPacketBuilder::kHeaderBytes == 21u, "wire header size (ADR-010)");
+    static_assert(replication::ReplicationPacketBuilder::kRecordBytes == 26u, "wire record size (ADR-010)");
+    SUCCEED();
+}
+
+// --- Configuration: every cross-field minimum rejected (value outcome) --------
+TEST(ReplicationHardeningStep14, ConfigurationInvariants)
+{
+    using replication::ReplicationConfiguration;
+    const char* const minKeys[] = {"max_clients",           "max_entities_per_update", "max_players_per_update",
+                                    "reliable_queue_depth",  "unreliable_queue_depth",  "retry_limit",
+                                    "version"};
+    for (const char* key : minKeys)
+    {
+        core::ConfigStore s;
+        s.Set("replication", key, "0"); // below the min of 1
+        EXPECT_FALSE(ReplicationConfiguration::FromConfig(s).HasValue());
+    }
+    // A negative value is also rejected.
+    core::ConfigStore neg;
+    neg.Set("replication", "max_clients", "-3");
+    EXPECT_FALSE(ReplicationConfiguration::FromConfig(neg).HasValue());
+}
+
+// --- Client registry: edge cases are value outcomes; state unchanged ----------
+TEST(ReplicationHardeningStep14, ClientRegistryInvariants)
+{
+    replication::ReplicationClientRegistry registry{2};
+    ASSERT_TRUE(registry.Register(net::ConnectionId{1}, Focus(1, 0)).HasValue());
+    ASSERT_TRUE(registry.Register(net::ConnectionId{2}, Focus(2, 0)).HasValue());
+    // At capacity: reject without changing state.
+    EXPECT_FALSE(registry.Register(net::ConnectionId{3}, Focus(3, 0)).HasValue());
+    EXPECT_EQ(registry.Count(), 2u);
+    // Unknown-id operations are value outcomes.
+    EXPECT_FALSE(registry.Unregister(replication::ClientId{999}).HasValue());
+    EXPECT_FALSE(registry.UpdateFocus(replication::ClientId{999}, Focus(9, 0)).HasValue());
+    EXPECT_FALSE(registry.RecordAck(replication::ClientId{999}, 1, 1).HasValue());
+    EXPECT_TRUE(registry.ValidateConsistency());
+}
+
+// --- Delta: boundary + empty inputs are deterministic value outcomes ----------
+TEST(ReplicationHardeningStep14, DeltaInvariants)
+{
+    // Empty baseline + empty current => empty change set, Ok.
+    const auto empty = replication::EncodeEntityDelta({}, {}, 8);
+    ASSERT_TRUE(empty.HasValue());
+    EXPECT_TRUE(empty.Value().added.empty() && empty.Value().changed.empty() && empty.Value().removed.empty());
+
+    // Exactly at the cap is accepted; one over is Overflow (value outcome).
+    const std::vector<replication::EntityReplicationState> two{ES(1, 1, 1, 0), ES(2, 2, 2, 0)};
+    EXPECT_TRUE(replication::EncodeEntityDelta({}, two, 2).HasValue());
+    EXPECT_FALSE(replication::EncodeEntityDelta({}, two, 1).HasValue());
+
+    // All-removed: baseline drained, current empty.
+    const auto removed = replication::EncodeEntityDelta(two, {}, 8);
+    ASSERT_TRUE(removed.HasValue());
+    EXPECT_EQ(removed.Value().removed.size(), 2u);
+    EXPECT_TRUE(removed.Value().added.empty());
+}
+
+// --- Queue capacities: zero-capacity + drain edge cases -----------------------
+TEST(ReplicationHardeningStep14, QueueInvariants)
+{
+    replication::FixedRecordQueue zero{0};
+    EXPECT_EQ(zero.Capacity(), 0u);
+    EXPECT_TRUE(zero.Full());
+    EXPECT_EQ(zero.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 1,
+                              replication::ReplicationReliability::Reliable)),
+              replication::ReplicationOutcome::Overflow);
+    EXPECT_FALSE(zero.Dequeue().has_value());
+
+    replication::FixedRecordQueue q{1};
+    EXPECT_FALSE(q.Dequeue().has_value()); // empty
+    (void)q.Enqueue(QR(replication::ReplicationChangeKind::EntitySpawn, 1, replication::ReplicationReliability::Reliable));
+    q.Clear();
+    EXPECT_TRUE(q.Empty());
+    EXPECT_FALSE(q.Dequeue().has_value());
+}
+
+// --- Packet builder: budget/cap boundaries; no partial drain ------------------
+TEST(ReplicationHardeningStep14, PacketBuilderInvariants)
+{
+    constexpr std::size_t hdr = replication::ReplicationPacketBuilder::kHeaderBytes;
+    constexpr std::size_t chk = replication::ReplicationPacketBuilder::kChecksumBytes;
+
+    // Budget == empty frame exactly: a valid zero-record packet (not Overflow).
+    {
+        replication::ReplicationPacketBuilder b{PacketCfg(static_cast<std::uint32_t>(hdr + chk), 64)};
+        replication::FixedRecordQueue q{4};
+        FillQueue(q, 3);
+        const auto p = b.BuildPacket(q, replication::ReplicationReliability::Reliable, replication::ClientId{1}, 0);
+        ASSERT_TRUE(p.HasValue());
+        EXPECT_EQ(p.Value().recordCount, 0u); // no record fits, but the frame is valid
+        EXPECT_EQ(q.Size(), 3u);              // no drain
+    }
+    // maxRecords == 0: no records emitted regardless of budget.
+    {
+        replication::ReplicationPacketBuilder b{PacketCfg(0, 0)};
+        replication::FixedRecordQueue q{4};
+        FillQueue(q, 3);
+        const auto p = b.BuildPacket(q, replication::ReplicationReliability::Reliable, replication::ClientId{1}, 0);
+        ASSERT_TRUE(p.HasValue());
+        EXPECT_EQ(p.Value().recordCount, 0u);
+        EXPECT_EQ(q.Size(), 3u);
+    }
+    // Sub-frame budget: Overflow value outcome, queue untouched.
+    {
+        replication::ReplicationPacketBuilder b{PacketCfg(5, 64)};
+        replication::FixedRecordQueue q{4};
+        FillQueue(q, 2);
+        EXPECT_FALSE(b.BuildPacket(q, replication::ReplicationReliability::Reliable, replication::ClientId{1}, 0)
+                         .HasValue());
+        EXPECT_EQ(q.Size(), 2u);
+    }
+}
+
+// --- Manager lifecycle: skip-before-init; malformed ack; stale ack ------------
+TEST(ReplicationHardeningStep14, ManagerLifecycleInvariants)
+{
+    ManagerRig rig{3, 0, /*publish*/ true};
+    for (std::uint32_t i = 1; i <= 3; ++i) rig.membership.SetInside(i);
+    const auto id = rig.registry.Register(net::ConnectionId{1}, Focus(0, 0));
+    ASSERT_TRUE(id.HasValue());
+    replication::ReplicationConfiguration cfg{};
+    replication::ReplicationManager manager{cfg, rig.registry, rig.policy, rig.queue};
+
+    // Update before Initialize is safe (queues pre-reserved at construction).
+    manager.Update();
+    EXPECT_EQ(manager.Ticks(), 1u);
+    EXPECT_EQ(manager.LastResult().reliablePackets, 1u);
+
+    // Malformed ack payload (truncated: only the message id) => value outcome.
+    std::uint8_t shortBuf[2] = {0x01, 0x02}; // 0x0201 id, then no body
+    net::ByteReader shortReader(shortBuf, sizeof(shortBuf));
+    EXPECT_FALSE(manager.HandleReplicationAck(shortReader).HasValue());
+
+    // Apply then stale: baseline monotonic; stale ignored (counted).
+    ASSERT_TRUE(manager.HandleReplicationAck(replication::ReplicationAck{id.Value(), 10, 10}).HasValue());
+    ASSERT_TRUE(manager.HandleReplicationAck(replication::ReplicationAck{id.Value(), 4, 99}).HasValue());
+    EXPECT_EQ(manager.AcksApplied(), 1u);
+    EXPECT_EQ(manager.AcksIgnored(), 1u);
+    EXPECT_EQ(rig.registry.FindById(id.Value())->lastAckedReplicationId, 10u);
+}
+
+// --- Diagnostics invariants: reset idempotent; monotonic under mixed load -----
+TEST(ReplicationHardeningStep14, DiagnosticsInvariants)
+{
+    replication::ReplicationDiagnostics diag;
+    diag.Reset();
+    diag.Reset(); // idempotent
+    EXPECT_EQ(diag.Snapshot().ticks, 0u);
+
+    replication::ReplicationExecuteResult r;
+    r.clientsProcessed = 1;
+    r.recordsQueued = 2;
+    std::uint64_t prev = 0;
+    for (int i = 0; i < 5; ++i)
+    {
+        diag.RecordTick(r);
+        diag.RecordPacket(replication::ReplicationReliability::Unreliable, 3);
+        diag.RecordOverflow();
+        const auto s = diag.Snapshot();
+        EXPECT_GE(s.overflows, prev); // monotonic
+        prev = s.overflows;
+    }
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.ticks, 5u);
+    EXPECT_EQ(s.overflows, 5u);
+    EXPECT_EQ(s.updatesDropped, 5u);
+    EXPECT_EQ(s.unreliablePackets, 5u);
+    EXPECT_EQ(s.entitiesReplicated, 10u); // 5 ticks * 2 records
+}
