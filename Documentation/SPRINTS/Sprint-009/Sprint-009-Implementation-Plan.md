@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Sprint | 009 — Replication Pipeline |
-| Status | **FROZEN — single implementation authority for Sprint-009** (approved 2026-07-16; supersedes the standalone Step-01 spec) |
+| Status | **COMPLETE — all 16 steps implemented, verified & frozen; Sprint-009 Closed** (2026-07-16). Single implementation authority; supersedes the standalone Step-01 spec. |
 | Scope authority | `Documentation/SPRINTS/Sprint-009/Sprint-009-Delta-Replication.md` (FROZEN) |
 | Baseline | Sprint-008 CLOSED & FROZEN — **377 / 377** tests passing (GCC + MSVC) |
 | Governing ADRs | ADR-007, ADR-008, ADR-009, ADR-010, ADR-011 (all preserved; none modified) |

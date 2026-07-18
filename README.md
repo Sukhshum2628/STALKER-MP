@@ -101,21 +101,22 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **006** | Host Networking Infrastructure (transport, session, wire) | ✅ Verified (Closed) |
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
 | **008** | Snapshot System (immutable snapshots) | ✅ Verified (Closed) |
-| **009** | **Replication Pipeline** | 🚧 **In progress** — Step 15 / 16 |
-| 010 | Client Prediction / Interpolation | ⏳ Planned |
+| **009** | Replication Pipeline | ✅ Verified (Closed) |
+| 010 | Client Prediction / Interpolation | ⏳ Planned (next) |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
 **Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified.
 
-**Current focus — Sprint-009 (Replication Pipeline):** the host-authoritative consumer that transforms immutable snapshots into prioritized, delta-encoded, bandwidth-efficient network updates. The complete 16-step implementation plan is frozen (`Documentation/SPRINTS/Sprint-009/Sprint-009-Implementation-Plan.md`); implementation is proceeding one verified step at a time. Replication owns no entities, executes no gameplay, and mutates no simulation.
+**Sprint-009 (Replication Pipeline) — Verified (Closed):** the host-authoritative consumer that transforms immutable snapshots into prioritized, delta-encoded, bandwidth-efficient network updates. All 16 steps were implemented one at a time and independently verified; replication owns no entities, executes no gameplay, and mutates no simulation. Subsystem documentation: `Multiplayer/docs/Replication.md`. **Next focus — Sprint-010 (Client Prediction & Interpolation).**
 
 ---
 
 ## Current Implementation Status
 
-- **Sprints 001–008:** implemented, independently verified, and closed.
+- **Sprints 001–009:** implemented, independently verified, and closed.
+- **Sprint-009 (Replication Pipeline) — closed:** all 16 steps delivered and verified — replication value types + configuration; the immutable `ReplicationUpdate` + `IReplicationView`; the `ReplicationClientRegistry` (per-client baselines); the engine-free interest seam + `BubbleInterestPolicy`; the deterministic `DeltaEncoder`; the frozen §7.A reliability/priority classifier; the exception-free FIFO `ReplicationQueues`; the deterministic little-endian `ReplicationPacketBuilder` with additive wire ids (`0x0200`/`0x0201`); the synchronous `ReplicationWorker`; the `ReplicationManager` (`IService` + `ITickable`) at `tick_order::kReplicationPipeline = 450`; the Bootstrap composition-root wiring with reverse-order teardown; the non-invasive `ReplicationDiagnostics` collector; the validation-hardening negative surface; and the subsystem documentation in `Multiplayer/docs/Replication.md`. **No new engine TU and no OS code** (replication consumes engine-free seams); evidence gates E-G1-R…E-G5-R passed.
 - **Sprint-008 (Snapshot System) — closed:** all 14 steps delivered and verified — value types + configuration; the immutable `SimulationSnapshot` + `ISnapshotView`; the exception-free fixed-capacity `SnapshotPool`; the additive engine-free `world::IEntitySnapshotSource` capture seam + null; the deterministic value-only `SnapshotBuilder`; the single-producer / multi-consumer `SnapshotQueue`; the per-tick `SnapshotManager` (`IService` + `ITickable`) at `tick_order::kReplication = 400`; the engine-boundary `adapters::EngineEntitySnapshotSource` (the sole new engine TU) with its engine-free marshaling helper; the Bootstrap composition-root wiring with reverse-order teardown; the read-only `SnapshotDiagnostics` inspector; the validation-hardening negative surface; and composed-stack integration with the subsystem documentation in `Multiplayer/docs/Snapshots.md`. Evidence gates E-G1-S / E-G2-S / E-G3-S passed, E-G4-S confirmed.
 - **Engine boundary:** intact — engine headers confined to `Multiplayer/src/adapters/EngineAdapters.cpp`.
 - **Platform boundary:** intact — OS socket headers confined to `Multiplayer/src/adapters/PlatformSockets.cpp`.

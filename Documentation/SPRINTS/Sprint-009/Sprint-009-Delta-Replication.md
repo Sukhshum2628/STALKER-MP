@@ -9,7 +9,7 @@
 |--------|-------|
 | Sprint | 009 |
 | Title | Replication Pipeline |
-| Status | Planned |
+| Status | **Implemented / Verified / Closed / Frozen** (2026-07-16) |
 | Priority | Critical |
 | Estimated Duration | 3–4 Weeks |
 | Prerequisites | Sprint-001 through Sprint-008 |
@@ -491,21 +491,21 @@ Stress Test
 
 # 11. Acceptance Criteria
 
-□ Replication Manager operational.
+☑ Replication Manager operational.
 
-□ Snapshot consumption complete.
+☑ Snapshot consumption complete.
 
-□ Delta replication operational.
+☑ Delta replication operational.
 
-□ Interest management verified.
+☑ Interest management verified.
 
-□ Reliability rules implemented.
+☑ Reliability rules implemented.
 
-□ Packet prioritization operational.
+☑ Packet prioritization operational.
 
-□ Tests passing.
+☑ Tests passing (442 / 442).
 
-□ Documentation updated.
+☑ Documentation updated.
 
 ---
 
@@ -529,3 +529,44 @@ Sprint-010 – Client Prediction & Interpolation
 Replication provides authoritative updates from the host, but network latency can still affect responsiveness.
 
 Sprint-010 introduces client-side prediction, interpolation, reconciliation, and smoothing techniques to provide responsive player movement while maintaining strict host authority.
+---
+
+# 14. Sprint Closure (2026-07-16)
+
+**Sprint-009 (Replication Pipeline) is declared Implemented / Verified / Closed / Frozen.**
+
+All 16 steps were implemented one at a time under the mandatory workflow (implement → Antigravity verification → git commit → GitHub push → next step) and each was independently verified by Antigravity, with the tree left buildable after every step.
+
+## 14.1 Final verified baseline
+- **442 / 442 build tests passing** — Release x64 on **MSVC** and the engine-free **GCC** test build; **0 errors, 0 warnings, no regressions.** (Sprint-008 baseline 377 + the Sprint-009 replication suite.)
+- MSVC Release clean under `EngineAbi.props`. Game testing has not started yet.
+
+## 14.2 Steps 01–15 (all implemented, verified, documented)
+01 value types & vocabulary · 02 `ReplicationConfiguration` · 03 immutable `ReplicationUpdate` + `IReplicationView` · 04 `ReplicationClientRegistry` · 05 interest seam + `BubbleInterestPolicy` · 06 delta generation (`DeltaEncoder`) · 07 §7.A classifier · 08 replication queues · 09 packet assembly + additive wire ids (0x0200/0x0201) · 10 synchronous `ReplicationWorker` · 11 `ReplicationManager` at `kReplicationPipeline = 450` · 12 Bootstrap wiring · 13 `ReplicationDiagnostics` · 14 validation hardening · 15 integration documentation (`Replication.md`).
+
+## 14.3 Definition of Done (§12) — satisfied
+1. Replication consumes immutable snapshots exclusively (read-only `ISnapshotView`; no live object captured). ✅
+2. Clients receive only relevant updates (Bubble membership + interest radius). ✅
+3. Delta replication minimizes bandwidth (unchanged entities omitted; deterministic change set). ✅
+4. Packet priorities/reliability function correctly (frozen §7.A classification; deterministic little-endian framing). ✅
+5. Worker execution is independent of simulation (no thread created; no mutation; runs synchronously at 450). ✅
+6. Networking never modifies gameplay state (replication owns no entities; acks advance only replication state). ✅
+
+## 14.4 Completion criteria — satisfied
+- All 16 steps implemented, each Antigravity-verified, tree buildable after each. ✅
+- `ReplicationManager` runs as a single `ITickable` at the reserved `tick_order::kReplicationPipeline = 450`, after Snapshot (400), before Persistence (500)/Networking (900), Bootstrap-wired with reverse-order teardown. ✅
+- One Engine Boundary **and** One Platform Boundary hold — **no new engine TU, no OS code added**; the wire protocol is extended only additively (`kMsgReplicationUpdate`/`kMsgReplicationAck`), never renumbered. ✅
+- ADR-007…ADR-011 all conformed to; no thread created; one new sanctioned `tick_order` key. ✅
+- Full suite green on GCC + MSVC, MSVC Release clean, zero new warnings, no regressions; the Sprint-008 377/377 baseline preserved and extended to 442/442. ✅
+- No non-goal implemented (no client prediction/interpolation/lag-compensation/save-system); replication owns no entities and executes no gameplay. ✅
+- Subsystem doc `Multiplayer/docs/Replication.md` written; status docs synchronized to Closed/Verified. ✅
+
+## 14.5 Evidence gates — satisfied
+- **E-G1-R** (immutable-snapshot consumption; no live object captured): **PASSED**.
+- **E-G2-R** (deterministic build/delta; byte-for-byte packets): **PASSED**.
+- **E-G3-R** (interest correctness — only relevant entities per client): **PASSED**.
+- **E-G4-R** (reliability/priority classification correct; total priority ordering): **PASSED**.
+- **E-G5-R** (worker independence — no simulation/engine mutation; networking a consumer): **PASSED**.
+
+## 14.6 Sprint-010 readiness
+Replication delivers authoritative, delta-encoded, per-client updates from the host. **Sprint-010 (Client Prediction & Interpolation)** builds on these updates to provide responsive client movement (prediction, interpolation, reconciliation, smoothing) while preserving strict Host Authority. No future producer `tick_order` value beyond the frozen `kReplicationPipeline = 450` is assigned or depended upon. **The project is ready for Sprint-010.**
