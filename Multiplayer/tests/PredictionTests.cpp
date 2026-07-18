@@ -12,6 +12,7 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/prediction/InputBuffer.h"
 #include "stalkermp/prediction/PredictionConfiguration.h"
+#include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
 
 using namespace stalkermp;
@@ -24,6 +25,14 @@ namespace
         c.sequence = sequence;
         c.tick = tick;
         return c;
+    }
+    prediction::PredictedState St(std::uint32_t id, std::uint64_t tick, float x)
+    {
+        prediction::PredictedState s{};
+        s.id = world::EntityId{id};
+        s.tick = tick;
+        s.position = world::Vec3{x, 0.0f, 0.0f};
+        return s;
     }
 } // namespace
 
@@ -311,4 +320,67 @@ TEST(InputBufferStep3, Clear)
     EXPECT_TRUE(buffer.Empty());
     EXPECT_EQ(buffer.LastSequence(), 0u);
     EXPECT_EQ(buffer.Push(Cmd(1, 0)), prediction::PredictionOutcome::Ok); // sequence restarts
+}
+
+// ============================================================================
+// Step 4 — StateBuffer
+// ============================================================================
+
+// --- Record + lookup by tick; latest; ascending guard -------------------------
+TEST(StateBufferStep4, RecordLookupLatest)
+{
+    prediction::StateBuffer buffer{4};
+    EXPECT_EQ(buffer.Capacity(), 4u);
+    EXPECT_TRUE(buffer.Empty());
+    EXPECT_EQ(buffer.At(1), nullptr);
+    EXPECT_EQ(buffer.Latest(), nullptr);
+
+    buffer.Record(St(7, 1, 1.0f));
+    buffer.Record(St(7, 2, 2.0f));
+    buffer.Record(St(7, 3, 3.0f));
+    EXPECT_EQ(buffer.Size(), 3u);
+
+    const prediction::PredictedState* at2 = buffer.At(2);
+    ASSERT_NE(at2, nullptr);
+    EXPECT_FLOAT_EQ(at2->position.x, 2.0f);
+    EXPECT_EQ(buffer.At(99), nullptr); // absent
+
+    const prediction::PredictedState* latest = buffer.Latest();
+    ASSERT_NE(latest, nullptr);
+    EXPECT_EQ(latest->tick, 3u);
+
+    // A non-ascending tick is ignored (deterministic no-op).
+    buffer.Record(St(7, 2, 99.0f));
+    EXPECT_EQ(buffer.Size(), 3u);
+    EXPECT_FLOAT_EQ(buffer.At(2)->position.x, 2.0f); // unchanged
+}
+
+// --- Bounded ring: oldest evicted on overflow (deterministic) -----------------
+TEST(StateBufferStep4, BoundedEviction)
+{
+    prediction::StateBuffer buffer{2};
+    buffer.Record(St(1, 1, 1.0f));
+    buffer.Record(St(1, 2, 2.0f));
+    EXPECT_TRUE(buffer.Full());
+
+    buffer.Record(St(1, 3, 3.0f)); // evicts tick 1
+    EXPECT_EQ(buffer.Size(), 2u);
+    EXPECT_EQ(buffer.At(1), nullptr);       // evicted
+    ASSERT_NE(buffer.At(2), nullptr);
+    ASSERT_NE(buffer.At(3), nullptr);
+    EXPECT_EQ(buffer.Latest()->tick, 3u);
+}
+
+// --- Clear restores the empty initial state -----------------------------------
+TEST(StateBufferStep4, Clear)
+{
+    prediction::StateBuffer buffer{4};
+    buffer.Record(St(1, 1, 1.0f));
+    buffer.Record(St(1, 2, 2.0f));
+    buffer.Clear();
+    EXPECT_TRUE(buffer.Empty());
+    EXPECT_EQ(buffer.At(1), nullptr);
+    buffer.Record(St(1, 1, 5.0f)); // tick sequence restarts after Clear
+    ASSERT_NE(buffer.At(1), nullptr);
+    EXPECT_FLOAT_EQ(buffer.At(1)->position.x, 5.0f);
 }
