@@ -8,7 +8,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/prediction/InputBuffer.h"
@@ -16,6 +19,7 @@
 #include "stalkermp/prediction/PredictionManager.h"
 #include "stalkermp/prediction/PredictionStep.h"
 #include "stalkermp/prediction/InterpolationStep.h"
+#include "stalkermp/prediction/InterpolationManager.h"
 #include "stalkermp/prediction/SnapshotBuffer.h"
 #include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
@@ -808,4 +812,128 @@ TEST(InterpolationStepStep8, Deterministic)
     EXPECT_EQ(x.id.value, y.id.value);
     EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.2f, 2.9f, 0.6f),
                     prediction::InterpolateYaw(0.2f, 2.9f, 0.6f));
+}
+
+// ============================================================================
+// Step 9 — InterpolationManager
+// ============================================================================
+
+namespace
+{
+    // A frame at `tick` whose entities are the given (id,x) pairs, ascending by id.
+    prediction::SnapshotFrame EntFrame(std::uint64_t tick,
+                                       std::initializer_list<std::pair<std::uint32_t, float>> ents)
+    {
+        prediction::SnapshotFrame f{};
+        f.tick = tick;
+        for (const auto& [id, x] : ents)
+        {
+            replication::EntityReplicationState e{};
+            e.id = world::EntityId{id};
+            e.position = world::Vec3{x, 0.0f, 0.0f};
+            f.entities.push_back(e);
+        }
+        return f;
+    }
+
+    prediction::PredictionConfiguration InterpConfig(std::uint32_t delay)
+    {
+        prediction::PredictionConfiguration c{};
+        c.stateBufferDepth = 16;
+        c.interpolationDelayTicks = delay;
+        return c;
+    }
+} // namespace
+
+// --- Smoothing: entities in both frames are lerped at the bracket factor -------
+TEST(InterpolationManagerStep9, SmoothsMatchedEntities)
+{
+    prediction::InterpolationManager mgr{InterpConfig(0)};
+    EXPECT_EQ(mgr.PushFrame(EntFrame(10, {{1, 0.0f}, {2, 100.0f}})), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.PushFrame(EntFrame(20, {{1, 10.0f}, {2, 200.0f}})), prediction::PredictionOutcome::Ok);
+
+    std::vector<prediction::InterpolatedState> out;
+    EXPECT_EQ(mgr.Interpolate(15, out), prediction::PredictionOutcome::Ok); // halfway
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].id.value, 1u);
+    EXPECT_FLOAT_EQ(out[0].position.x, 5.0f);
+    EXPECT_EQ(out[1].id.value, 2u);
+    EXPECT_FLOAT_EQ(out[1].position.x, 150.0f);
+}
+
+// --- Ordering + uniqueness; unmatched entities are skipped (no extrapolation) --
+TEST(InterpolationManagerStep9, AscendingUniqueAndMatchedOnly)
+{
+    prediction::InterpolationManager mgr{InterpConfig(0)};
+    // Entity 2 present in both; 1 only in `from`; 3 only in `to`.
+    EXPECT_EQ(mgr.PushFrame(EntFrame(10, {{1, 1.0f}, {2, 20.0f}})), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.PushFrame(EntFrame(20, {{2, 40.0f}, {3, 3.0f}})), prediction::PredictionOutcome::Ok);
+
+    std::vector<prediction::InterpolatedState> out;
+    EXPECT_EQ(mgr.Interpolate(15, out), prediction::PredictionOutcome::Ok);
+    ASSERT_EQ(out.size(), 1u);         // only entity 2 is in both frames
+    EXPECT_EQ(out[0].id.value, 2u);
+    EXPECT_FLOAT_EQ(out[0].position.x, 30.0f);
+}
+
+// --- Append-only: existing contents are preserved -----------------------------
+TEST(InterpolationManagerStep9, AppendOnlyOutput)
+{
+    prediction::InterpolationManager mgr{InterpConfig(0)};
+    EXPECT_EQ(mgr.PushFrame(EntFrame(10, {{5, 0.0f}})), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.PushFrame(EntFrame(20, {{5, 8.0f}})), prediction::PredictionOutcome::Ok);
+
+    std::vector<prediction::InterpolatedState> out;
+    prediction::InterpolatedState sentinel{};
+    sentinel.id = world::EntityId{999};
+    out.push_back(sentinel);
+
+    EXPECT_EQ(mgr.Interpolate(15, out), prediction::PredictionOutcome::Ok);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].id.value, 999u); // preserved
+    EXPECT_EQ(out[1].id.value, 5u);
+    EXPECT_FLOAT_EQ(out[1].position.x, 4.0f);
+}
+
+// --- No extrapolation: clamp to boundary; empty buffer appends nothing ---------
+TEST(InterpolationManagerStep9, NoExtrapolationAndEmpty)
+{
+    prediction::InterpolationManager mgr{InterpConfig(0)};
+
+    // Empty buffer -> NoAuthoritativeFrame, nothing appended.
+    std::vector<prediction::InterpolatedState> none;
+    EXPECT_EQ(mgr.Interpolate(10, none), prediction::PredictionOutcome::NoAuthoritativeFrame);
+    EXPECT_TRUE(none.empty());
+
+    EXPECT_EQ(mgr.PushFrame(EntFrame(10, {{7, 1.0f}})), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.PushFrame(EntFrame(20, {{7, 5.0f}})), prediction::PredictionOutcome::Ok);
+
+    // Beyond newest -> clamp to newest frame (factor 0 -> own position, no overshoot).
+    std::vector<prediction::InterpolatedState> ahead;
+    EXPECT_EQ(mgr.Interpolate(999, ahead), prediction::PredictionOutcome::Ok);
+    ASSERT_EQ(ahead.size(), 1u);
+    EXPECT_FLOAT_EQ(ahead[0].position.x, 5.0f); // newest, not extrapolated past
+}
+
+// --- Deterministic: identical calls produce identical output ------------------
+TEST(InterpolationManagerStep9, Deterministic)
+{
+    prediction::InterpolationManager a{InterpConfig(2)};
+    prediction::InterpolationManager b{InterpConfig(2)};
+    for (auto* m : {&a, &b})
+    {
+        EXPECT_EQ(m->PushFrame(EntFrame(10, {{1, 0.0f}, {2, 0.0f}})), prediction::PredictionOutcome::Ok);
+        EXPECT_EQ(m->PushFrame(EntFrame(20, {{1, 10.0f}, {2, 20.0f}})), prediction::PredictionOutcome::Ok);
+    }
+
+    std::vector<prediction::InterpolatedState> oa;
+    std::vector<prediction::InterpolatedState> ob;
+    EXPECT_EQ(a.Interpolate(19, oa), prediction::PredictionOutcome::Ok); // 19 - delay 2 = 17
+    EXPECT_EQ(b.Interpolate(19, ob), prediction::PredictionOutcome::Ok);
+    ASSERT_EQ(oa.size(), ob.size());
+    for (std::size_t k = 0; k < oa.size(); ++k)
+    {
+        EXPECT_EQ(oa[k].id.value, ob[k].id.value);
+        EXPECT_FLOAT_EQ(oa[k].position.x, ob[k].position.x);
+    }
 }
