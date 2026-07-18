@@ -318,6 +318,9 @@
     <ClInclude Include="include\stalkermp\prediction\SnapshotBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\InterpolationStep.h" />
     <ClInclude Include="include\stalkermp\prediction\InterpolationManager.h" />
+    <ClInclude Include="include\stalkermp\prediction\ILocalInputSource.h" />
+    <ClInclude Include="include\stalkermp\prediction\IAuthoritativeStateSource.h" />
+    <ClInclude Include="include\stalkermp\prediction\IPresentationSink.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />

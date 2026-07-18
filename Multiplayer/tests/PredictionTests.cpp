@@ -20,6 +20,9 @@
 #include "stalkermp/prediction/PredictionStep.h"
 #include "stalkermp/prediction/InterpolationStep.h"
 #include "stalkermp/prediction/InterpolationManager.h"
+#include "stalkermp/prediction/IAuthoritativeStateSource.h"
+#include "stalkermp/prediction/ILocalInputSource.h"
+#include "stalkermp/prediction/IPresentationSink.h"
 #include "stalkermp/prediction/SnapshotBuffer.h"
 #include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
@@ -936,4 +939,151 @@ TEST(InterpolationManagerStep9, Deterministic)
         EXPECT_EQ(oa[k].id.value, ob[k].id.value);
         EXPECT_FLOAT_EQ(oa[k].position.x, ob[k].position.x);
     }
+}
+
+// ============================================================================
+// Step 10 — Client seams (input / authoritative / presentation) + test fakes
+// ============================================================================
+
+namespace
+{
+    // Fake local input source: replays a queued list of inputs, one per poll.
+    class FakeInputSource final : public prediction::ILocalInputSource
+    {
+    public:
+        void Queue(const prediction::InputCommand& c) { m_queue.push_back(c); }
+
+        [[nodiscard]] bool PollInput(prediction::InputCommand& out) const override
+        {
+            if (m_next >= m_queue.size())
+            {
+                return false; // nothing available this tick (out unchanged)
+            }
+            out = m_queue[m_next++];
+            return true;
+        }
+
+    private:
+        std::vector<prediction::InputCommand> m_queue;
+        mutable std::size_t m_next = 0; // const-poll advances the cursor
+    };
+
+    // Fake authoritative source: yields queued frames in order. Read-only.
+    class FakeAuthoritativeSource final : public prediction::IAuthoritativeStateSource
+    {
+    public:
+        void Queue(const prediction::SnapshotFrame& f) { m_frames.push_back(f); }
+
+        [[nodiscard]] bool NextFrame(prediction::SnapshotFrame& out) const override
+        {
+            if (m_next >= m_frames.size())
+            {
+                return false;
+            }
+            out = m_frames[m_next++];
+            return true;
+        }
+
+    private:
+        std::vector<prediction::SnapshotFrame> m_frames;
+        mutable std::size_t m_next = 0;
+    };
+
+    // Fake presentation sink: records what the driver would render. Observes only.
+    class FakePresentationSink final : public prediction::IPresentationSink
+    {
+    public:
+        void ApplyLocal(const prediction::PredictedState& s) override { local.push_back(s); }
+        void ApplyRemote(const prediction::InterpolatedState& s) override { remote.push_back(s); }
+
+        std::vector<prediction::PredictedState> local;
+        std::vector<prediction::InterpolatedState> remote;
+    };
+} // namespace
+
+// --- Local input source: fake drives values; false when drained ---------------
+TEST(ClientSeamsStep10, LocalInputSourcePolls)
+{
+    FakeInputSource src;
+    src.Queue(MoveInput(1, 1, 1.0f, 0.0f, 0.0f));
+    src.Queue(MoveInput(2, 2, 0.0f, 1.0f, 0.0f));
+
+    const prediction::ILocalInputSource& seam = src; // consume through the interface
+    prediction::InputCommand c{};
+    ASSERT_TRUE(seam.PollInput(c));
+    EXPECT_EQ(c.sequence, 1u);
+    ASSERT_TRUE(seam.PollInput(c));
+    EXPECT_EQ(c.sequence, 2u);
+
+    prediction::InputCommand untouched{};
+    untouched.sequence = 77u;
+    EXPECT_FALSE(seam.PollInput(untouched)); // drained
+    EXPECT_EQ(untouched.sequence, 77u);      // left unchanged
+}
+
+// --- Authoritative source: read-only frames with ackedInputSequence -----------
+TEST(ClientSeamsStep10, AuthoritativeSourceYieldsFrames)
+{
+    FakeAuthoritativeSource src;
+    auto f = Frame(100, /*acked*/ 42);
+    src.Queue(f);
+
+    const prediction::IAuthoritativeStateSource& seam = src;
+    prediction::SnapshotFrame out{};
+    ASSERT_TRUE(seam.NextFrame(out));
+    EXPECT_EQ(out.tick, 100u);
+    EXPECT_EQ(out.ackedInputSequence, 42u);
+
+    prediction::SnapshotFrame none{};
+    EXPECT_FALSE(seam.NextFrame(none)); // drained
+}
+
+// --- Presentation sink: append-only observation of client-visual values -------
+TEST(ClientSeamsStep10, PresentationSinkAppendsOnly)
+{
+    FakePresentationSink sink;
+    prediction::IPresentationSink& seam = sink;
+
+    prediction::PredictedState local{};
+    local.id = world::EntityId{5};
+    local.position = world::Vec3{1.0f, 2.0f, 3.0f};
+    seam.ApplyLocal(local);
+
+    prediction::InterpolatedState r1{};
+    r1.id = world::EntityId{7};
+    prediction::InterpolatedState r2{};
+    r2.id = world::EntityId{9};
+    seam.ApplyRemote(r1);
+    seam.ApplyRemote(r2);
+
+    ASSERT_EQ(sink.local.size(), 1u);
+    EXPECT_EQ(sink.local[0].id.value, 5u);
+    ASSERT_EQ(sink.remote.size(), 2u); // append-only, order preserved
+    EXPECT_EQ(sink.remote[0].id.value, 7u);
+    EXPECT_EQ(sink.remote[1].id.value, 9u);
+}
+
+// --- Seams carry values without mutating the authoritative source snapshot -----
+TEST(ClientSeamsStep10, AuthoritativeObservationDoesNotMutateInput)
+{
+    // Building a SnapshotFrame from Sprint-009 replication states and reading it
+    // back through the seam leaves the original values intact (read-only seam).
+    prediction::SnapshotFrame frame{};
+    frame.tick = 7;
+    frame.ackedInputSequence = 3;
+    frame.entities.push_back(Ent(2, 5.0f, 0.0f, 0.0f));
+
+    FakeAuthoritativeSource src;
+    src.Queue(frame);
+
+    const prediction::IAuthoritativeStateSource& seam = src;
+    prediction::SnapshotFrame observed{};
+    ASSERT_TRUE(seam.NextFrame(observed));
+    ASSERT_EQ(observed.entities.size(), 1u);
+    EXPECT_EQ(observed.entities[0].id.value, 2u);
+    EXPECT_FLOAT_EQ(observed.entities[0].position.x, 5.0f);
+
+    // Original frame unchanged.
+    EXPECT_EQ(frame.entities.size(), 1u);
+    EXPECT_FLOAT_EQ(frame.entities[0].position.x, 5.0f);
 }
