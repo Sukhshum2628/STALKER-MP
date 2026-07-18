@@ -12,6 +12,7 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/prediction/InputBuffer.h"
 #include "stalkermp/prediction/PredictionConfiguration.h"
+#include "stalkermp/prediction/PredictionStep.h"
 #include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
 
@@ -383,4 +384,93 @@ TEST(StateBufferStep4, Clear)
     buffer.Record(St(1, 1, 5.0f)); // tick sequence restarts after Clear
     ASSERT_NE(buffer.At(1), nullptr);
     EXPECT_FLOAT_EQ(buffer.At(1)->position.x, 5.0f);
+}
+
+// ============================================================================
+// Step 5 — Deterministic prediction integrator
+// ============================================================================
+
+namespace
+{
+    prediction::InputCommand MoveInput(std::uint64_t seq, std::uint64_t tick, float mx, float mz, float yaw,
+                                       std::uint32_t actions = 0)
+    {
+        prediction::InputCommand c{};
+        c.sequence = seq;
+        c.tick = tick;
+        c.move = world::Vec3{mx, 0.0f, mz};
+        c.yaw = yaw;
+        c.actionBits = actions;
+        return c;
+    }
+    constexpr float kHalfPi = 1.5707963267948966f;
+} // namespace
+
+// --- No input (zero move, unchanged yaw) is the identity for position ---------
+TEST(PredictionStepStep5, NoInputIsIdentity)
+{
+    const prediction::PredictionConfiguration cfg{};
+    prediction::PredictedState prior{};
+    prior.id = world::EntityId{7};
+    prior.position = world::Vec3{5.0f, 1.0f, -3.0f};
+    prior.yaw = 0.0f;
+
+    const auto next = prediction::Integrate(prior, MoveInput(1, 10, 0.0f, 0.0f, 0.0f), cfg);
+    EXPECT_EQ(next.id.value, 7u);
+    EXPECT_EQ(next.tick, 10u);
+    EXPECT_FLOAT_EQ(next.position.x, 5.0f);
+    EXPECT_FLOAT_EQ(next.position.y, 1.0f);
+    EXPECT_FLOAT_EQ(next.position.z, -3.0f);
+    EXPECT_FLOAT_EQ(next.velocity.x, 0.0f);
+    EXPECT_FLOAT_EQ(next.velocity.z, 0.0f);
+}
+
+// --- Movement integrates in world space; yaw rotates the local intent ---------
+TEST(PredictionStepStep5, MovementAndRotation)
+{
+    const prediction::PredictionConfiguration cfg{};
+    prediction::PredictedState origin{};
+
+    // Facing yaw 0: local +X moves world +X.
+    const auto east = prediction::Integrate(origin, MoveInput(1, 1, 1.0f, 0.0f, 0.0f), cfg);
+    EXPECT_FLOAT_EQ(east.position.x, 1.0f);
+    EXPECT_FLOAT_EQ(east.position.z, 0.0f);
+    EXPECT_FLOAT_EQ(east.yaw, 0.0f);
+
+    // Facing yaw +90deg: local +X rotates to world +Z (x*sin, x*cos with x=cos~0).
+    const auto turned = prediction::Integrate(origin, MoveInput(2, 2, 1.0f, 0.0f, kHalfPi), cfg);
+    EXPECT_NEAR(turned.position.x, 0.0f, 1e-6f);
+    EXPECT_FLOAT_EQ(turned.position.z, 1.0f);
+    EXPECT_FLOAT_EQ(turned.yaw, kHalfPi);
+    EXPECT_FLOAT_EQ(turned.velocity.z, 1.0f); // per-tick displacement == velocity
+}
+
+// --- Facing + stance flags come from the input; tick is stamped ---------------
+TEST(PredictionStepStep5, FacingAndFlags)
+{
+    const prediction::PredictionConfiguration cfg{};
+    prediction::PredictedState prior{};
+    const auto next = prediction::Integrate(prior, MoveInput(1, 42, 0.0f, 0.0f, 0.75f, /*actions*/ 0xABCDu), cfg);
+    EXPECT_FLOAT_EQ(next.yaw, 0.75f);
+    EXPECT_EQ(next.stateFlags, 0xABCDu);
+    EXPECT_EQ(next.tick, 42u);
+}
+
+// --- Deterministic: identical inputs => identical output ----------------------
+TEST(PredictionStepStep5, Deterministic)
+{
+    const prediction::PredictionConfiguration cfg{};
+    prediction::PredictedState prior{};
+    prior.position = world::Vec3{2.0f, 0.0f, 1.0f};
+    const auto in = MoveInput(1, 5, 0.5f, -0.25f, 0.3f, 0x1u);
+
+    const auto a = prediction::Integrate(prior, in, cfg);
+    const auto b = prediction::Integrate(prior, in, cfg);
+    EXPECT_FLOAT_EQ(a.position.x, b.position.x);
+    EXPECT_FLOAT_EQ(a.position.y, b.position.y);
+    EXPECT_FLOAT_EQ(a.position.z, b.position.z);
+    EXPECT_FLOAT_EQ(a.velocity.x, b.velocity.x);
+    EXPECT_FLOAT_EQ(a.yaw, b.yaw);
+    EXPECT_EQ(a.tick, b.tick);
+    EXPECT_EQ(a.stateFlags, b.stateFlags);
 }
