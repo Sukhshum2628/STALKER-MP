@@ -101,7 +101,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **006** | Host Networking Infrastructure (transport, session, wire) | ✅ Verified (Closed) |
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
 | **008** | Snapshot System (immutable snapshots) | ✅ Verified (Closed) |
-| **009** | **Replication Pipeline** | 🚧 **In progress** — Step 14 / 16 |
+| **009** | **Replication Pipeline** | 🚧 **In progress** — Step 15 / 16 |
 | 010 | Client Prediction / Interpolation | ⏳ Planned |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |

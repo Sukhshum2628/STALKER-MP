@@ -669,7 +669,7 @@ docs(replication): freeze Sprint-009 Step-14 spec (validation hardening negative
 
 # Step-15 — Integration + documentation
 
-**Objective.** Prove the composed pipeline end-to-end behind the seams and author the subsystem doc. No behavior change.
+**Objective.** Author the subsystem documentation (`Multiplayer/docs/Replication.md`). No behavior change. (Scoped to documentation only: the composed-stack integration is already exercised by the per-step tests — `WorkerStep10` runs the full interest→delta→classify→queue→packet pipeline end-to-end, and `ReplicationManagerStep11` drives it through the tick lifecycle — so no additional integration tests are added here. Production code and tests are not modified.)
 
 **Scope — In.** Integration tests in `tests/ReplicationTests.cpp` (and/or `BootstrapTests.cpp`): snapshot → replication → loopback/mock transport; multiple clients synchronize; interest filtering (only relevant entities per client); delta minimizes bandwidth (unchanged entities skipped); priority ordering correct; reliability channels honored; full-pass replay identity across two runs. Author `Multiplayer/docs/Replication.md` (prose: lifecycle, delta, interest, reliability model, packet priorities, worker/consumer interaction, boundaries, ADR-007…011, worker-thread readiness, extension points).
 **Scope — Out.** New functionality; Sprint-010 work; graphics.
