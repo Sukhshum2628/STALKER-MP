@@ -158,6 +158,7 @@
     <ClCompile Include="..\src\prediction\PredictionManager.cpp" />
     <ClCompile Include="..\src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="..\src\prediction\InterpolationManager.cpp" />
+    <ClCompile Include="..\src\prediction\ClientPresentationDriver.cpp" />
     <ClCompile Include="..\src\replication\ReplicationConfiguration.cpp" />
     <ClCompile Include="..\src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="..\src\replication\ReplicationClientRegistry.cpp" />

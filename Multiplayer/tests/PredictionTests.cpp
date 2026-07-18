@@ -21,6 +21,7 @@
 #include "stalkermp/prediction/InterpolationStep.h"
 #include "stalkermp/prediction/InterpolationManager.h"
 #include "stalkermp/prediction/PredictionDiagnostics.h"
+#include "stalkermp/prediction/ClientPresentationDriver.h"
 #include "stalkermp/prediction/IAuthoritativeStateSource.h"
 #include "stalkermp/prediction/ILocalInputSource.h"
 #include "stalkermp/prediction/IPresentationSink.h"
@@ -1513,4 +1514,125 @@ TEST(PredictionDiagnosticsStep13, DeterministicAverage)
     diag.RecordCorrection(31); // sum 61 / 3 = 20 (integer)
     EXPECT_EQ(diag.CorrectionMagnitudeSum(), 61u);
     EXPECT_EQ(diag.AverageCorrectionMagnitude(), 20u);
+}
+
+// ============================================================================
+// Step 14 — ClientPresentationDriver
+// ============================================================================
+
+namespace
+{
+    // A frame with the given entities (ascending id) and one local player (entity).
+    prediction::SnapshotFrame DriverFrame(std::uint64_t tick, std::uint64_t acked,
+                                          std::initializer_list<std::pair<std::uint32_t, float>> ents,
+                                          std::uint32_t localEntity, float localX)
+    {
+        prediction::SnapshotFrame f{};
+        f.tick = tick;
+        f.ackedInputSequence = acked;
+        for (const auto& [id, x] : ents)
+        {
+            f.entities.push_back(Ent(id, x, 0.0f, 0.0f));
+        }
+        f.players.push_back(Ply(localEntity, localX, 0.0f, 0.0f));
+        return f;
+    }
+} // namespace
+
+// --- End to end: input -> predict -> reconcile -> interpolate -> present -------
+TEST(ClientDriverStep14, EndToEndClientPass)
+{
+    FakeInputSource in;
+    in.Queue(MoveInput(1, 1, 1.0f, 0.0f, 0.0f));
+
+    FakeAuthoritativeSource auth;
+    auth.Queue(DriverFrame(10, /*acked*/ 0, {{1, 0.0f}, {2, 100.0f}}, /*local*/ 1, /*localX*/ 0.0f));
+    auth.Queue(DriverFrame(20, /*acked*/ 0, {{1, 10.0f}, {2, 200.0f}}, /*local*/ 1, /*localX*/ 5.0f));
+
+    FakePresentationSink sink;
+    prediction::ClientPresentationDriver driver{InterpConfig(0), in, auth, sink};
+
+    EXPECT_EQ(driver.Advance(15, 0.016), prediction::PredictionOutcome::Ok);
+
+    // Local player established (id 1) and predicted forward from the authoritative
+    // baseline (x=5) + one recorded input (+1) => x=6.
+    EXPECT_EQ(driver.Prediction().Current().id.value, 1u);
+    ASSERT_EQ(sink.local.size(), 1u);
+    EXPECT_FLOAT_EQ(sink.local[0].position.x, 6.0f);
+
+    // Remote entities interpolated at render tick 15 (halfway between 10 and 20):
+    // entity 1 -> 5, entity 2 -> 150, ascending by id.
+    ASSERT_EQ(sink.remote.size(), 2u);
+    EXPECT_EQ(sink.remote[0].id.value, 1u);
+    EXPECT_FLOAT_EQ(sink.remote[0].position.x, 5.0f);
+    EXPECT_EQ(sink.remote[1].id.value, 2u);
+    EXPECT_FLOAT_EQ(sink.remote[1].position.x, 150.0f);
+
+    // Diagnostics recorded the pass.
+    EXPECT_EQ(driver.Diagnostics().Snapshot().predictionsRun, 1u);
+    EXPECT_EQ(driver.Diagnostics().Snapshot().interpolations, 2u);
+}
+
+// --- Host identity mode: authoritative rendered directly, no prediction --------
+TEST(ClientDriverStep14, HostIdentityMode)
+{
+    FakeInputSource in; // unused in identity mode
+    FakeAuthoritativeSource auth;
+    auth.Queue(DriverFrame(10, 0, {{1, 7.0f}, {2, 9.0f}}, 1, 0.0f));
+
+    FakePresentationSink sink;
+    prediction::ClientPresentationDriver driver{InterpConfig(0), in, auth, sink};
+    driver.SetIdentityMode(true);
+    EXPECT_TRUE(driver.IsIdentityMode());
+
+    EXPECT_EQ(driver.Advance(10, 0.033), prediction::PredictionOutcome::Ok);
+
+    // Authoritative entities applied directly, in order; no local prediction.
+    EXPECT_TRUE(sink.local.empty());
+    ASSERT_EQ(sink.remote.size(), 2u);
+    EXPECT_FLOAT_EQ(sink.remote[0].position.x, 7.0f);
+    EXPECT_FLOAT_EQ(sink.remote[1].position.x, 9.0f);
+    EXPECT_EQ(driver.Diagnostics().Snapshot().predictionsRun, 0u);
+    EXPECT_EQ(driver.Diagnostics().Snapshot().interpolations, 0u);
+}
+
+// --- Deterministic: identical drivers produce identical presentation -----------
+TEST(ClientDriverStep14, Deterministic)
+{
+    FakeInputSource inA;
+    inA.Queue(MoveInput(1, 1, 0.5f, 0.25f, 0.1f));
+    inA.Queue(MoveInput(2, 2, 0.5f, 0.25f, 0.2f));
+    FakeAuthoritativeSource authA;
+    authA.Queue(DriverFrame(10, 0, {{1, 0.0f}, {2, 4.0f}}, 1, 0.0f));
+    authA.Queue(DriverFrame(20, 1, {{1, 2.0f}, {2, 8.0f}}, 1, 1.0f));
+    FakePresentationSink sinkA;
+    prediction::ClientPresentationDriver a{InterpConfig(0), inA, authA, sinkA};
+
+    FakeInputSource inB;
+    inB.Queue(MoveInput(1, 1, 0.5f, 0.25f, 0.1f));
+    inB.Queue(MoveInput(2, 2, 0.5f, 0.25f, 0.2f));
+    FakeAuthoritativeSource authB;
+    authB.Queue(DriverFrame(10, 0, {{1, 0.0f}, {2, 4.0f}}, 1, 0.0f));
+    authB.Queue(DriverFrame(20, 1, {{1, 2.0f}, {2, 8.0f}}, 1, 1.0f));
+    FakePresentationSink sinkB;
+    prediction::ClientPresentationDriver b{InterpConfig(0), inB, authB, sinkB};
+
+    for (std::uint64_t t = 12; t <= 19; ++t)
+    {
+        EXPECT_EQ(a.Advance(t, 0.016), prediction::PredictionOutcome::Ok);
+        EXPECT_EQ(b.Advance(t, 0.016), prediction::PredictionOutcome::Ok);
+    }
+
+    ASSERT_EQ(sinkA.local.size(), sinkB.local.size());
+    for (std::size_t k = 0; k < sinkA.local.size(); ++k)
+    {
+        EXPECT_FLOAT_EQ(sinkA.local[k].position.x, sinkB.local[k].position.x);
+        EXPECT_FLOAT_EQ(sinkA.local[k].yaw, sinkB.local[k].yaw);
+    }
+    ASSERT_EQ(sinkA.remote.size(), sinkB.remote.size());
+    for (std::size_t k = 0; k < sinkA.remote.size(); ++k)
+    {
+        EXPECT_EQ(sinkA.remote[k].id.value, sinkB.remote[k].id.value);
+        EXPECT_FLOAT_EQ(sinkA.remote[k].position.x, sinkB.remote[k].position.x);
+    }
 }
