@@ -102,14 +102,16 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **007** | Player Lifecycle (persistent players, join/reconnect) | ✅ Verified (Closed) |
 | **008** | Snapshot System (immutable snapshots) | ✅ Verified (Closed) |
 | **009** | Replication Pipeline | ✅ Verified (Closed) |
-| 010 | Client Prediction / Interpolation | ⏳ Planned (next) |
+| **010** | **Client Prediction & Interpolation** | 🚧 **In progress** — Step 1 / 17 |
 | 011–012 | Persistence (save format, reconnect persistence) | ⏳ Planned |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
 **Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified.
 
-**Sprint-009 (Replication Pipeline) — Verified (Closed):** the host-authoritative consumer that transforms immutable snapshots into prioritized, delta-encoded, bandwidth-efficient network updates. All 16 steps were implemented one at a time and independently verified; replication owns no entities, executes no gameplay, and mutates no simulation. Subsystem documentation: `Multiplayer/docs/Replication.md`. **Next focus — Sprint-010 (Client Prediction & Interpolation).**
+**Sprint-009 (Replication Pipeline) — Verified (Closed):** the host-authoritative consumer that transforms immutable snapshots into prioritized, delta-encoded, bandwidth-efficient network updates. All 16 steps were implemented one at a time and independently verified; replication owns no entities, executes no gameplay, and mutates no simulation. Subsystem documentation: `Multiplayer/docs/Replication.md`.
+
+**Current focus — Sprint-010 (Client Prediction & Interpolation):** the client-side presentation layer — local-player prediction, remote-entity interpolation, and deterministic reconciliation — that consumes replication output and never mutates authoritative simulation. The complete 17-step plan is frozen (`Documentation/SPRINTS/Sprint-010/Sprint-010-Implementation-Plan.md`); implementation is proceeding one verified step at a time. Host authority always wins.
 
 ---
 
@@ -123,7 +125,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Test Status
 
-- **442 / 442 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
+- **448 / 448 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.

@@ -153,6 +153,7 @@
     <ClCompile Include="PlayerTests.cpp" />
     <ClCompile Include="SnapshotTests.cpp" />
     <ClCompile Include="ReplicationTests.cpp" />
+    <ClCompile Include="PredictionTests.cpp" />
     <ClCompile Include="..\src\replication\ReplicationConfiguration.cpp" />
     <ClCompile Include="..\src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="..\src\replication\ReplicationClientRegistry.cpp" />
