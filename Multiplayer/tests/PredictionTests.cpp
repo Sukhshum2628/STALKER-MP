@@ -12,6 +12,7 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/prediction/InputBuffer.h"
 #include "stalkermp/prediction/PredictionConfiguration.h"
+#include "stalkermp/prediction/PredictionManager.h"
 #include "stalkermp/prediction/PredictionStep.h"
 #include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
@@ -473,4 +474,104 @@ TEST(PredictionStepStep5, Deterministic)
     EXPECT_FLOAT_EQ(a.yaw, b.yaw);
     EXPECT_EQ(a.tick, b.tick);
     EXPECT_EQ(a.stateFlags, b.stateFlags);
+}
+
+// ============================================================================
+// Step 6 — PredictionManager
+// ============================================================================
+
+namespace
+{
+    prediction::PredictionConfiguration ManagerConfig(std::uint32_t maxPredictionTicks)
+    {
+        prediction::PredictionConfiguration c{};
+        c.inputBufferDepth = 64;
+        c.stateBufferDepth = 64;
+        c.maxPredictionTicks = maxPredictionTicks;
+        return c;
+    }
+} // namespace
+
+// --- Record inputs, then predict forward from the confirmed baseline ----------
+TEST(PredictionManagerStep6, RecordAndPredict)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+
+    // Three forward inputs, each moving local +X by 1 at yaw 0 (world +X).
+    EXPECT_EQ(mgr.RecordInput(MoveInput(1, 1, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.RecordInput(MoveInput(2, 2, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.RecordInput(MoveInput(3, 3, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.Statistics().inputsRecorded, 3u);
+
+    const auto& current = mgr.PredictLocal(3);
+    EXPECT_FLOAT_EQ(current.position.x, 3.0f); // three ticks of +X
+    EXPECT_EQ(current.tick, 3u);
+    EXPECT_EQ(mgr.Statistics().predictionsRun, 1u);
+    EXPECT_EQ(mgr.RecordedStateCount(), 3u);
+
+    // Current() mirrors the last prediction.
+    EXPECT_FLOAT_EQ(mgr.Current().position.x, 3.0f);
+}
+
+// --- toTick bounds how far forward prediction runs ----------------------------
+TEST(PredictionManagerStep6, PredictsOnlyUpToRequestedTick)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+    EXPECT_EQ(mgr.RecordInput(MoveInput(1, 1, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.RecordInput(MoveInput(2, 2, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.RecordInput(MoveInput(3, 3, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+
+    const auto& current = mgr.PredictLocal(2); // stop at tick 2
+    EXPECT_FLOAT_EQ(current.position.x, 2.0f);
+    EXPECT_EQ(current.tick, 2u);
+}
+
+// --- maxPredictionTicks caps the number of integrations -----------------------
+TEST(PredictionManagerStep6, CapsAtMaxPredictionTicks)
+{
+    prediction::PredictionManager mgr{ManagerConfig(2)}; // cap = 2
+
+    for (std::uint64_t i = 1; i <= 5; ++i)
+    {
+        EXPECT_EQ(mgr.RecordInput(MoveInput(i, i, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    }
+
+    const auto& current = mgr.PredictLocal(100); // request far ahead
+    EXPECT_FLOAT_EQ(current.position.x, 2.0f);   // only 2 inputs applied (capped)
+    EXPECT_EQ(current.tick, 2u);
+}
+
+// --- Deterministic: identical inputs => identical current state; idempotent ----
+TEST(PredictionManagerStep6, DeterministicAndIdempotent)
+{
+    prediction::PredictionManager a{ManagerConfig(8)};
+    prediction::PredictionManager b{ManagerConfig(8)};
+
+    for (std::uint64_t i = 1; i <= 4; ++i)
+    {
+        const auto in = MoveInput(i, i, 0.5f, 0.25f, 0.1f * static_cast<float>(i), static_cast<std::uint32_t>(i));
+        EXPECT_EQ(a.RecordInput(in), prediction::PredictionOutcome::Ok);
+        EXPECT_EQ(b.RecordInput(in), prediction::PredictionOutcome::Ok);
+    }
+
+    const auto sa = a.PredictLocal(4);
+    const auto sb = b.PredictLocal(4);
+    EXPECT_FLOAT_EQ(sa.position.x, sb.position.x);
+    EXPECT_FLOAT_EQ(sa.position.z, sb.position.z);
+    EXPECT_FLOAT_EQ(sa.yaw, sb.yaw);
+    EXPECT_EQ(sa.tick, sb.tick);
+
+    // Re-running the same prediction is idempotent (replays from the baseline).
+    const auto again = a.PredictLocal(4);
+    EXPECT_FLOAT_EQ(again.position.x, sa.position.x);
+    EXPECT_FLOAT_EQ(again.position.z, sa.position.z);
+}
+
+// --- Out-of-order input is rejected without disturbing prediction -------------
+TEST(PredictionManagerStep6, RejectsSequenceRegression)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+    EXPECT_EQ(mgr.RecordInput(MoveInput(5, 5, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.RecordInput(MoveInput(3, 3, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::SequenceMismatch);
+    EXPECT_EQ(mgr.Statistics().inputsRecorded, 1u);
 }

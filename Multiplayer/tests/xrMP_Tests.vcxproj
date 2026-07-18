@@ -155,6 +155,7 @@
     <ClCompile Include="ReplicationTests.cpp" />
     <ClCompile Include="PredictionTests.cpp" />
     <ClCompile Include="..\src\prediction\PredictionConfiguration.cpp" />
+    <ClCompile Include="..\src\prediction\PredictionManager.cpp" />
     <ClCompile Include="..\src\replication\ReplicationConfiguration.cpp" />
     <ClCompile Include="..\src\replication\ReplicationUpdate.cpp" />
     <ClCompile Include="..\src\replication\ReplicationClientRegistry.cpp" />
