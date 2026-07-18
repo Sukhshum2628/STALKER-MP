@@ -1201,3 +1201,216 @@ TEST(ReconciliationStep11, ConflictingEntityRejected)
     // A reconcile for a different entity (2) is rejected.
     EXPECT_EQ(mgr.Reconcile(Ply(2, 0.0f, 0.0f, 0.0f), 1, 1), prediction::PredictionOutcome::CorrectionRejected);
 }
+
+// ============================================================================
+// Step 12 — Prediction validation (negative surface + deterministic stress)
+// ============================================================================
+
+// --- Input-buffer overflow is a value outcome that leaves state unchanged ------
+TEST(PredictionHardeningStep12, InputOverflowLeavesStateUnchanged)
+{
+    prediction::InputBuffer buf{2};
+    EXPECT_EQ(buf.Push(Cmd(1, 1)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Cmd(2, 2)), prediction::PredictionOutcome::Ok);
+    EXPECT_TRUE(buf.Full());
+
+    EXPECT_EQ(buf.Push(Cmd(3, 3)), prediction::PredictionOutcome::BufferOverflow);
+    EXPECT_EQ(buf.Size(), 2u);           // unchanged
+    EXPECT_EQ(buf.LastSequence(), 2u);   // unchanged
+
+    // After pruning, capacity frees and the next ascending push is accepted.
+    buf.PruneUpTo(1);
+    EXPECT_EQ(buf.Push(Cmd(3, 3)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Size(), 2u);
+}
+
+// --- Input-buffer sequence regress/duplicate is a value outcome, unchanged -----
+TEST(PredictionHardeningStep12, InputRegressLeavesStateUnchanged)
+{
+    prediction::InputBuffer buf{8};
+    EXPECT_EQ(buf.Push(Cmd(5, 5)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Cmd(5, 5)), prediction::PredictionOutcome::SequenceMismatch); // duplicate
+    EXPECT_EQ(buf.Push(Cmd(3, 3)), prediction::PredictionOutcome::SequenceMismatch); // regress
+    EXPECT_EQ(buf.Size(), 1u);
+    EXPECT_EQ(buf.LastSequence(), 5u);
+
+    // The monotonic guard persists across a prune-to-empty (only Clear resets it).
+    buf.PruneUpTo(100);
+    EXPECT_TRUE(buf.Empty());
+    EXPECT_EQ(buf.Push(Cmd(4, 4)), prediction::PredictionOutcome::SequenceMismatch);
+    buf.Clear();
+    EXPECT_EQ(buf.Push(Cmd(4, 4)), prediction::PredictionOutcome::Ok); // fresh session
+}
+
+// --- State-buffer bounded eviction: oldest dropped, lookups correct ------------
+TEST(PredictionHardeningStep12, StateBufferBoundedEviction)
+{
+    prediction::StateBuffer sb{3};
+    for (std::uint64_t t = 1; t <= 5; ++t)
+    {
+        sb.Record(St(1, t * 10, static_cast<float>(t)));
+    }
+    EXPECT_EQ(sb.Size(), 3u);
+    EXPECT_TRUE(sb.Full());
+    EXPECT_EQ(sb.At(10), nullptr); // evicted
+    EXPECT_EQ(sb.At(20), nullptr); // evicted
+    ASSERT_NE(sb.At(30), nullptr);
+    ASSERT_NE(sb.At(50), nullptr);
+    ASSERT_NE(sb.Latest(), nullptr);
+    EXPECT_EQ(sb.Latest()->tick, 50u);
+
+    // Non-ascending record is ignored (deterministic no-op): tick 40 is still
+    // buffered and retains its ORIGINAL value (x=4.0), not the rejected 99.0.
+    sb.Record(St(1, 40, 99.0f));
+    ASSERT_NE(sb.At(40), nullptr);
+    EXPECT_FLOAT_EQ(sb.At(40)->position.x, 4.0f);
+    EXPECT_EQ(sb.Latest()->tick, 50u);
+}
+
+// --- Prediction cap holds under heavy input churn -----------------------------
+TEST(PredictionHardeningStep12, PredictionCapUnderStress)
+{
+    prediction::PredictionManager mgr{ManagerConfig(4)}; // cap = 4
+    for (std::uint64_t i = 1; i <= 50; ++i)
+    {
+        EXPECT_EQ(mgr.RecordInput(MoveInput(i, i, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    }
+    const auto& s = mgr.PredictLocal(1000);
+    EXPECT_FLOAT_EQ(s.position.x, 4.0f); // only 4 inputs applied regardless of request
+    EXPECT_EQ(s.tick, 4u);
+}
+
+// --- Interpolation never extrapolates: clamp both boundaries + empty -----------
+TEST(PredictionHardeningStep12, InterpolationNoExtrapolation)
+{
+    prediction::SnapshotBuffer buf{8, 0};
+    EXPECT_EQ(buf.Push(Frame(10)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Frame(20)), prediction::PredictionOutcome::Ok);
+
+    const auto ahead = buf.Pair(10000); // far beyond newest
+    EXPECT_EQ(ahead.from->tick, 20u);
+    EXPECT_EQ(ahead.to->tick, 20u);
+    EXPECT_FLOAT_EQ(ahead.factor, 0.0f);
+
+    const auto behind = buf.Pair(0); // before oldest
+    EXPECT_EQ(behind.from->tick, 10u);
+    EXPECT_EQ(behind.to->tick, 10u);
+
+    prediction::SnapshotBuffer empty{4, 0};
+    EXPECT_FALSE(empty.Pair(10).valid);
+
+    // Manager-level: request far beyond newest clamps (no overshoot).
+    prediction::InterpolationManager mgr{InterpConfig(0)};
+    EXPECT_EQ(mgr.PushFrame(EntFrame(10, {{1, 0.0f}})), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.PushFrame(EntFrame(20, {{1, 5.0f}})), prediction::PredictionOutcome::Ok);
+    std::vector<prediction::InterpolatedState> out;
+    EXPECT_EQ(mgr.Interpolate(99999, out), prediction::PredictionOutcome::Ok);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_FLOAT_EQ(out[0].position.x, 5.0f); // newest, not extrapolated past
+}
+
+// --- Reconciliation snap+replay is deterministic under interleaved stress ------
+TEST(PredictionHardeningStep12, ReconcileStressDeterministic)
+{
+    auto drive = [](prediction::PredictionManager& m) {
+        std::uint64_t seq = 0;
+        for (std::uint64_t round = 0; round < 10; ++round)
+        {
+            for (int k = 0; k < 5; ++k)
+            {
+                ++seq;
+                (void)m.RecordInput(MoveInput(seq, seq, 0.3f, -0.2f, 0.05f * static_cast<float>(seq)));
+            }
+            (void)m.PredictLocal(seq);
+            // Host acknowledges a few inputs back, at a shifting authoritative point.
+            const std::uint64_t acked = seq >= 3 ? seq - 3 : 0;
+            (void)m.Reconcile(Ply(1, static_cast<float>(round), 0.0f, static_cast<float>(round) * 0.5f), acked, seq);
+        }
+    };
+
+    prediction::PredictionManager a{ManagerConfig(8)};
+    prediction::PredictionManager b{ManagerConfig(8)};
+    drive(a);
+    drive(b);
+
+    EXPECT_FLOAT_EQ(a.Current().position.x, b.Current().position.x);
+    EXPECT_FLOAT_EQ(a.Current().position.y, b.Current().position.y);
+    EXPECT_FLOAT_EQ(a.Current().position.z, b.Current().position.z);
+    EXPECT_FLOAT_EQ(a.Current().yaw, b.Current().yaw);
+    EXPECT_EQ(a.ConfirmedSequence(), b.ConfirmedSequence());
+    EXPECT_EQ(a.LastCorrection(), b.LastCorrection());
+    EXPECT_EQ(a.Statistics().snaps, b.Statistics().snaps);
+    EXPECT_EQ(a.Statistics().corrections, b.Statistics().corrections);
+}
+
+// --- Config invariants: min-1 fields reject 0 / negative (value outcome) -------
+TEST(PredictionHardeningStep12, ConfigInvariantsRejected)
+{
+    const char* minOneKeys[] = {"input_buffer_depth", "state_buffer_depth", "max_prediction_ticks", "version"};
+    for (const char* key : minOneKeys)
+    {
+        core::ConfigStore zero;
+        zero.Set("prediction", key, "0");
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(zero).HasValue());
+
+        core::ConfigStore negative;
+        negative.Set("prediction", key, "-5");
+        EXPECT_FALSE(prediction::PredictionConfiguration::FromConfig(negative).HasValue());
+    }
+}
+
+// --- Large-entity churn: bounded memory + deterministic replay identity --------
+TEST(PredictionHardeningStep12, LargeEntityChurnReplayIdentity)
+{
+    // Two independent managers fed an identical, churny frame stream must produce
+    // byte-identical interpolation output at every render tick (replay identity),
+    // while the snapshot ring stays bounded.
+    auto buildStream = [](prediction::InterpolationManager& m) {
+        for (std::uint64_t f = 0; f < 40; ++f)
+        {
+            const std::uint64_t tick = (f + 1) * 10;
+            prediction::SnapshotFrame frame{};
+            frame.tick = tick;
+            // Churn: a sliding window of 8 entity ids, ascending by id.
+            const std::uint32_t base = static_cast<std::uint32_t>(f % 5) + 1;
+            for (std::uint32_t e = 0; e < 8; ++e)
+            {
+                replication::EntityReplicationState ent{};
+                ent.id = world::EntityId{base + e};
+                ent.position = world::Vec3{static_cast<float>(base + e) + static_cast<float>(f),
+                                           0.0f, static_cast<float>(f) * 0.25f};
+                frame.entities.push_back(ent);
+            }
+            (void)m.PushFrame(frame);
+        }
+    };
+
+    prediction::InterpolationManager a{InterpConfig(2)};
+    prediction::InterpolationManager b{InterpConfig(2)};
+    buildStream(a);
+    buildStream(b);
+
+    EXPECT_LE(a.BufferedFrameCount(), a.Capacity()); // bounded memory under churn
+    EXPECT_EQ(a.BufferedFrameCount(), b.BufferedFrameCount());
+
+    for (std::uint64_t renderTick = 50; renderTick <= 420; renderTick += 7)
+    {
+        std::vector<prediction::InterpolatedState> oa;
+        std::vector<prediction::InterpolatedState> ob;
+        const auto ra = a.Interpolate(renderTick, oa);
+        const auto rb = b.Interpolate(renderTick, ob);
+        EXPECT_EQ(ra, rb);
+        ASSERT_EQ(oa.size(), ob.size());
+        for (std::size_t k = 0; k < oa.size(); ++k)
+        {
+            EXPECT_EQ(oa[k].id.value, ob[k].id.value);
+            EXPECT_FLOAT_EQ(oa[k].position.x, ob[k].position.x);
+            EXPECT_FLOAT_EQ(oa[k].position.z, ob[k].position.z);
+            // Output is ascending + unique by EntityId.
+            if (k > 0)
+            {
+                EXPECT_TRUE(oa[k - 1].id.value < oa[k].id.value);
+            }
+        }
+    }
+}
