@@ -1087,3 +1087,117 @@ TEST(ClientSeamsStep10, AuthoritativeObservationDoesNotMutateInput)
     EXPECT_EQ(frame.entities.size(), 1u);
     EXPECT_FLOAT_EQ(frame.entities[0].position.x, 5.0f);
 }
+
+// ============================================================================
+// Step 11 — Reconciliation + error correction
+// ============================================================================
+
+// --- Prune advances the confirmed point; pending inputs shrink ----------------
+TEST(ReconciliationStep11, PruneAdvancesConfirmed)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+    for (std::uint64_t i = 1; i <= 4; ++i)
+    {
+        EXPECT_EQ(mgr.RecordInput(MoveInput(i, i, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    }
+    mgr.PredictLocal(4);
+    EXPECT_EQ(mgr.PendingInputCount(), 4u);
+
+    // Host acknowledges through sequence 2; inputs 1,2 are pruned, 3,4 remain.
+    EXPECT_EQ(mgr.Reconcile(Ply(1, 0.0f, 0.0f, 0.0f), /*acked*/ 2, /*toTick*/ 4),
+              prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.ConfirmedSequence(), 2u);
+    EXPECT_EQ(mgr.PendingInputCount(), 2u);
+}
+
+// --- Host authority wins: baseline snaps to authoritative, pending replayed ----
+TEST(ReconciliationStep11, HostAuthorityWinsAndReplaysPending)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+    for (std::uint64_t i = 1; i <= 4; ++i)
+    {
+        EXPECT_EQ(mgr.RecordInput(MoveInput(i, i, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    }
+    mgr.PredictLocal(4);
+    EXPECT_FLOAT_EQ(mgr.Current().position.x, 4.0f); // client predicted x=4
+
+    // Host says the player is at the origin, acknowledging only inputs 1,2.
+    EXPECT_EQ(mgr.Reconcile(Ply(1, 0.0f, 0.0f, 0.0f), /*acked*/ 2, /*toTick*/ 4),
+              prediction::PredictionOutcome::Ok);
+    // Authoritative origin + replayed inputs 3,4 (+1 each) => x = 2 (host wins).
+    EXPECT_FLOAT_EQ(mgr.Current().position.x, 2.0f);
+    EXPECT_EQ(mgr.LastCorrection(), prediction::CorrectionKind::Snapped);
+}
+
+// --- Snap+replay is deterministic across managers -----------------------------
+TEST(ReconciliationStep11, SnapReplayDeterministic)
+{
+    prediction::PredictionManager a{ManagerConfig(8)};
+    prediction::PredictionManager b{ManagerConfig(8)};
+    for (auto* m : {&a, &b})
+    {
+        for (std::uint64_t i = 1; i <= 5; ++i)
+        {
+            EXPECT_EQ(m->RecordInput(MoveInput(i, i, 0.5f, 0.25f, 0.0f)), prediction::PredictionOutcome::Ok);
+        }
+        m->PredictLocal(5);
+    }
+    EXPECT_EQ(a.Reconcile(Ply(1, 9.0f, 0.0f, -3.0f), 3, 5), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(b.Reconcile(Ply(1, 9.0f, 0.0f, -3.0f), 3, 5), prediction::PredictionOutcome::Ok);
+    EXPECT_FLOAT_EQ(a.Current().position.x, b.Current().position.x);
+    EXPECT_FLOAT_EQ(a.Current().position.z, b.Current().position.z);
+    EXPECT_EQ(a.LastCorrection(), b.LastCorrection());
+}
+
+// --- Small error smoothed; large error snapped (threshold compare) ------------
+TEST(ReconciliationStep11, SmoothWithinThresholdSnapBeyond)
+{
+    // Default thresholds: position 250mm (0.25 world units).
+    prediction::PredictionManager small{ManagerConfig(8)};
+    EXPECT_EQ(small.RecordInput(MoveInput(1, 1, 2.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    small.PredictLocal(1); // predicted x = 2.0
+    // Authoritative x = 1.9 (0.1 unit = 100mm error < 250mm) -> Smoothed.
+    EXPECT_EQ(small.Reconcile(Ply(1, 1.9f, 0.0f, 0.0f), 1, 1), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(small.LastCorrection(), prediction::CorrectionKind::Smoothed);
+    EXPECT_FLOAT_EQ(small.Current().position.x, 1.9f); // host authority still applied
+
+    prediction::PredictionManager big{ManagerConfig(8)};
+    EXPECT_EQ(big.RecordInput(MoveInput(1, 1, 2.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    big.PredictLocal(1); // predicted x = 2.0
+    // Authoritative x = 1.0 (1.0 unit = 1000mm error > 250mm) -> Snapped.
+    EXPECT_EQ(big.Reconcile(Ply(1, 1.0f, 0.0f, 0.0f), 1, 1), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(big.LastCorrection(), prediction::CorrectionKind::Snapped);
+    EXPECT_EQ(big.Statistics().snaps, 1u);
+    EXPECT_EQ(big.Statistics().corrections, 1u);
+}
+
+// --- Regressed acknowledgement is rejected without mutation -------------------
+TEST(ReconciliationStep11, SequenceMismatchRejected)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+    for (std::uint64_t i = 1; i <= 5; ++i)
+    {
+        EXPECT_EQ(mgr.RecordInput(MoveInput(i, i, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    }
+    mgr.PredictLocal(5);
+    EXPECT_EQ(mgr.Reconcile(Ply(1, 0.0f, 0.0f, 0.0f), 4, 5), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(mgr.ConfirmedSequence(), 4u);
+
+    // A stale ack (2 < 4) is rejected; confirmed point unchanged.
+    EXPECT_EQ(mgr.Reconcile(Ply(1, 0.0f, 0.0f, 0.0f), 2, 5), prediction::PredictionOutcome::SequenceMismatch);
+    EXPECT_EQ(mgr.ConfirmedSequence(), 4u);
+}
+
+// --- A conflicting authoritative entity is rejected ---------------------------
+TEST(ReconciliationStep11, ConflictingEntityRejected)
+{
+    prediction::PredictionManager mgr{ManagerConfig(8)};
+    EXPECT_EQ(mgr.RecordInput(MoveInput(1, 1, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
+    mgr.PredictLocal(1);
+
+    // First reconcile establishes local entity 1.
+    EXPECT_EQ(mgr.Reconcile(Ply(1, 0.0f, 0.0f, 0.0f), 1, 1), prediction::PredictionOutcome::Ok);
+
+    // A reconcile for a different entity (2) is rejected.
+    EXPECT_EQ(mgr.Reconcile(Ply(2, 0.0f, 0.0f, 0.0f), 1, 1), prediction::PredictionOutcome::CorrectionRejected);
+}
