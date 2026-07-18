@@ -14,6 +14,7 @@
 #include "stalkermp/prediction/PredictionConfiguration.h"
 #include "stalkermp/prediction/PredictionManager.h"
 #include "stalkermp/prediction/PredictionStep.h"
+#include "stalkermp/prediction/SnapshotBuffer.h"
 #include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
 
@@ -574,4 +575,123 @@ TEST(PredictionManagerStep6, RejectsSequenceRegression)
     EXPECT_EQ(mgr.RecordInput(MoveInput(5, 5, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::Ok);
     EXPECT_EQ(mgr.RecordInput(MoveInput(3, 3, 1.0f, 0.0f, 0.0f)), prediction::PredictionOutcome::SequenceMismatch);
     EXPECT_EQ(mgr.Statistics().inputsRecorded, 1u);
+}
+
+// ============================================================================
+// Step 7 — SnapshotBuffer
+// ============================================================================
+
+namespace
+{
+    prediction::SnapshotFrame Frame(std::uint64_t tick, std::uint64_t acked = 0)
+    {
+        prediction::SnapshotFrame f{};
+        f.tick = tick;
+        f.ackedInputSequence = acked;
+        return f;
+    }
+} // namespace
+
+// --- Ascending push accepted; regress/duplicate rejected ----------------------
+TEST(SnapshotBufferStep7, PushAscendingAndRejectRegression)
+{
+    prediction::SnapshotBuffer buf{8, /*delay*/ 0};
+    EXPECT_EQ(buf.Push(Frame(10)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Frame(20)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Frame(20)), prediction::PredictionOutcome::SequenceMismatch); // duplicate
+    EXPECT_EQ(buf.Push(Frame(15)), prediction::PredictionOutcome::SequenceMismatch); // regress
+    EXPECT_EQ(buf.Size(), 2u);
+}
+
+// --- Pair brackets the (delayed) render tick and derives factor in [0,1] -------
+TEST(SnapshotBufferStep7, PairFactorMidpoint)
+{
+    prediction::SnapshotBuffer buf{8, /*delay*/ 0};
+    EXPECT_EQ(buf.Push(Frame(10)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Frame(20)), prediction::PredictionOutcome::Ok);
+
+    const auto pair = buf.Pair(15); // exactly halfway between 10 and 20
+    ASSERT_TRUE(pair.valid);
+    ASSERT_NE(pair.from, nullptr);
+    ASSERT_NE(pair.to, nullptr);
+    EXPECT_EQ(pair.from->tick, 10u);
+    EXPECT_EQ(pair.to->tick, 20u);
+    EXPECT_FLOAT_EQ(pair.factor, 0.5f);
+
+    // Endpoint: target equals a frame tick -> factor 0 on that bracket.
+    const auto atFrom = buf.Pair(10);
+    EXPECT_EQ(atFrom.from->tick, 10u);
+    EXPECT_FLOAT_EQ(atFrom.factor, 0.0f);
+}
+
+// --- Interpolation delay shifts the target tick backward ----------------------
+TEST(SnapshotBufferStep7, DelayShiftsTarget)
+{
+    prediction::SnapshotBuffer buf{8, /*delay*/ 4};
+    EXPECT_EQ(buf.Push(Frame(10)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Frame(20)), prediction::PredictionOutcome::Ok);
+
+    // renderTick 24 - delay 4 = target 20 -> newest boundary.
+    const auto pair = buf.Pair(24);
+    ASSERT_TRUE(pair.valid);
+    EXPECT_EQ(pair.from->tick, 20u);
+    EXPECT_EQ(pair.to->tick, 20u);
+
+    // renderTick 19 - delay 4 = target 15 -> midpoint of [10,20].
+    const auto mid = buf.Pair(19);
+    EXPECT_EQ(mid.from->tick, 10u);
+    EXPECT_EQ(mid.to->tick, 20u);
+    EXPECT_FLOAT_EQ(mid.factor, 0.5f);
+}
+
+// --- No extrapolation: clamp before oldest and beyond newest ------------------
+TEST(SnapshotBufferStep7, ClampsWithoutExtrapolation)
+{
+    prediction::SnapshotBuffer buf{8, /*delay*/ 0};
+    EXPECT_EQ(buf.Push(Frame(10)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buf.Push(Frame(20)), prediction::PredictionOutcome::Ok);
+
+    // Beyond newest -> clamp to newest (no extrapolation).
+    const auto ahead = buf.Pair(999);
+    ASSERT_TRUE(ahead.valid);
+    EXPECT_EQ(ahead.from->tick, 20u);
+    EXPECT_EQ(ahead.to->tick, 20u);
+    EXPECT_FLOAT_EQ(ahead.factor, 0.0f);
+
+    // Before oldest -> clamp to oldest.
+    const auto behind = buf.Pair(3);
+    EXPECT_EQ(behind.from->tick, 10u);
+    EXPECT_EQ(behind.to->tick, 10u);
+    EXPECT_FLOAT_EQ(behind.factor, 0.0f);
+
+    // Empty buffer -> invalid.
+    prediction::SnapshotBuffer empty{4, 0};
+    const auto none = empty.Pair(10);
+    EXPECT_FALSE(none.valid);
+    EXPECT_EQ(none.from, nullptr);
+}
+
+// --- Bounded ring: oldest evicted on overflow (deterministic) -----------------
+TEST(SnapshotBufferStep7, BoundedEviction)
+{
+    prediction::SnapshotBuffer buf{3, /*delay*/ 0};
+    for (std::uint64_t t = 1; t <= 5; ++t)
+    {
+        EXPECT_EQ(buf.Push(Frame(t * 10)), prediction::PredictionOutcome::Ok);
+    }
+    EXPECT_EQ(buf.Size(), 3u);         // capacity bound respected
+    EXPECT_TRUE(buf.Full());
+
+    // Frames 10, 20 evicted; 30, 40, 50 remain. Target before oldest clamps to 30.
+    const auto pair = buf.Pair(30);
+    ASSERT_TRUE(pair.valid);
+    EXPECT_EQ(pair.from->tick, 30u);
+
+    // Determinism: a second identical Pair yields the same bracket + factor.
+    const auto mid1 = buf.Pair(45);
+    const auto mid2 = buf.Pair(45);
+    EXPECT_EQ(mid1.from->tick, mid2.from->tick);
+    EXPECT_EQ(mid1.to->tick, mid2.to->tick);
+    EXPECT_FLOAT_EQ(mid1.factor, mid2.factor);
+    EXPECT_FLOAT_EQ(mid1.factor, 0.5f); // 45 between 40 and 50
 }
