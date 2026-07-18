@@ -10,10 +10,22 @@
 #include <type_traits>
 
 #include "stalkermp/core/Config.h"
+#include "stalkermp/prediction/InputBuffer.h"
 #include "stalkermp/prediction/PredictionConfiguration.h"
 #include "stalkermp/prediction/PredictionTypes.h"
 
 using namespace stalkermp;
+
+namespace
+{
+    prediction::InputCommand Cmd(std::uint64_t sequence, std::uint64_t tick)
+    {
+        prediction::InputCommand c{};
+        c.sequence = sequence;
+        c.tick = tick;
+        return c;
+    }
+} // namespace
 
 // --- Enum layout: fixed std::uint8_t underlying type (deterministic ABI) -----
 TEST(PredictionTypesStep1, EnumsHaveUint8UnderlyingType)
@@ -211,4 +223,92 @@ TEST(PredictionConfigStep2, BoundaryMinimumsAccepted)
     EXPECT_EQ(r.Value().inputBufferDepth, 1u);
     EXPECT_EQ(r.Value().maxPredictionTicks, 1u);
     EXPECT_EQ(r.Value().version, 1u);
+}
+
+// ============================================================================
+// Step 3 — InputBuffer
+// ============================================================================
+
+// --- Push: ascending sequence; regress rejected; FIFO; size/capacity ----------
+TEST(InputBufferStep3, PushAscendingAndSequenceMismatch)
+{
+    prediction::InputBuffer buffer{4};
+    EXPECT_EQ(buffer.Capacity(), 4u);
+    EXPECT_TRUE(buffer.Empty());
+
+    EXPECT_EQ(buffer.Push(Cmd(1, 10)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buffer.Push(Cmd(2, 11)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buffer.Size(), 2u);
+    EXPECT_EQ(buffer.LastSequence(), 2u);
+
+    // A regress or duplicate sequence is rejected; the buffer is unchanged.
+    EXPECT_EQ(buffer.Push(Cmd(2, 12)), prediction::PredictionOutcome::SequenceMismatch);
+    EXPECT_EQ(buffer.Push(Cmd(1, 13)), prediction::PredictionOutcome::SequenceMismatch);
+    EXPECT_EQ(buffer.Size(), 2u);
+}
+
+// --- Overflow is a value outcome; the buffer is unchanged ---------------------
+TEST(InputBufferStep3, OverflowValueOutcome)
+{
+    prediction::InputBuffer buffer{2};
+    EXPECT_EQ(buffer.Push(Cmd(1, 0)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buffer.Push(Cmd(2, 0)), prediction::PredictionOutcome::Ok);
+    EXPECT_TRUE(buffer.Full());
+    EXPECT_EQ(buffer.Push(Cmd(3, 0)), prediction::PredictionOutcome::BufferOverflow);
+    EXPECT_EQ(buffer.Size(), 2u); // unchanged
+}
+
+// --- PruneUpTo discards acknowledged inputs; sequences stay monotonic ---------
+TEST(InputBufferStep3, PruneUpTo)
+{
+    prediction::InputBuffer buffer{4};
+    (void)buffer.Push(Cmd(1, 0));
+    (void)buffer.Push(Cmd(2, 0));
+    (void)buffer.Push(Cmd(3, 0));
+    (void)buffer.Push(Cmd(4, 0));
+
+    buffer.PruneUpTo(2); // acknowledge sequences 1 and 2
+    EXPECT_EQ(buffer.Size(), 2u);
+
+    // A freed slot is reusable (ring wrap); sequences remain strictly ascending.
+    EXPECT_EQ(buffer.Push(Cmd(5, 0)), prediction::PredictionOutcome::Ok);
+    EXPECT_EQ(buffer.Size(), 3u);
+    // Pruning past everything empties the buffer (benign).
+    buffer.PruneUpTo(100);
+    EXPECT_TRUE(buffer.Empty());
+    EXPECT_EQ(buffer.LastSequence(), 5u); // monotonic guard persists after prune
+    EXPECT_EQ(buffer.Push(Cmd(5, 0)), prediction::PredictionOutcome::SequenceMismatch);
+}
+
+// --- Pending returns unacknowledged inputs ascending (for replay) -------------
+TEST(InputBufferStep3, PendingAscending)
+{
+    prediction::InputBuffer buffer{8};
+    for (std::uint64_t s = 1; s <= 5; ++s)
+    {
+        (void)buffer.Push(Cmd(s, s * 10));
+    }
+    const auto pending = buffer.Pending(/*fromSequence*/ 2);
+    ASSERT_EQ(pending.size(), 3u); // sequences 3, 4, 5
+    EXPECT_EQ(pending[0].sequence, 3u);
+    EXPECT_EQ(pending[1].sequence, 4u);
+    EXPECT_EQ(pending[2].sequence, 5u);
+    for (std::size_t i = 1; i < pending.size(); ++i)
+    {
+        EXPECT_TRUE(pending[i - 1].sequence < pending[i].sequence); // strictly ascending
+    }
+    // Pending does not mutate the buffer.
+    EXPECT_EQ(buffer.Size(), 5u);
+}
+
+// --- Clear restores the empty initial state -----------------------------------
+TEST(InputBufferStep3, Clear)
+{
+    prediction::InputBuffer buffer{4};
+    (void)buffer.Push(Cmd(1, 0));
+    (void)buffer.Push(Cmd(2, 0));
+    buffer.Clear();
+    EXPECT_TRUE(buffer.Empty());
+    EXPECT_EQ(buffer.LastSequence(), 0u);
+    EXPECT_EQ(buffer.Push(Cmd(1, 0)), prediction::PredictionOutcome::Ok); // sequence restarts
 }

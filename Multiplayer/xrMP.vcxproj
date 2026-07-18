@@ -308,6 +308,7 @@
     <ClInclude Include="include\stalkermp\replication\ReplicationDiagnostics.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionTypes.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
+    <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\world\BubbleConfiguration.h" />
     <ClInclude Include="include\stalkermp\world\BubbleManager.h" />
     <ClInclude Include="include\stalkermp\world\IPlayerPositionSource.h" />
