@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <type_traits>
 
@@ -14,6 +15,7 @@
 #include "stalkermp/prediction/PredictionConfiguration.h"
 #include "stalkermp/prediction/PredictionManager.h"
 #include "stalkermp/prediction/PredictionStep.h"
+#include "stalkermp/prediction/InterpolationStep.h"
 #include "stalkermp/prediction/SnapshotBuffer.h"
 #include "stalkermp/prediction/StateBuffer.h"
 #include "stalkermp/prediction/PredictionTypes.h"
@@ -694,4 +696,116 @@ TEST(SnapshotBufferStep7, BoundedEviction)
     EXPECT_EQ(mid1.to->tick, mid2.to->tick);
     EXPECT_FLOAT_EQ(mid1.factor, mid2.factor);
     EXPECT_FLOAT_EQ(mid1.factor, 0.5f); // 45 between 40 and 50
+}
+
+// ============================================================================
+// Step 8 — Deterministic interpolation step
+// ============================================================================
+
+namespace
+{
+    replication::EntityReplicationState Ent(std::uint32_t id, float x, float y, float z)
+    {
+        replication::EntityReplicationState e{};
+        e.id = world::EntityId{id};
+        e.position = world::Vec3{x, y, z};
+        return e;
+    }
+    replication::PlayerReplicationState Ply(std::uint32_t entityId, float x, float y, float z)
+    {
+        replication::PlayerReplicationState p{};
+        p.entity = world::EntityId{entityId};
+        p.position = world::Vec3{x, y, z};
+        return p;
+    }
+    constexpr float kPi = 3.14159265358979323846f;
+} // namespace
+
+// --- Position lerp: endpoints exact, midpoint halfway --------------------------
+TEST(InterpolationStepStep8, EntityPositionEndpointsAndMidpoint)
+{
+    const auto a = Ent(9, 0.0f, 0.0f, 0.0f);
+    const auto b = Ent(9, 10.0f, -4.0f, 2.0f);
+
+    const auto at0 = prediction::Interpolate(a, b, 0.0f);
+    EXPECT_EQ(at0.id.value, 9u);
+    EXPECT_FLOAT_EQ(at0.position.x, 0.0f);
+    EXPECT_FLOAT_EQ(at0.position.z, 0.0f);
+
+    const auto at1 = prediction::Interpolate(a, b, 1.0f);
+    EXPECT_FLOAT_EQ(at1.position.x, 10.0f);
+    EXPECT_FLOAT_EQ(at1.position.y, -4.0f);
+    EXPECT_FLOAT_EQ(at1.position.z, 2.0f);
+
+    const auto mid = prediction::Interpolate(a, b, 0.5f);
+    EXPECT_FLOAT_EQ(mid.position.x, 5.0f);
+    EXPECT_FLOAT_EQ(mid.position.y, -2.0f);
+    EXPECT_FLOAT_EQ(mid.position.z, 1.0f);
+}
+
+// --- Factor clamps: no extrapolation below 0 or above 1 -----------------------
+TEST(InterpolationStepStep8, FactorClampsNoExtrapolation)
+{
+    const auto a = Ent(1, 0.0f, 0.0f, 0.0f);
+    const auto b = Ent(1, 8.0f, 0.0f, 0.0f);
+
+    const auto below = prediction::Interpolate(a, b, -2.0f); // clamp to from
+    EXPECT_FLOAT_EQ(below.position.x, 0.0f);
+
+    const auto above = prediction::Interpolate(a, b, 5.0f); // clamp to to
+    EXPECT_FLOAT_EQ(above.position.x, 8.0f);
+
+    EXPECT_FLOAT_EQ(prediction::ClampFactor(-0.5f), 0.0f);
+    EXPECT_FLOAT_EQ(prediction::ClampFactor(1.5f), 1.0f);
+    EXPECT_FLOAT_EQ(prediction::ClampFactor(0.25f), 0.25f);
+}
+
+// --- Player overload lerps position and carries the entity id -----------------
+TEST(InterpolationStepStep8, PlayerOverload)
+{
+    const auto a = Ply(42, 0.0f, 0.0f, 0.0f);
+    const auto b = Ply(42, 4.0f, 4.0f, 4.0f);
+    const auto mid = prediction::Interpolate(a, b, 0.5f);
+    EXPECT_EQ(mid.id.value, 42u);
+    EXPECT_FLOAT_EQ(mid.position.x, 2.0f);
+    EXPECT_FLOAT_EQ(mid.position.y, 2.0f);
+    EXPECT_FLOAT_EQ(mid.position.z, 2.0f);
+}
+
+// --- Yaw angular interpolation: shortest arc across the +/-pi seam ------------
+TEST(InterpolationStepStep8, YawShortestArc)
+{
+    // Endpoints exact.
+    EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.5f, 1.5f, 0.0f), 0.5f);
+    EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.5f, 1.5f, 1.0f), 1.5f);
+
+    // Simple midpoint (no wrap).
+    EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.0f, 1.0f, 0.5f), 0.5f);
+
+    // Across the seam: from just below +pi to just above -pi should move the SHORT
+    // way (through +pi), not the long way back through 0.
+    const float from = kPi - 0.1f;
+    const float to = -kPi + 0.1f;   // effectively +0.2 rad the short way
+    const float halfway = prediction::InterpolateYaw(from, to, 0.5f);
+    // Short arc midpoint is just past +pi (which equals -pi); expect ~ +pi.
+    EXPECT_NEAR(std::fabs(halfway), kPi, 0.05f);
+
+    // Clamp: factor beyond [0,1] does not extrapolate.
+    EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.0f, 1.0f, 2.0f), 1.0f);
+    EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.0f, 1.0f, -1.0f), 0.0f);
+}
+
+// --- Deterministic: identical inputs => identical output ----------------------
+TEST(InterpolationStepStep8, Deterministic)
+{
+    const auto a = Ent(3, 1.0f, 2.0f, 3.0f);
+    const auto b = Ent(3, 9.0f, -2.0f, 0.0f);
+    const auto x = prediction::Interpolate(a, b, 0.375f);
+    const auto y = prediction::Interpolate(a, b, 0.375f);
+    EXPECT_FLOAT_EQ(x.position.x, y.position.x);
+    EXPECT_FLOAT_EQ(x.position.y, y.position.y);
+    EXPECT_FLOAT_EQ(x.position.z, y.position.z);
+    EXPECT_EQ(x.id.value, y.id.value);
+    EXPECT_FLOAT_EQ(prediction::InterpolateYaw(0.2f, 2.9f, 0.6f),
+                    prediction::InterpolateYaw(0.2f, 2.9f, 0.6f));
 }
