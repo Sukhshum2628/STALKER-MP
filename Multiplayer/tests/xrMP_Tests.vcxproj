@@ -170,6 +170,8 @@
     <ClCompile Include="..\src\saveload\PlayerRestorer.cpp" />
     <ClCompile Include="..\src\saveload\AlifeRestorer.cpp" />
     <ClCompile Include="..\src\saveload\SchedulerRestorer.cpp" />
+    <ClCompile Include="..\src\saveload\SaveManager.cpp" />
+    <ClCompile Include="..\src\saveload\RecoveryPipeline.cpp" />
     <ClCompile Include="..\src\persistence\PersistenceConfiguration.cpp" />
     <ClCompile Include="..\src\persistence\SaveMetadataBuilder.cpp" />
     <ClCompile Include="..\src\persistence\ValidationFramework.cpp" />

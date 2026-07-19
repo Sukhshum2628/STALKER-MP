@@ -24,6 +24,9 @@
 #include "stalkermp/saveload/SchedulerRestorer.h"
 #include "stalkermp/saveload/PlayerRestorer.h"
 #include "stalkermp/saveload/RecordingRestoreSinks.h"
+#include "stalkermp/saveload/RecoveryPipeline.h"
+#include "stalkermp/saveload/SaveLoadDiagnostics.h"
+#include "stalkermp/saveload/SaveManager.h"
 #include "stalkermp/saveload/WorldRestorer.h"
 #include "stalkermp/saveload/SaveIntegrityValidator.h"
 #include "stalkermp/saveload/SaveMigrator.h"
@@ -1220,4 +1223,295 @@ TEST(AlifeSchedulerRestoreStep13, SchedulerRestored)
     failing.SetOutcome(saveload::SaveLoadOutcome::CorruptedSave);
     EXPECT_EQ(saveload::SchedulerRestorer::Restore(save, failing), saveload::SaveLoadOutcome::CorruptedSave);
     EXPECT_EQ(failing.schedulers.size(), 1u); // the attempt is recorded
+}
+
+// ============================================================================
+// Batch-8 helpers (Recovery Subsystem)
+// ============================================================================
+
+namespace
+{
+    // Build a RestoreSinkSet routing every seam to one recording double.
+    saveload::RestoreSinkSet AllSinks(saveload::RecordingRestoreSinks& s)
+    {
+        return saveload::RestoreSinkSet{s, s, s, s, s, s};
+    }
+} // namespace
+
+// ============================================================================
+// Step 14 — SaveManager
+// ============================================================================
+
+// --- Create / enumerate / validate / delete lifecycle -------------------------
+TEST(SaveManagerStep14, Lifecycle)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    const persistence::VersionManager build = MakeBuild(3, 7);
+    saveload::SaveManager manager{*backend, build};
+
+    // No saves initially; validating a missing save is NothingToLoad.
+    EXPECT_TRUE(manager.EnumerateSaves().empty());
+    EXPECT_EQ(manager.ValidateSave(42), saveload::SaveLoadOutcome::NothingToLoad);
+
+    // Create -> enumerated + valid.
+    EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+    auto list = manager.EnumerateSaves();
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list[0].saveId, 42u);
+    EXPECT_EQ(manager.ValidateSave(42), saveload::SaveLoadOutcome::Ok);
+
+    // Overwrite keeps a single generation of the slot.
+    EXPECT_EQ(manager.OverwriteSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(manager.EnumerateSaves().size(), 1u);
+
+    // Delete -> gone.
+    EXPECT_EQ(manager.DeleteSave(42), saveload::SaveLoadOutcome::Ok);
+    EXPECT_TRUE(manager.EnumerateSaves().empty());
+    EXPECT_EQ(manager.ValidateSave(42), saveload::SaveLoadOutcome::NothingToLoad);
+}
+
+// --- ValidateSave rejects an incompatible build version -----------------------
+TEST(SaveManagerStep14, ValidateRejectsIncompatibleVersion)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    saveload::SaveManager writer{*backend, MakeBuild(3, 7)};
+    EXPECT_EQ(writer.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+
+    // A manager whose build has a different compatibility boundary rejects the save.
+    saveload::SaveManager reader{*backend, MakeBuild(4, 7)};
+    EXPECT_EQ(reader.ValidateSave(42), saveload::SaveLoadOutcome::VersionMismatch);
+}
+
+// ============================================================================
+// Step 14 — RecoveryPipeline
+// ============================================================================
+
+// --- Full recovery restores every phase in order ------------------------------
+TEST(RecoveryPipelineStep14, FullRecovery)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    const persistence::VersionManager build = MakeBuild(3, 7);
+    saveload::SaveManager manager{*backend, build};
+    EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+
+    saveload::SaveMigrator migrator;
+    saveload::RecoveryPipeline pipeline{backend->Source(), build, migrator, /*target*/ 3};
+    saveload::RecordingRestoreSinks sinks;
+
+    const saveload::RecoveryReport report = pipeline.Recover(42, AllSinks(sinks));
+    EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(report.finalState, saveload::LoadState::Completed);
+    EXPECT_EQ(report.reachedPhase, saveload::RestorePhase::Complete);
+    EXPECT_EQ(report.saveId, 42u);
+    EXPECT_EQ(report.entitiesRestored, 2u);
+    EXPECT_EQ(report.playersRestored, 1u);
+
+    // The restorers applied every section through the seams, in order.
+    EXPECT_EQ(sinks.worlds.size(), 1u);
+    EXPECT_EQ(sinks.environments.size(), 1u);
+    EXPECT_EQ(sinks.entities.size(), 2u);
+    EXPECT_EQ(sinks.players.size(), 1u);
+    EXPECT_EQ(sinks.schedulers.size(), 1u);
+}
+
+// --- Missing save => NothingToLoad, nothing applied ---------------------------
+TEST(RecoveryPipelineStep14, MissingSave)
+{
+    saveload::InMemorySaveSource source; // empty
+    saveload::SaveMigrator migrator;
+    saveload::RecoveryPipeline pipeline{source, MakeBuild(3, 7), migrator, 3};
+    saveload::RecordingRestoreSinks sinks;
+
+    const saveload::RecoveryReport report = pipeline.Recover(99, AllSinks(sinks));
+    EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::NothingToLoad);
+    EXPECT_EQ(report.finalState, saveload::LoadState::Failed);
+    EXPECT_TRUE(sinks.worlds.empty());
+    EXPECT_TRUE(sinks.entities.empty());
+}
+
+// --- A restore-sink failure => PartialRecovery at the reached phase ------------
+TEST(RecoveryPipelineStep14, PartialRecoveryOnSinkFailure)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    const persistence::VersionManager build = MakeBuild(3, 7);
+    saveload::SaveManager manager{*backend, build};
+    EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+
+    saveload::SaveMigrator migrator;
+    saveload::RecoveryPipeline pipeline{backend->Source(), build, migrator, 3};
+    saveload::RecordingRestoreSinks sinks;
+    sinks.SetOutcome(saveload::SaveLoadOutcome::IntegrityFailure); // the World sink fails first
+
+    const saveload::RecoveryReport report = pipeline.Recover(42, AllSinks(sinks));
+    EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::PartialRecovery);
+    EXPECT_EQ(report.finalState, saveload::LoadState::Failed);
+    EXPECT_EQ(report.reachedPhase, saveload::RestorePhase::World);
+    EXPECT_EQ(sinks.worlds.size(), 1u);        // world attempted
+    EXPECT_TRUE(sinks.environments.empty());   // stopped before environment
+    EXPECT_TRUE(sinks.entities.empty());
+}
+
+// ============================================================================
+// Step 15 — SaveLoadDiagnostics
+// ============================================================================
+
+// --- Record then snapshot: counters + aggregates ------------------------------
+TEST(SaveLoadDiagnosticsStep15, RecordAndSnapshot)
+{
+    saveload::SaveLoadDiagnostics diag;
+    diag.RecordRecoveryAttempt();
+    diag.RecordRecoveryAttempt();
+    diag.RecordRecoveryAttempt();
+    diag.RecordRecoverySuccess(); // 1 of 3 -> 33%
+    diag.RecordEntitiesRestored(2);
+    diag.RecordPlayersRestored(1);
+    diag.RecordValidationFailure();
+    diag.RecordSaveDuration(100);
+    diag.RecordSaveDuration(300); // avg 200, last 300
+    diag.RecordLoadDuration(50);
+    diag.RecordMigrationTime(9);
+
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.recoveryAttempts, 3u);
+    EXPECT_EQ(s.recoverySuccesses, 1u);
+    EXPECT_EQ(s.entitiesRestored, 2u);
+    EXPECT_EQ(s.playersRestored, 1u);
+    EXPECT_EQ(s.validationFailures, 1u);
+    EXPECT_EQ(s.saveDurationMicros, 300u);
+    EXPECT_EQ(s.migrationTimeMicros, 9u);
+    EXPECT_EQ(diag.RecoverySuccessPercent(), 33u);
+    EXPECT_EQ(diag.AverageSaveDurationMicros(), 200u);
+    EXPECT_EQ(diag.AverageLoadDurationMicros(), 50u);
+}
+
+// --- Reset restores initial; snapshot is an immutable copy --------------------
+TEST(SaveLoadDiagnosticsStep15, ResetAndImmutableSnapshot)
+{
+    saveload::SaveLoadDiagnostics diag;
+    diag.RecordRecoveryAttempt();
+    diag.RecordSaveDuration(500);
+    diag.RecordTimestamp(123u);
+
+    saveload::RecoveryStatistics early = diag.Snapshot();
+    early.recoveryAttempts = 9999u; // mutating the copy does not affect the collector
+    EXPECT_EQ(early.recoveryAttempts, 9999u);
+    EXPECT_EQ(diag.Snapshot().recoveryAttempts, 1u);
+
+    diag.Reset();
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.recoveryAttempts, 0u);
+    EXPECT_EQ(s.saveDurationMicros, 0u);
+    EXPECT_EQ(s.timestampWallClock, 0u);
+    EXPECT_EQ(diag.RecoverySuccessPercent(), 0u);
+    EXPECT_EQ(diag.AverageSaveDurationMicros(), 0u);
+}
+
+// ============================================================================
+// Step 16 — Recovery hardening (negative surface + determinism)
+// ============================================================================
+
+namespace
+{
+    // A source holding exactly one raw byte blob under saveId 7.
+    saveload::InMemorySaveSource SourceWithBytes(std::vector<std::uint8_t> bytes)
+    {
+        saveload::InMemorySaveSource src;
+        src.Store(MakeDescriptor(7, 0), std::move(bytes));
+        return src;
+    }
+
+    saveload::RecoveryReport RecoverBytes(std::vector<std::uint8_t> bytes, saveload::RecordingRestoreSinks& sinks,
+                                          std::uint32_t compat = 3, std::uint32_t world = 7,
+                                          std::uint32_t target = 3)
+    {
+        saveload::InMemorySaveSource src = SourceWithBytes(std::move(bytes));
+        saveload::SaveMigrator migrator;
+        saveload::RecoveryPipeline pipeline{src, MakeBuild(compat, world), migrator, target};
+        return pipeline.Recover(7, AllSinks(sinks));
+    }
+} // namespace
+
+// --- Corrupted / checksum / truncated saves are value outcomes, nothing applied
+TEST(SaveLoadHardeningStep16, StructuralFailuresApplyNothing)
+{
+    const auto valid = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+
+    {
+        saveload::RecordingRestoreSinks sinks;
+        auto report = RecoverBytes({0x00u, 0x01u, 0x02u, 0x03u}, sinks); // garbage
+        EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::CorruptedSave);
+        EXPECT_TRUE(sinks.worlds.empty());
+    }
+    {
+        saveload::RecordingRestoreSinks sinks;
+        auto bytes = valid;
+        bytes[20] ^= 0x01u; // flip a body byte -> checksum
+        auto report = RecoverBytes(bytes, sinks);
+        EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::ChecksumFailure);
+        EXPECT_TRUE(sinks.entities.empty());
+    }
+    {
+        saveload::RecordingRestoreSinks sinks;
+        auto bytes = valid;
+        bytes.resize(bytes.size() / 2); // truncated
+        auto report = RecoverBytes(bytes, sinks);
+        EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::CorruptedSave);
+        EXPECT_TRUE(sinks.worlds.empty());
+    }
+}
+
+// --- Version mismatch / integrity failure / unsupported migration -------------
+TEST(SaveLoadHardeningStep16, SemanticFailuresApplyNothing)
+{
+    // Version mismatch: build compatibility differs from the save's build version.
+    {
+        saveload::RecordingRestoreSinks sinks;
+        auto report = RecoverBytes(saveload::SaveWriter::Serialize(MakeView(), MakeMetadata()), sinks,
+                                   /*compat*/ 4);
+        EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::VersionMismatch);
+        EXPECT_TRUE(sinks.worlds.empty());
+    }
+    // Integrity failure: metadata counts disagree with the records.
+    {
+        persistence::SaveMetadata bad = MakeMetadata();
+        bad.entityCount = 9; // real entities = 2
+        saveload::RecordingRestoreSinks sinks;
+        auto report = RecoverBytes(saveload::SaveWriter::Serialize(MakeView(), bad), sinks);
+        EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::IntegrityFailure);
+        EXPECT_TRUE(sinks.worlds.empty());
+    }
+    // Unsupported migration: target version beyond any registered path.
+    {
+        saveload::RecordingRestoreSinks sinks;
+        auto report = RecoverBytes(saveload::SaveWriter::Serialize(MakeView(), MakeMetadata()), sinks,
+                                   /*compat*/ 3, /*world*/ 7, /*target*/ 5);
+        EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::VersionUnsupported);
+        EXPECT_TRUE(sinks.worlds.empty());
+    }
+}
+
+// --- Deterministic replay: identical recovery yields identical results --------
+TEST(SaveLoadHardeningStep16, DeterministicRecovery)
+{
+    const auto bytes = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+
+    saveload::RecordingRestoreSinks a;
+    saveload::RecordingRestoreSinks b;
+    const auto ra = RecoverBytes(bytes, a);
+    const auto rb = RecoverBytes(bytes, b);
+
+    EXPECT_EQ(ra.outcome, rb.outcome);
+    EXPECT_EQ(ra.entitiesRestored, rb.entitiesRestored);
+    EXPECT_EQ(ra.playersRestored, rb.playersRestored);
+    EXPECT_EQ(ra.reachedPhase, rb.reachedPhase);
+    ASSERT_EQ(a.entities.size(), b.entities.size());
+    for (std::size_t i = 0; i < a.entities.size(); ++i)
+    {
+        EXPECT_EQ(a.entities[i].id.value, b.entities[i].id.value);
+    }
+    EXPECT_EQ(a.schedulers.size(), b.schedulers.size());
 }
