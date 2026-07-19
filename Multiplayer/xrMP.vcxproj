@@ -145,6 +145,7 @@
     <ClCompile Include="src\persistence\PersistenceConfiguration.cpp" />
     <ClCompile Include="src\persistence\SaveMetadataBuilder.cpp" />
     <ClCompile Include="src\persistence\ValidationFramework.cpp" />
+    <ClCompile Include="src\persistence\InMemoryPersistenceStore.cpp" />
     <ClCompile Include="src\prediction\PredictionManager.cpp" />
     <ClCompile Include="src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="src\prediction\InterpolationManager.cpp" />
@@ -321,6 +322,10 @@
     <ClInclude Include="include\stalkermp\persistence\SaveMetadataBuilder.h" />
     <ClInclude Include="include\stalkermp\persistence\PersistenceSnapshot.h" />
     <ClInclude Include="include\stalkermp\persistence\ValidationFramework.h" />
+    <ClInclude Include="include\stalkermp\persistence\PersistenceQueue.h" />
+    <ClInclude Include="include\stalkermp\persistence\IPersistenceStore.h" />
+    <ClInclude Include="include\stalkermp\persistence\NullPersistenceStore.h" />
+    <ClInclude Include="include\stalkermp\persistence\InMemoryPersistenceStore.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />

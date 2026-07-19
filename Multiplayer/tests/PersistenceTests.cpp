@@ -11,7 +11,11 @@
 #include <vector>
 
 #include "stalkermp/core/Config.h"
+#include "stalkermp/persistence/InMemoryPersistenceStore.h"
+#include "stalkermp/persistence/IPersistenceStore.h"
+#include "stalkermp/persistence/NullPersistenceStore.h"
 #include "stalkermp/persistence/PersistenceConfiguration.h"
+#include "stalkermp/persistence/PersistenceQueue.h"
 #include "stalkermp/persistence/PersistenceSnapshot.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
 #include "stalkermp/persistence/SaveMetadataBuilder.h"
@@ -723,4 +727,215 @@ TEST(ValidationStep6, DeterministicAndNonMutating)
     // Inputs unchanged by validation.
     EXPECT_EQ(v.m_metadata.entityCount, 2u);
     EXPECT_EQ(v.m_metadata.state, snapshot::SnapshotState::Finalized);
+}
+
+// ============================================================================
+// Step 7 — PersistenceQueue
+// ============================================================================
+
+namespace
+{
+    persistence::PersistenceConfiguration QueueConfig(std::uint32_t depth, std::uint32_t high, std::uint32_t low)
+    {
+        persistence::PersistenceConfiguration c{};
+        c.queueDepth = depth;
+        c.backpressureHighWatermark = high;
+        c.backpressureLowWatermark = low;
+        return c;
+    }
+} // namespace
+
+// --- FIFO publish / acquire / release ordering --------------------------------
+TEST(PersistenceQueueStep7, FifoOrder)
+{
+    persistence::PersistenceQueue q{QueueConfig(4, 0, 0)};
+    EXPECT_TRUE(q.Empty());
+    EXPECT_EQ(q.Publish(MakeRequest(1, 10)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Publish(MakeRequest(2, 20)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Publish(MakeRequest(3, 30)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Size(), 3u);
+
+    ASSERT_NE(q.Acquire(), nullptr);
+    EXPECT_EQ(q.Acquire()->id, 1u); // front, not removed
+    EXPECT_EQ(q.Acquire()->id, 1u);
+    q.Release();
+    EXPECT_EQ(q.Acquire()->id, 2u);
+    q.Release();
+    EXPECT_EQ(q.Acquire()->id, 3u);
+    q.Release();
+    EXPECT_TRUE(q.Empty());
+    EXPECT_EQ(q.Acquire(), nullptr);
+    EXPECT_EQ(q.PublishedCount(), 3u);
+    EXPECT_EQ(q.MaxDepth(), 3u);
+}
+
+// --- Overflow is a value outcome leaving the queue unchanged ------------------
+TEST(PersistenceQueueStep7, OverflowLeavesStateUnchanged)
+{
+    persistence::PersistenceQueue q{QueueConfig(2, 0, 0)};
+    EXPECT_EQ(q.Publish(MakeRequest(1, 10)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Publish(MakeRequest(2, 20)), persistence::PersistenceOutcome::Ok);
+    EXPECT_TRUE(q.Full());
+
+    EXPECT_EQ(q.Publish(MakeRequest(3, 30)), persistence::PersistenceOutcome::QueueFull);
+    EXPECT_EQ(q.Size(), 2u);            // unchanged
+    EXPECT_EQ(q.Acquire()->id, 1u);     // front unchanged
+    EXPECT_EQ(q.OverflowCount(), 1u);
+
+    // After a release, publishing succeeds again (ring reuse).
+    q.Release();
+    EXPECT_EQ(q.Publish(MakeRequest(3, 30)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Size(), 2u);
+}
+
+// --- Retry re-enqueues (bounded) and is counted separately --------------------
+TEST(PersistenceQueueStep7, RetryReenqueuesAndCounts)
+{
+    persistence::PersistenceQueue q{QueueConfig(3, 0, 0)};
+    EXPECT_EQ(q.Publish(MakeRequest(1, 10)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Retry(MakeRequest(1, 10)), persistence::PersistenceOutcome::Ok); // re-enqueued
+    EXPECT_EQ(q.Size(), 2u);
+    EXPECT_EQ(q.RetryCount(), 1u);
+    EXPECT_EQ(q.PublishedCount(), 1u); // retry is not a publish
+
+    // Retry is bounded by capacity.
+    EXPECT_EQ(q.Publish(MakeRequest(2, 20)), persistence::PersistenceOutcome::Ok);
+    EXPECT_TRUE(q.Full());
+    EXPECT_EQ(q.Retry(MakeRequest(1, 10)), persistence::PersistenceOutcome::QueueFull);
+    EXPECT_EQ(q.Size(), 3u);
+}
+
+// --- Back-pressure hysteresis: engage at high, release at low ------------------
+TEST(PersistenceQueueStep7, BackpressureHysteresis)
+{
+    persistence::PersistenceQueue q{QueueConfig(8, /*high*/ 4, /*low*/ 2)};
+    EXPECT_FALSE(q.IsBackpressured());
+
+    for (std::uint64_t i = 1; i <= 3; ++i)
+    {
+        EXPECT_EQ(q.Publish(MakeRequest(i, i * 10)), persistence::PersistenceOutcome::Ok);
+    }
+    EXPECT_FALSE(q.IsBackpressured());        // depth 3 < high 4
+
+    EXPECT_EQ(q.Publish(MakeRequest(4, 40)), persistence::PersistenceOutcome::Ok);
+    EXPECT_TRUE(q.IsBackpressured());         // depth 4 >= high -> engaged
+
+    q.Release();                              // depth 3 (> low, still engaged)
+    EXPECT_TRUE(q.IsBackpressured());
+    q.Release();                              // depth 2 <= low -> released
+    EXPECT_FALSE(q.IsBackpressured());
+}
+
+// --- High watermark 0 disables back-pressure ----------------------------------
+TEST(PersistenceQueueStep7, BackpressureDisabledWhenHighZero)
+{
+    persistence::PersistenceQueue q{QueueConfig(4, 0, 0)};
+    for (std::uint64_t i = 1; i <= 4; ++i)
+    {
+        EXPECT_EQ(q.Publish(MakeRequest(i, i)), persistence::PersistenceOutcome::Ok);
+    }
+    EXPECT_TRUE(q.Full());
+    EXPECT_FALSE(q.IsBackpressured()); // never engages when high == 0
+}
+
+// ============================================================================
+// Step 8 — IPersistenceStore (in-memory + null)
+// ============================================================================
+
+// --- In-memory: begin -> write -> commit records a save -----------------------
+TEST(PersistenceStoreStep8, InMemoryCommitRecordsSave)
+{
+    persistence::InMemoryPersistenceStore store;
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+    const auto meta = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, 7);
+
+    auto begin = store.Begin(meta);
+    ASSERT_TRUE(begin.HasValue());
+    const persistence::StoreHandle handle = begin.Value();
+    EXPECT_TRUE(handle.IsValid());
+    EXPECT_EQ(store.PendingCount(), 1u);
+
+    EXPECT_EQ(store.Write(handle, snap), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(store.Commit(handle), persistence::PersistenceOutcome::Ok);
+
+    EXPECT_EQ(store.CommittedCount(), 1u);
+    EXPECT_EQ(store.PendingCount(), 0u);
+    EXPECT_EQ(store.LastCommitted().saveId, 7u);
+    EXPECT_EQ(store.LastCommitted().checksum, meta.checksum);
+}
+
+// --- Abort discards the transaction; the previous save is retained ------------
+TEST(PersistenceStoreStep8, AbortRetainsPrevious)
+{
+    persistence::InMemoryPersistenceStore store;
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+
+    // Commit a first save (the "previous").
+    auto b1 = store.Begin(persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, 1));
+    ASSERT_TRUE(b1.HasValue());
+    EXPECT_EQ(store.Write(b1.Value(), snap), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(store.Commit(b1.Value()), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(store.CommittedCount(), 1u);
+
+    // Begin + abort a second save.
+    auto b2 = store.Begin(persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Autosave, 2));
+    ASSERT_TRUE(b2.HasValue());
+    store.Abort(b2.Value());
+
+    EXPECT_EQ(store.PendingCount(), 0u);
+    EXPECT_EQ(store.CommittedCount(), 1u);         // previous retained
+    EXPECT_EQ(store.LastCommitted().saveId, 1u);   // still the first save
+}
+
+// --- Storage unavailable: Begin fails; write failure => StorageUnavailable -----
+TEST(PersistenceStoreStep8, FailureModes)
+{
+    persistence::InMemoryPersistenceStore store;
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+    const auto meta = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Shutdown, 5);
+
+    // Unavailable backend -> Begin errors, nothing recorded.
+    store.SetAvailable(false);
+    EXPECT_FALSE(store.Begin(meta).HasValue());
+    EXPECT_EQ(store.PendingCount(), 0u);
+    EXPECT_EQ(store.CommittedCount(), 0u);
+
+    // Available again, but writes fail -> StorageUnavailable; commit cannot proceed.
+    store.SetAvailable(true);
+    store.SetFailWrites(true);
+    auto begin = store.Begin(meta);
+    ASSERT_TRUE(begin.HasValue());
+    EXPECT_EQ(store.Write(begin.Value(), snap), persistence::PersistenceOutcome::StorageUnavailable);
+    EXPECT_EQ(store.Commit(begin.Value()), persistence::PersistenceOutcome::IncompleteSnapshot); // nothing written
+    EXPECT_EQ(store.CommittedCount(), 0u);
+
+    // Unknown handle is a value outcome, not a crash.
+    EXPECT_EQ(store.Write(persistence::StoreHandle{9999}, snap), persistence::PersistenceOutcome::StorageUnavailable);
+    EXPECT_EQ(store.Commit(persistence::StoreHandle{9999}), persistence::PersistenceOutcome::StorageUnavailable);
+    store.Abort(persistence::StoreHandle{9999}); // benign
+}
+
+// --- Null store: accepts and discards everything, records nothing --------------
+TEST(PersistenceStoreStep8, NullStoreInert)
+{
+    persistence::NullPersistenceStore store;
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+    const auto meta = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, 3);
+
+    auto begin = store.Begin(meta);
+    ASSERT_TRUE(begin.HasValue());
+    EXPECT_TRUE(begin.Value().IsValid());
+    EXPECT_EQ(store.Write(begin.Value(), snap), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(store.Commit(begin.Value()), persistence::PersistenceOutcome::Ok);
+    store.Abort(begin.Value()); // benign
+
+    // Consume through the interface to confirm the seam is polymorphic.
+    persistence::IPersistenceStore& seam = store;
+    auto b2 = seam.Begin(meta);
+    ASSERT_TRUE(b2.HasValue());
+    EXPECT_EQ(seam.Commit(b2.Value()), persistence::PersistenceOutcome::Ok);
 }
