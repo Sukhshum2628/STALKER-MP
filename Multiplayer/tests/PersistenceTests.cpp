@@ -17,8 +17,13 @@
 #include "stalkermp/persistence/PersistenceConfiguration.h"
 #include "stalkermp/persistence/PersistenceQueue.h"
 #include "stalkermp/persistence/PersistenceSnapshot.h"
+#include "stalkermp/persistence/PersistenceManager.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
 #include "stalkermp/persistence/PersistenceWorker.h"
+#include "stalkermp/persistence/SaveScheduler.h"
+#include "stalkermp/snapshot/SimulationSnapshot.h"
+#include "stalkermp/snapshot/SnapshotPool.h"
+#include "stalkermp/snapshot/SnapshotQueue.h"
 #include "stalkermp/persistence/SaveMetadataBuilder.h"
 #include "stalkermp/persistence/ValidationFramework.h"
 #include "stalkermp/persistence/VersionManager.h"
@@ -1110,4 +1115,267 @@ TEST(PersistenceWorkerStep9, Deterministic)
     EXPECT_EQ(sa.LastCommitted().checksum, sb.LastCommitted().checksum);
     EXPECT_EQ(wa.CompletedCount(), wb.CompletedCount());
     EXPECT_EQ(wa.ProcessedCount(), wb.ProcessedCount());
+}
+
+// ============================================================================
+// Step 10 — SaveScheduler
+// ============================================================================
+
+namespace
+{
+    persistence::PersistenceConfiguration SchedConfig(std::uint32_t autosaveInterval)
+    {
+        persistence::PersistenceConfiguration c{};
+        c.autosaveIntervalTicks = autosaveInterval;
+        return c;
+    }
+} // namespace
+
+// --- Autosave cadence: one autosave every interval ticks (from arm) -----------
+TEST(SaveSchedulerStep10, AutosaveCadence)
+{
+    persistence::SaveScheduler s{SchedConfig(5)};
+    EXPECT_FALSE(s.Tick(0).has_value()); // arms baseline at 0
+    for (std::uint64_t t = 1; t <= 4; ++t)
+    {
+        EXPECT_FALSE(s.Tick(t).has_value());
+    }
+    auto a = s.Tick(5); // 5 - 0 >= 5
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->trigger, persistence::SaveTrigger::Autosave);
+    EXPECT_EQ(a->requestTick, 5u);
+
+    for (std::uint64_t t = 6; t <= 9; ++t)
+    {
+        EXPECT_FALSE(s.Tick(t).has_value());
+    }
+    auto b = s.Tick(10);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->trigger, persistence::SaveTrigger::Autosave);
+    EXPECT_GT(b->id, a->id); // monotonic ids
+}
+
+// --- Autosave disabled when interval is 0 -------------------------------------
+TEST(SaveSchedulerStep10, AutosaveDisabledWhenZero)
+{
+    persistence::SaveScheduler s{SchedConfig(0)};
+    for (std::uint64_t t = 0; t <= 100; ++t)
+    {
+        EXPECT_FALSE(s.Tick(t).has_value());
+    }
+    EXPECT_EQ(s.EmittedCount(), 0u);
+}
+
+// --- Priority order: Shutdown > Administrative > Manual, one per tick ----------
+TEST(SaveSchedulerStep10, PriorityOrder)
+{
+    persistence::SaveScheduler s{SchedConfig(0)};
+    s.RequestManual();
+    s.RequestAdministrative();
+    s.RequestShutdown();
+    EXPECT_TRUE(s.HasPending());
+
+    auto a = s.Tick(1);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->trigger, persistence::SaveTrigger::Shutdown);
+    auto b = s.Tick(2);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->trigger, persistence::SaveTrigger::Administrative);
+    auto c = s.Tick(3);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->trigger, persistence::SaveTrigger::Manual);
+    EXPECT_FALSE(s.Tick(4).has_value());
+    EXPECT_FALSE(s.HasPending());
+}
+
+// --- Deferred fires on the first tick at/after untilTick ----------------------
+TEST(SaveSchedulerStep10, DeferredFiresAtTick)
+{
+    persistence::SaveScheduler s{SchedConfig(0)};
+    s.Defer(10);
+    EXPECT_FALSE(s.Tick(5).has_value());  // before untilTick
+    EXPECT_FALSE(s.Tick(9).has_value());
+    auto d = s.Tick(10);                  // due
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->trigger, persistence::SaveTrigger::Deferred);
+    EXPECT_FALSE(s.Tick(11).has_value()); // consumed
+}
+
+// --- A manual save suppresses autosave that tick; autosave fires next tick ------
+TEST(SaveSchedulerStep10, ManualSuppressesAutosaveSameTick)
+{
+    persistence::SaveScheduler s{SchedConfig(3)};
+    EXPECT_FALSE(s.Tick(0).has_value()); // arm at 0
+    s.RequestManual();
+    auto m = s.Tick(3); // both manual and autosave due; manual wins
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->trigger, persistence::SaveTrigger::Manual);
+    auto a = s.Tick(4); // autosave now emitted (still overdue)
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->trigger, persistence::SaveTrigger::Autosave);
+}
+
+// --- Deterministic emission for a given tick sequence -------------------------
+TEST(SaveSchedulerStep10, DeterministicEmission)
+{
+    persistence::SaveScheduler a{SchedConfig(4)};
+    persistence::SaveScheduler b{SchedConfig(4)};
+    for (std::uint64_t t = 0; t <= 20; ++t)
+    {
+        const auto ra = a.Tick(t);
+        const auto rb = b.Tick(t);
+        EXPECT_EQ(ra.has_value(), rb.has_value());
+        if (ra.has_value() && rb.has_value())
+        {
+            EXPECT_EQ(ra->trigger, rb->trigger);
+            EXPECT_EQ(ra->id, rb->id);
+            EXPECT_EQ(ra->requestTick, rb->requestTick);
+        }
+    }
+    EXPECT_EQ(a.EmittedCount(), b.EmittedCount());
+}
+
+// ============================================================================
+// Step 11 — PersistenceManager
+// ============================================================================
+
+namespace
+{
+    persistence::PersistenceConfiguration ManagerConfig(std::uint32_t queueDepth, std::uint32_t autosaveInterval)
+    {
+        persistence::PersistenceConfiguration c{};
+        c.queueDepth = queueDepth;
+        c.autosaveIntervalTicks = autosaveInterval;
+        c.backpressureHighWatermark = 0; // disabled for these tests
+        c.backpressureLowWatermark = 0;
+        return c;
+    }
+
+    // A composed rig: a pool + queue with (optionally) a published finalized
+    // snapshot, an in-memory store, and the manager under test.
+    struct PersistRig
+    {
+        snapshot::SnapshotPool pool;
+        snapshot::SnapshotQueue queue{pool};
+        persistence::InMemoryPersistenceStore store;
+        persistence::PersistenceManager manager;
+
+        explicit PersistRig(const persistence::PersistenceConfiguration& cfg) : manager(cfg, queue, store)
+        {
+            pool.Reserve(4);
+        }
+
+        void PublishSnapshot(std::uint64_t tick)
+        {
+            auto acq = pool.Acquire();
+            snapshot::SimulationSnapshot* s = acq.Value();
+            s->BeginBuild(snapshot::SnapshotId{1}, tick, /*version*/ 1);
+            snapshot::EntitySnapshot e{};
+            e.id = world::EntityId{1};
+            e.position = world::Vec3{1.0f, 0.0f, 0.0f};
+            (void)s->AddEntity(e);
+            (void)s->Finalize();
+            (void)queue.Publish(s);
+        }
+    };
+} // namespace
+
+// --- Manual request is serviced and committed on the next Tick ----------------
+TEST(PersistenceManagerStep11, ManualRequestPersists)
+{
+    PersistRig rig{ManagerConfig(8, 0)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(100);
+
+    EXPECT_EQ(rig.manager.RequestSave(persistence::SaveTrigger::Manual), persistence::PersistenceOutcome::Ok);
+    rig.manager.Tick(0.016); // scheduler emits manual -> enqueue -> acquire -> flush -> commit
+
+    EXPECT_EQ(rig.store.CommittedCount(), 1u);
+    EXPECT_EQ(rig.store.LastCommitted().simulationTick, 100u);
+    const auto stats = rig.manager.Statistics();
+    EXPECT_EQ(stats.completedSaves, 1u);
+    EXPECT_EQ(stats.saveRequests, 1u);
+    EXPECT_EQ(rig.manager.Ticks(), 1u);
+}
+
+// --- Autosave cadence commits saves over successive Ticks ---------------------
+TEST(PersistenceManagerStep11, AutosaveOverTicks)
+{
+    PersistRig rig{ManagerConfig(8, /*autosave*/ 2)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(50);
+
+    for (int i = 0; i < 6; ++i)
+    {
+        rig.manager.Tick(0.016); // ticks 1..6; arm at 1 -> autosave at 3 and 5
+    }
+    const auto stats = rig.manager.Statistics();
+    EXPECT_EQ(stats.autosaves, 2u);
+    EXPECT_EQ(stats.completedSaves, 2u);
+    EXPECT_EQ(rig.store.CommittedCount(), 2u);
+}
+
+// --- Without a published snapshot, requests wait; commit once one arrives ------
+TEST(PersistenceManagerStep11, WaitsForSnapshot)
+{
+    PersistRig rig{ManagerConfig(8, 0)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+
+    EXPECT_EQ(rig.manager.RequestSave(persistence::SaveTrigger::Manual), persistence::PersistenceOutcome::Ok);
+    rig.manager.Tick(0.016); // manual enqueued, but no snapshot -> not persisted yet
+    EXPECT_EQ(rig.store.CommittedCount(), 0u);
+    EXPECT_EQ(rig.manager.QueueDepth(), 1u);
+
+    rig.PublishSnapshot(200);
+    rig.manager.Tick(0.016); // snapshot available -> queued request drains + commits
+    EXPECT_EQ(rig.store.CommittedCount(), 1u);
+    EXPECT_EQ(rig.manager.QueueDepth(), 0u);
+}
+
+// --- Non-caller-initiated triggers are rejected by RequestSave ----------------
+TEST(PersistenceManagerStep11, RequestSaveRejectsPeriodicTriggers)
+{
+    PersistRig rig{ManagerConfig(8, 5)};
+    EXPECT_EQ(rig.manager.RequestSave(persistence::SaveTrigger::Autosave),
+              persistence::PersistenceOutcome::NothingToPersist);
+    EXPECT_EQ(rig.manager.RequestSave(persistence::SaveTrigger::Deferred),
+              persistence::PersistenceOutcome::NothingToPersist);
+}
+
+// --- Deterministic: two rigs with identical inputs commit identically ---------
+TEST(PersistenceManagerStep11, Deterministic)
+{
+    auto drive = [](PersistRig& rig) {
+        (void)rig.manager.Initialize();
+        rig.PublishSnapshot(77);
+        (void)rig.manager.RequestSave(persistence::SaveTrigger::Manual);
+        for (int i = 0; i < 4; ++i)
+        {
+            rig.manager.Tick(0.016);
+        }
+    };
+
+    PersistRig a{ManagerConfig(8, 3)};
+    PersistRig b{ManagerConfig(8, 3)};
+    drive(a);
+    drive(b);
+
+    ASSERT_EQ(a.store.CommittedCount(), b.store.CommittedCount());
+    EXPECT_GT(a.store.CommittedCount(), 0u);
+    EXPECT_EQ(a.store.LastCommitted().checksum, b.store.LastCommitted().checksum);
+    EXPECT_EQ(a.manager.Statistics().completedSaves, b.manager.Statistics().completedSaves);
+    EXPECT_EQ(a.manager.Statistics().autosaves, b.manager.Statistics().autosaves);
+}
+
+// --- Shutdown stops the worker (no further commits) ---------------------------
+TEST(PersistenceManagerStep11, ShutdownStopsWorker)
+{
+    PersistRig rig{ManagerConfig(8, 0)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(10);
+
+    rig.manager.Shutdown(); // stop the synchronous worker
+    (void)rig.manager.RequestSave(persistence::SaveTrigger::Manual);
+    rig.manager.Tick(0.016); // worker stopped -> Flush returns WorkerUnavailable, nothing commits
+    EXPECT_EQ(rig.store.CommittedCount(), 0u);
 }
