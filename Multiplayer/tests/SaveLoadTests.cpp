@@ -16,8 +16,10 @@
 #include "stalkermp/saveload/SaveLoadConfiguration.h"
 #include "stalkermp/saveload/SaveLoadTypes.h"
 #include "stalkermp/saveload/InMemorySaveSource.h"
+#include "stalkermp/saveload/IRestoreSinks.h"
 #include "stalkermp/saveload/ISaveSource.h"
 #include "stalkermp/saveload/NullSaveSource.h"
+#include "stalkermp/saveload/RecordingRestoreSinks.h"
 #include "stalkermp/saveload/SaveIntegrityValidator.h"
 #include "stalkermp/saveload/SaveMigrator.h"
 #include "stalkermp/saveload/SaveReader.h"
@@ -971,4 +973,97 @@ TEST(PlatformSaveStoreStep9, CommitWithoutWriteRejected)
 TEST(PlatformSaveStoreStep9, EmptyTokenRejected)
 {
     EXPECT_FALSE(adapters::CreatePlatformSaveBackend("").HasValue());
+}
+
+// ============================================================================
+// Step 10 — Restore-sink seams (engine write boundary) + recording double
+// ============================================================================
+
+// --- Each seam applies its record and records the applied value ---------------
+TEST(RestoreSinksStep10, RecordsAppliedValuesThroughSeams)
+{
+    saveload::RecordingRestoreSinks sinks;
+
+    // Consume through the engine-free interface references (polymorphic seams).
+    saveload::IWorldRestoreSink& world = sinks;
+    saveload::IEnvironmentRestoreSink& env = sinks;
+    saveload::IEntityRestoreSink& entity = sinks;
+    saveload::IPlayerRestoreSink& player = sinks;
+    saveload::IAlifeRestoreSink& alife = sinks;
+    saveload::ISchedulerRestoreSink& scheduler = sinks;
+
+    saveload::WorldRestoreRecord w{};
+    w.simulationTick = 4200;
+    w.weatherId = 3;
+    EXPECT_EQ(world.Apply(w), saveload::SaveLoadOutcome::Ok);
+
+    saveload::EnvironmentRestoreRecord e{};
+    e.environmentVersion = 7;
+    EXPECT_EQ(env.Apply(e), saveload::SaveLoadOutcome::Ok);
+
+    saveload::EntityRestoreRecord en{};
+    en.id = world::EntityId{5};
+    en.position = world::Vec3{1.0f, 2.0f, 3.0f};
+    EXPECT_EQ(entity.Apply(en), saveload::SaveLoadOutcome::Ok);
+
+    saveload::PlayerRestoreRecord p{};
+    p.id = player::PlayerId{9};
+    p.connectionState = player::PlayerConnectionState::Suspended;
+    EXPECT_EQ(player.Apply(p), saveload::SaveLoadOutcome::Ok);
+
+    saveload::AlifeRestoreRecord a{};
+    a.smartTerrainId = 11;
+    EXPECT_EQ(alife.Apply(a), saveload::SaveLoadOutcome::Ok);
+
+    saveload::SchedulerRestoreRecord s{};
+    s.simulationTick = 4200;
+    EXPECT_EQ(scheduler.Apply(s), saveload::SaveLoadOutcome::Ok);
+
+    // The recording double captured every applied record with its values.
+    ASSERT_EQ(sinks.worlds.size(), 1u);
+    EXPECT_EQ(sinks.worlds[0].simulationTick, 4200u);
+    EXPECT_EQ(sinks.worlds[0].weatherId, 3u);
+    ASSERT_EQ(sinks.environments.size(), 1u);
+    EXPECT_EQ(sinks.environments[0].environmentVersion, 7u);
+    ASSERT_EQ(sinks.entities.size(), 1u);
+    EXPECT_EQ(sinks.entities[0].id.value, 5u);
+    EXPECT_FLOAT_EQ(sinks.entities[0].position.y, 2.0f);
+    ASSERT_EQ(sinks.players.size(), 1u);
+    EXPECT_EQ(sinks.players[0].id.value, 9u);
+    EXPECT_EQ(sinks.players[0].connectionState, player::PlayerConnectionState::Suspended);
+    ASSERT_EQ(sinks.alife.size(), 1u);
+    EXPECT_EQ(sinks.alife[0].smartTerrainId, 11u);
+    ASSERT_EQ(sinks.schedulers.size(), 1u);
+    EXPECT_EQ(sinks.schedulers[0].simulationTick, 4200u);
+}
+
+// --- A forced failure outcome is returned by every seam -----------------------
+TEST(RestoreSinksStep10, ForcedOutcomePropagates)
+{
+    saveload::RecordingRestoreSinks sinks;
+    sinks.SetOutcome(saveload::SaveLoadOutcome::IntegrityFailure);
+
+    EXPECT_EQ(sinks.Apply(saveload::WorldRestoreRecord{}), saveload::SaveLoadOutcome::IntegrityFailure);
+    EXPECT_EQ(sinks.Apply(saveload::EntityRestoreRecord{}), saveload::SaveLoadOutcome::IntegrityFailure);
+    EXPECT_EQ(sinks.Apply(saveload::SchedulerRestoreRecord{}), saveload::SaveLoadOutcome::IntegrityFailure);
+
+    // Records are still captured (the double observes attempts regardless of outcome).
+    EXPECT_EQ(sinks.worlds.size(), 1u);
+    EXPECT_EQ(sinks.entities.size(), 1u);
+    EXPECT_EQ(sinks.schedulers.size(), 1u);
+}
+
+// --- Clear resets the recorded state; the input records are never mutated ------
+TEST(RestoreSinksStep10, ClearAndNonMutating)
+{
+    saveload::RecordingRestoreSinks sinks;
+    saveload::EntityRestoreRecord en{};
+    en.id = world::EntityId{7};
+    EXPECT_EQ(sinks.Apply(en), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(en.id.value, 7u); // the source record is unchanged by Apply
+
+    EXPECT_EQ(sinks.entities.size(), 1u);
+    sinks.Clear();
+    EXPECT_TRUE(sinks.entities.empty());
+    EXPECT_TRUE(sinks.worlds.empty());
 }
