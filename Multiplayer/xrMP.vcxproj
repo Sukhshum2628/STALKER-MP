@@ -152,6 +152,9 @@
     <ClCompile Include="src\saveload\SaveLoadConfiguration.cpp" />
     <ClCompile Include="src\saveload\SaveWriter.cpp" />
     <ClCompile Include="src\saveload\SaveReader.cpp" />
+    <ClCompile Include="src\saveload\SaveIntegrityValidator.cpp" />
+    <ClCompile Include="src\saveload\SaveMigrator.cpp" />
+    <ClCompile Include="src\saveload\InMemorySaveSource.cpp" />
     <ClCompile Include="src\prediction\PredictionManager.cpp" />
     <ClCompile Include="src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="src\prediction\InterpolationManager.cpp" />
@@ -342,6 +345,11 @@
     <ClInclude Include="include\stalkermp\saveload\SaveFormat.h" />
     <ClInclude Include="include\stalkermp\saveload\SaveWriter.h" />
     <ClInclude Include="include\stalkermp\saveload\SaveReader.h" />
+    <ClInclude Include="include\stalkermp\saveload\SaveIntegrityValidator.h" />
+    <ClInclude Include="include\stalkermp\saveload\SaveMigrator.h" />
+    <ClInclude Include="include\stalkermp\saveload\ISaveSource.h" />
+    <ClInclude Include="include\stalkermp\saveload\NullSaveSource.h" />
+    <ClInclude Include="include\stalkermp\saveload\InMemorySaveSource.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />

@@ -15,6 +15,11 @@
 #include "stalkermp/saveload/SaveFormat.h"
 #include "stalkermp/saveload/SaveLoadConfiguration.h"
 #include "stalkermp/saveload/SaveLoadTypes.h"
+#include "stalkermp/saveload/InMemorySaveSource.h"
+#include "stalkermp/saveload/ISaveSource.h"
+#include "stalkermp/saveload/NullSaveSource.h"
+#include "stalkermp/saveload/SaveIntegrityValidator.h"
+#include "stalkermp/saveload/SaveMigrator.h"
 #include "stalkermp/saveload/SaveReader.h"
 #include "stalkermp/saveload/SaveWriter.h"
 #include "stalkermp/snapshot/ISnapshotView.h"
@@ -461,7 +466,7 @@ namespace
         e1.velocity = world::Vec3{0.25f, 0.0f, 0.0f};
         e1.state = 11u;
         e1.flags = 22u;
-        e1.inventoryRef = world::EntityId{5};
+        e1.inventoryRef = world::EntityId{2}; // references entity 2 (present -> reference-valid)
         e1.runtimeState = 0xABCDEF01u;
         snapshot::EntitySnapshot e2{};
         e2.id = world::EntityId{2};
@@ -582,7 +587,7 @@ TEST(SaveReaderStep5, RoundTrip)
     EXPECT_FLOAT_EQ(s.entities[0].velocity.x, 0.25f);
     EXPECT_EQ(s.entities[0].stateFlags, 11u);
     EXPECT_EQ(s.entities[0].runtimeFlags, 22u);
-    EXPECT_EQ(s.entities[0].inventoryRef.value, 5u);
+    EXPECT_EQ(s.entities[0].inventoryRef.value, 2u);
     EXPECT_EQ(s.entities[0].runtimeState, 0xABCDEF01u);
     EXPECT_EQ(s.entities[1].id.value, 2u);
     EXPECT_FLOAT_EQ(s.entities[1].position.x, 100.0f);
@@ -656,4 +661,231 @@ TEST(SaveReaderStep5, EmptyWorldRoundTrip)
     EXPECT_TRUE(result.save.entities.empty());
     EXPECT_TRUE(result.save.players.empty());
     EXPECT_TRUE(result.save.alife.empty());
+}
+
+// ============================================================================
+// Batch-3 shared helpers
+// ============================================================================
+
+namespace
+{
+    // A valid LoadedSave obtained by round-tripping the writer/reader (Ok).
+    saveload::LoadedSave MakeLoadedSave()
+    {
+        const auto bytes = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+        return saveload::SaveReader::Parse(bytes).save;
+    }
+
+    persistence::VersionManager MakeBuild(std::uint32_t compatibility, std::uint32_t world)
+    {
+        persistence::VersionSet vs{};
+        vs.world = world;
+        vs.compatibility = compatibility;
+        return persistence::VersionManager{vs};
+    }
+
+    // Non-capturing migration steps (convertible to SaveMigrator::StepFn).
+    saveload::SaveLoadOutcome BumpTo4(saveload::LoadedSave& s)
+    {
+        s.metadata.buildVersion = 4u;
+        return saveload::SaveLoadOutcome::Ok;
+    }
+    saveload::SaveLoadOutcome BumpTo5(saveload::LoadedSave& s)
+    {
+        s.metadata.buildVersion = 5u;
+        return saveload::SaveLoadOutcome::Ok;
+    }
+    saveload::SaveLoadOutcome FailingStep(saveload::LoadedSave&)
+    {
+        return saveload::SaveLoadOutcome::IntegrityFailure;
+    }
+
+    saveload::SaveDescriptor MakeDescriptor(std::uint64_t saveId, std::uint32_t generation)
+    {
+        saveload::SaveDescriptor d{};
+        d.saveId = saveId;
+        d.generation = generation;
+        d.metadata.saveId = saveId;
+        return d;
+    }
+} // namespace
+
+// ============================================================================
+// Step 6 — SaveIntegrityValidator
+// ============================================================================
+
+// --- A valid save passes every validator --------------------------------------
+TEST(IntegrityStep6, ValidSavePasses)
+{
+    const saveload::LoadedSave save = MakeLoadedSave();
+    const persistence::VersionManager build = MakeBuild(/*compat*/ 3, /*world*/ 7);
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateCounts(save), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateRegistry(save), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateReferences(save), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateVersion(build, save), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(saveload::SaveIntegrityValidator::Validate(build, save), saveload::SaveLoadOutcome::Ok);
+}
+
+// --- Count mismatch => IntegrityFailure ---------------------------------------
+TEST(IntegrityStep6, CountMismatch)
+{
+    saveload::LoadedSave save = MakeLoadedSave();
+    save.metadata.entityCount = 99u; // disagrees with entities.size()
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateCounts(save), saveload::SaveLoadOutcome::IntegrityFailure);
+}
+
+// --- Registry integrity: none id / duplicate / regress => IntegrityFailure -----
+TEST(IntegrityStep6, RegistryIntegrity)
+{
+    {
+        saveload::LoadedSave save = MakeLoadedSave();
+        save.entities[0].id = world::EntityId{0}; // none id
+        EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateRegistry(save),
+                  saveload::SaveLoadOutcome::IntegrityFailure);
+    }
+    {
+        saveload::LoadedSave save = MakeLoadedSave();
+        save.entities[1].id = save.entities[0].id; // duplicate (not ascending)
+        EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateRegistry(save),
+                  saveload::SaveLoadOutcome::IntegrityFailure);
+    }
+}
+
+// --- Dangling references => MissingData ---------------------------------------
+TEST(IntegrityStep6, DanglingReferences)
+{
+    {
+        saveload::LoadedSave save = MakeLoadedSave();
+        save.entities[0].inventoryRef = world::EntityId{9999}; // no such entity
+        EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateReferences(save),
+                  saveload::SaveLoadOutcome::MissingData);
+    }
+    {
+        saveload::LoadedSave save = MakeLoadedSave();
+        save.players[0].entity = world::EntityId{9999}; // dangling owning entity
+        EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateReferences(save),
+                  saveload::SaveLoadOutcome::MissingData);
+    }
+}
+
+// --- Version compatibility: incompatible build => VersionMismatch -------------
+TEST(IntegrityStep6, VersionCompatibility)
+{
+    const saveload::LoadedSave save = MakeLoadedSave(); // buildVersion 3, worldVersion 7
+
+    // Compatible boundary + world -> Ok.
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateVersion(MakeBuild(3, 7), save),
+              saveload::SaveLoadOutcome::Ok);
+    // Compatible boundary, differing world -> still Ok (migration territory).
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateVersion(MakeBuild(3, 9), save),
+              saveload::SaveLoadOutcome::Ok);
+    // Differing compatibility boundary -> VersionMismatch.
+    EXPECT_EQ(saveload::SaveIntegrityValidator::ValidateVersion(MakeBuild(4, 7), save),
+              saveload::SaveLoadOutcome::VersionMismatch);
+}
+
+// ============================================================================
+// Step 7 — SaveMigrator
+// ============================================================================
+
+// --- Version detection reads the save's build version -------------------------
+TEST(MigrationStep7, DetectVersion)
+{
+    const saveload::LoadedSave save = MakeLoadedSave();
+    EXPECT_EQ(saveload::SaveMigrator::DetectVersion(save), 3u); // metadata.buildVersion
+}
+
+// --- from == to is a no-op (Ok, zero steps) -----------------------------------
+TEST(MigrationStep7, NoOpWhenEqual)
+{
+    saveload::SaveMigrator migrator;
+    saveload::LoadedSave save = MakeLoadedSave();
+    EXPECT_EQ(migrator.Migrate(save, 3, 3), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(migrator.AppliedSteps(), 0u);
+}
+
+// --- A registered chain migrates forward and applies each step ----------------
+TEST(MigrationStep7, ForwardChain)
+{
+    saveload::SaveMigrator migrator;
+    migrator.Register(3, 4, &BumpTo4);
+    migrator.Register(4, 5, &BumpTo5);
+    EXPECT_TRUE(migrator.CanMigrate(3, 5));
+
+    saveload::LoadedSave save = MakeLoadedSave();
+    EXPECT_EQ(migrator.Migrate(save, 3, 5), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(migrator.AppliedSteps(), 2u);
+    EXPECT_EQ(save.metadata.buildVersion, 5u);
+}
+
+// --- Missing step / downgrade => VersionUnsupported ---------------------------
+TEST(MigrationStep7, UnsupportedPaths)
+{
+    saveload::SaveMigrator migrator;
+    migrator.Register(3, 4, &BumpTo4); // no 4 -> 5 registered
+
+    EXPECT_FALSE(migrator.CanMigrate(3, 5));
+    saveload::LoadedSave a = MakeLoadedSave();
+    EXPECT_EQ(migrator.Migrate(a, 3, 5), saveload::SaveLoadOutcome::VersionUnsupported);
+
+    // Downgrade is unsupported.
+    saveload::LoadedSave b = MakeLoadedSave();
+    EXPECT_EQ(migrator.Migrate(b, 5, 3), saveload::SaveLoadOutcome::VersionUnsupported);
+    EXPECT_FALSE(migrator.CanMigrate(5, 3));
+}
+
+// --- A step's own failure is propagated ---------------------------------------
+TEST(MigrationStep7, StepFailurePropagates)
+{
+    saveload::SaveMigrator migrator;
+    migrator.Register(3, 4, &FailingStep);
+    saveload::LoadedSave save = MakeLoadedSave();
+    EXPECT_EQ(migrator.Migrate(save, 3, 4), saveload::SaveLoadOutcome::IntegrityFailure);
+}
+
+// ============================================================================
+// Step 8 — ISaveSource (in-memory + null)
+// ============================================================================
+
+// --- In-memory: store / enumerate (ascending) / read / exists / remove --------
+TEST(SaveSourceStep8, InMemoryStoreAndRead)
+{
+    saveload::InMemorySaveSource src;
+    src.Store(MakeDescriptor(5, 1), {0xAAu, 0xBBu});
+    src.Store(MakeDescriptor(2, 1), {0x01u, 0x02u, 0x03u});
+    EXPECT_EQ(src.Count(), 2u);
+
+    // Enumerate is ascending by saveId (deterministic).
+    const auto list = src.Enumerate();
+    ASSERT_EQ(list.size(), 2u);
+    EXPECT_EQ(list[0].saveId, 2u);
+    EXPECT_EQ(list[1].saveId, 5u);
+
+    EXPECT_TRUE(src.Exists(5));
+    EXPECT_FALSE(src.Exists(99));
+
+    auto read = src.Read(5);
+    ASSERT_TRUE(read.HasValue());
+    ASSERT_EQ(read.Value().size(), 2u);
+    EXPECT_EQ(read.Value()[0], 0xAAu);
+
+    EXPECT_FALSE(src.Read(99).HasValue()); // not found -> value outcome
+
+    // Replace + remove.
+    src.Store(MakeDescriptor(2, 2), {0x09u});
+    EXPECT_EQ(src.Count(), 2u);
+    EXPECT_EQ(src.Read(2).Value().size(), 1u);
+    src.Remove(2);
+    EXPECT_FALSE(src.Exists(2));
+    EXPECT_EQ(src.Count(), 1u);
+}
+
+// --- Null source is inert; consumable through the interface -------------------
+TEST(SaveSourceStep8, NullSourceInert)
+{
+    saveload::NullSaveSource src;
+    const saveload::ISaveSource& seam = src;
+    EXPECT_TRUE(seam.Enumerate().empty());
+    EXPECT_FALSE(seam.Exists(1));
+    EXPECT_FALSE(seam.Read(1).HasValue());
 }
