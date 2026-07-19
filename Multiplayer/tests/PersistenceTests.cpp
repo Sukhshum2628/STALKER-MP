@@ -15,6 +15,7 @@
 #include "stalkermp/persistence/IPersistenceStore.h"
 #include "stalkermp/persistence/NullPersistenceStore.h"
 #include "stalkermp/persistence/PersistenceConfiguration.h"
+#include "stalkermp/persistence/PersistenceDiagnostics.h"
 #include "stalkermp/persistence/PersistenceQueue.h"
 #include "stalkermp/persistence/PersistenceSnapshot.h"
 #include "stalkermp/persistence/PersistenceManager.h"
@@ -1378,4 +1379,242 @@ TEST(PersistenceManagerStep11, ShutdownStopsWorker)
     (void)rig.manager.RequestSave(persistence::SaveTrigger::Manual);
     rig.manager.Tick(0.016); // worker stopped -> Flush returns WorkerUnavailable, nothing commits
     EXPECT_EQ(rig.store.CommittedCount(), 0u);
+}
+
+// ============================================================================
+// Step 12 — Error handling + recovery hardening (negative surface + stress)
+// ============================================================================
+
+// --- Worker failure never corrupts the "simulation" proxy (retain-previous) ---
+TEST(PersistenceHardeningStep12, FailureDoesNotCorruptSimulation)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+    const FakeSnapshotView view = MakeSealedView(); // stands in for authoritative state
+    const persistence::PersistenceSnapshot snap{view};
+
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(1, 10), snap, versions, store),
+              persistence::PersistenceOutcome::Ok);
+    ASSERT_EQ(store.CommittedCount(), 1u);
+
+    store.SetFailWrites(true);
+    for (std::uint64_t i = 2; i <= 6; ++i)
+    {
+        EXPECT_EQ(worker.ProcessRequest(MakeRequest(i, i * 10), snap, versions, store),
+                  persistence::PersistenceOutcome::StorageUnavailable);
+    }
+    // Authoritative proxy untouched; previous save retained; no dangling transactions.
+    EXPECT_EQ(view.m_metadata.simulationTick, 4200u);
+    EXPECT_EQ(view.Entities().size(), 2u);
+    EXPECT_EQ(store.CommittedCount(), 1u);
+    EXPECT_EQ(store.LastCommitted().saveId, 1u);
+    EXPECT_EQ(store.PendingCount(), 0u);
+}
+
+// --- Queue overflow + back-pressure are value outcomes, bounded ---------------
+TEST(PersistenceHardeningStep12, QueueOverflowAndBackpressure)
+{
+    persistence::PersistenceQueue q{QueueConfig(3, /*high*/ 2, /*low*/ 1)};
+    EXPECT_EQ(q.Publish(MakeRequest(1, 1)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(q.Publish(MakeRequest(2, 2)), persistence::PersistenceOutcome::Ok);
+    EXPECT_TRUE(q.IsBackpressured()); // depth 2 >= high
+    EXPECT_EQ(q.Publish(MakeRequest(3, 3)), persistence::PersistenceOutcome::Ok);
+    EXPECT_TRUE(q.Full());
+
+    for (int i = 0; i < 100; ++i)
+    {
+        EXPECT_EQ(q.Publish(MakeRequest(99, 99)), persistence::PersistenceOutcome::QueueFull);
+    }
+    EXPECT_EQ(q.Size(), 3u);            // bounded — never grows past capacity
+    EXPECT_EQ(q.OverflowCount(), 100u);
+}
+
+// --- Version mismatch is rejected as a value outcome --------------------------
+TEST(PersistenceHardeningStep12, VersionMismatchRejected)
+{
+    const persistence::VersionManager mgr{MakeVersions(1, 1, 1, 1)};
+    // Incompatible boundary.
+    EXPECT_EQ(persistence::ValidationFramework::ValidateVersion(mgr, MakeVersions(1, 1, 1, 2)),
+              persistence::PersistenceOutcome::VersionMismatch);
+    // Compatible (migration) is not a mismatch.
+    EXPECT_EQ(persistence::ValidationFramework::ValidateVersion(mgr, MakeVersions(2, 1, 1, 1)),
+              persistence::PersistenceOutcome::Ok);
+}
+
+// --- Interrupted save (write fails mid-transaction) aborts + retains previous --
+TEST(PersistenceHardeningStep12, InterruptedSaveRetainsPrevious)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+    const auto goodMeta = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, 1);
+
+    ASSERT_EQ(worker.Persist(goodMeta, snap, store), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(store.CommittedCount(), 1u);
+
+    // A write failure mid-transaction: aborted, previous retained, no pending.
+    store.SetFailWrites(true);
+    const auto meta2 = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Autosave, 2);
+    EXPECT_EQ(worker.Persist(meta2, snap, store), persistence::PersistenceOutcome::StorageUnavailable);
+    EXPECT_EQ(store.CommittedCount(), 1u);
+    EXPECT_EQ(store.LastCommitted().saveId, 1u);
+    EXPECT_EQ(store.PendingCount(), 0u);
+}
+
+// --- Validation failure short-circuits before any persist ---------------------
+TEST(PersistenceHardeningStep12, ValidationFailureShortCircuits)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+
+    FakeSnapshotView incomplete = MakeSealedView();
+    incomplete.m_metadata.state = snapshot::SnapshotState::Building; // not sealed
+    const persistence::PersistenceSnapshot snap{incomplete};
+
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(1, 1), snap, versions, store),
+              persistence::PersistenceOutcome::IncompleteSnapshot);
+    EXPECT_EQ(store.CommittedCount(), 0u); // never reached the store
+    EXPECT_EQ(store.PendingCount(), 0u);
+}
+
+// --- Sustained autosave churn: bounded memory + deterministic replay ----------
+TEST(PersistenceHardeningStep12, SustainedAutosaveChurnDeterministic)
+{
+    auto drive = [](PersistRig& rig) {
+        (void)rig.manager.Initialize();
+        rig.PublishSnapshot(500);
+        for (int i = 0; i < 200; ++i) // sustained autosave workload
+        {
+            rig.manager.Tick(0.016);
+        }
+    };
+
+    PersistRig a{ManagerConfig(4, /*autosave*/ 3)};
+    PersistRig b{ManagerConfig(4, /*autosave*/ 3)};
+    drive(a);
+    drive(b);
+
+    // Bounded memory: the queue never exceeds its capacity across the whole run.
+    EXPECT_LE(a.manager.Statistics().maxQueueDepth, 4u);
+    // Deterministic: identical committed history and stats.
+    EXPECT_EQ(a.store.CommittedCount(), b.store.CommittedCount());
+    EXPECT_GT(a.store.CommittedCount(), 0u);
+    EXPECT_EQ(a.store.LastCommitted().checksum, b.store.LastCommitted().checksum);
+    EXPECT_EQ(a.manager.Statistics().completedSaves, b.manager.Statistics().completedSaves);
+    EXPECT_EQ(a.manager.Statistics().autosaves, b.manager.Statistics().autosaves);
+}
+
+// ============================================================================
+// Step 13 — PersistenceDiagnostics
+// ============================================================================
+
+// --- Record then snapshot: counters + aggregates reflect the records ----------
+TEST(PersistenceDiagnosticsStep13, RecordAndSnapshot)
+{
+    persistence::PersistenceDiagnostics diag;
+    diag.RecordSaveRequest(persistence::SaveTrigger::Manual);
+    diag.RecordSaveRequest(persistence::SaveTrigger::Autosave); // also bumps autosaves
+    diag.RecordCompleted();
+    diag.RecordFailure();
+    diag.RecordRetry();
+    diag.RecordOverflow();
+    diag.RecordSaveDuration(100);
+    diag.RecordSaveDuration(300); // last 300, max 300, avg 200
+    diag.RecordQueueDepth(5);
+    diag.RecordQueueDepth(2); // current 2, max stays 5
+
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.saveRequests, 2u);
+    EXPECT_EQ(s.autosaves, 1u);
+    EXPECT_EQ(s.completedSaves, 1u);
+    EXPECT_EQ(s.failedSaves, 1u);
+    EXPECT_EQ(s.retries, 1u);
+    EXPECT_EQ(s.queueOverflows, 1u);
+    EXPECT_EQ(s.lastSaveDurationMicros, 300u);
+    EXPECT_EQ(s.maxSaveDurationMicros, 300u);
+    EXPECT_EQ(s.currentQueueDepth, 2u);
+    EXPECT_EQ(s.maxQueueDepth, 5u);
+    EXPECT_EQ(diag.AverageSaveDurationMicros(), 200u);
+}
+
+// --- Reset restores the initial state -----------------------------------------
+TEST(PersistenceDiagnosticsStep13, ResetRestoresInitial)
+{
+    persistence::PersistenceDiagnostics diag;
+    diag.RecordSaveRequest(persistence::SaveTrigger::Autosave);
+    diag.RecordSaveDuration(999);
+    diag.RecordWorkerActivity(true);
+    diag.RecordTimestamp(123u);
+
+    diag.Reset();
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.saveRequests, 0u);
+    EXPECT_EQ(s.autosaves, 0u);
+    EXPECT_EQ(s.maxSaveDurationMicros, 0u);
+    EXPECT_EQ(s.timestampWallClock, 0u);
+    EXPECT_EQ(diag.AverageSaveDurationMicros(), 0u);
+    EXPECT_EQ(diag.WorkerUtilizationPercent(), 0u);
+}
+
+// --- Monotonic counters; max never decreases ----------------------------------
+TEST(PersistenceDiagnosticsStep13, MonotonicCountersAndMax)
+{
+    persistence::PersistenceDiagnostics diag;
+    diag.RecordSaveDuration(500);
+    diag.RecordSaveDuration(100); // smaller -> max stays 500, last 100
+    EXPECT_EQ(diag.Snapshot().maxSaveDurationMicros, 500u);
+    EXPECT_EQ(diag.Snapshot().lastSaveDurationMicros, 100u);
+
+    std::uint64_t prev = 0;
+    for (int i = 0; i < 10; ++i)
+    {
+        diag.RecordCompleted();
+        const std::uint64_t now = diag.Snapshot().completedSaves;
+        EXPECT_TRUE(now > prev);
+        prev = now;
+    }
+}
+
+// --- Snapshot is an immutable value copy ---------------------------------------
+TEST(PersistenceDiagnosticsStep13, SnapshotIsImmutableCopy)
+{
+    persistence::PersistenceDiagnostics diag;
+    diag.RecordCompleted();
+    persistence::PersistenceStatistics early = diag.Snapshot();
+
+    early.completedSaves = 9999u; // mutate the copy
+    EXPECT_EQ(diag.Snapshot().completedSaves, 1u);
+
+    diag.RecordCompleted(); // later record does not change the earlier copy
+    EXPECT_EQ(early.completedSaves, 9999u);
+    EXPECT_EQ(diag.Snapshot().completedSaves, 2u);
+}
+
+// --- Deterministic aggregates: integer average + worker utilisation -----------
+TEST(PersistenceDiagnosticsStep13, DeterministicAggregates)
+{
+    persistence::PersistenceDiagnostics diag;
+    EXPECT_EQ(diag.AverageSaveDurationMicros(), 0u); // none yet
+    EXPECT_EQ(diag.WorkerUtilizationPercent(), 0u);
+
+    diag.RecordSaveDuration(10);
+    diag.RecordSaveDuration(20);
+    diag.RecordSaveDuration(31); // sum 61 / 3 = 20 (integer)
+    EXPECT_EQ(diag.AverageSaveDurationMicros(), 20u);
+
+    // 3 of 4 samples busy -> 75%.
+    diag.RecordWorkerActivity(true);
+    diag.RecordWorkerActivity(true);
+    diag.RecordWorkerActivity(false);
+    diag.RecordWorkerActivity(true);
+    EXPECT_EQ(diag.WorkerUtilizationPercent(), 75u);
+    EXPECT_EQ(diag.WorkerSamples(), 4u);
+    EXPECT_EQ(diag.DurationSamples(), 3u);
 }

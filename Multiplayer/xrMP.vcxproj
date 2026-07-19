@@ -332,6 +332,7 @@
     <ClInclude Include="include\stalkermp\persistence\PersistenceWorker.h" />
     <ClInclude Include="include\stalkermp\persistence\SaveScheduler.h" />
     <ClInclude Include="include\stalkermp\persistence\PersistenceManager.h" />
+    <ClInclude Include="include\stalkermp\persistence\PersistenceDiagnostics.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
