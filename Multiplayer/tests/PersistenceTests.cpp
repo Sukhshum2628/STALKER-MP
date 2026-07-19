@@ -8,11 +8,15 @@
 
 #include <cstdint>
 #include <type_traits>
+#include <vector>
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/persistence/PersistenceConfiguration.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
+#include "stalkermp/persistence/SaveMetadataBuilder.h"
 #include "stalkermp/persistence/VersionManager.h"
+#include "stalkermp/snapshot/ISnapshotView.h"
+#include "stalkermp/snapshot/SnapshotTypes.h"
 
 using namespace stalkermp;
 
@@ -360,4 +364,157 @@ TEST(VersionManagerStep3, CompatibilityNamesTotal)
     EXPECT_STREQ(persistence::VersionCompatibilityName(static_cast<persistence::VersionCompatibility>(200)),
                  "Unknown");
     static_assert(std::is_same_v<std::underlying_type_t<persistence::VersionCompatibility>, std::uint8_t>);
+}
+
+// ============================================================================
+// Step 4 — SaveMetadataBuilder
+// ============================================================================
+
+namespace
+{
+    // A minimal, configurable ISnapshotView for tests. Owns its captured value data.
+    class FakeSnapshotView final : public snapshot::ISnapshotView
+    {
+    public:
+        [[nodiscard]] const snapshot::SnapshotMetadata& Metadata() const override { return m_metadata; }
+        [[nodiscard]] const std::vector<snapshot::EntitySnapshot>& Entities() const override { return m_entities; }
+        [[nodiscard]] const std::vector<snapshot::PlayerSnapshot>& Players() const override { return m_players; }
+        [[nodiscard]] const snapshot::EnvironmentSnapshot& Environment() const override { return m_environment; }
+
+        snapshot::SnapshotMetadata m_metadata{};
+        std::vector<snapshot::EntitySnapshot> m_entities;
+        std::vector<snapshot::PlayerSnapshot> m_players;
+        snapshot::EnvironmentSnapshot m_environment{};
+    };
+
+    snapshot::EntitySnapshot SnapEntity(std::uint32_t id, float x)
+    {
+        snapshot::EntitySnapshot e{};
+        e.id = world::EntityId{id};
+        e.position = world::Vec3{x, 0.0f, 0.0f};
+        return e;
+    }
+
+    // A representative populated view: tick 4200, 2 entities, 1 player, env version 7.
+    FakeSnapshotView MakeView()
+    {
+        FakeSnapshotView v;
+        v.m_metadata.simulationTick = 4200;
+        v.m_metadata.version = 3; // snapshot/build/format version
+        v.m_metadata.entityCount = 2;
+        v.m_metadata.playerCount = 1;
+        v.m_entities.push_back(SnapEntity(1, 1.0f));
+        v.m_entities.push_back(SnapEntity(2, 2.5f));
+        snapshot::PlayerSnapshot p{};
+        p.id = player::PlayerId{9};
+        p.entity = world::EntityId{1};
+        p.position = world::Vec3{3.0f, 0.0f, -1.0f};
+        v.m_players.push_back(p);
+        v.m_environment.environmentVersion = 7; // world version
+        v.m_environment.weatherId = 2;
+        v.m_environment.timeOfDaySeconds = 36000;
+        return v;
+    }
+} // namespace
+
+// --- Field capture: tick, counts, versions, saveId ----------------------------
+TEST(SaveMetadataStep4, CapturesFields)
+{
+    const FakeSnapshotView view = MakeView();
+    const auto meta = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, /*saveId*/ 42);
+
+    EXPECT_EQ(meta.saveId, 42u);
+    EXPECT_EQ(meta.simulationTick, 4200u);
+    EXPECT_EQ(meta.entityCount, 2u);
+    EXPECT_EQ(meta.playerCount, 1u);
+    EXPECT_EQ(meta.worldVersion, 7u); // Environment().environmentVersion
+    EXPECT_EQ(meta.buildVersion, 3u); // snapshot Metadata().version
+    EXPECT_NE(meta.checksum, 0u);
+}
+
+// --- Checksum determinism: identical content => identical checksum -------------
+TEST(SaveMetadataStep4, ChecksumDeterministic)
+{
+    const FakeSnapshotView a = MakeView();
+    const FakeSnapshotView b = MakeView();
+    EXPECT_EQ(persistence::SaveMetadataBuilder::Checksum(a), persistence::SaveMetadataBuilder::Checksum(b));
+
+    // Build stamps the same checksum it exposes; saveId does not affect it.
+    const auto m1 = persistence::SaveMetadataBuilder::Build(a, persistence::SaveTrigger::Manual, 1);
+    const auto m2 = persistence::SaveMetadataBuilder::Build(b, persistence::SaveTrigger::Manual, 999);
+    EXPECT_EQ(m1.checksum, persistence::SaveMetadataBuilder::Checksum(a));
+    EXPECT_EQ(m1.checksum, m2.checksum);
+}
+
+// --- Trigger is provenance only: it does not change the metadata/checksum ------
+TEST(SaveMetadataStep4, TriggerDoesNotAffectOutput)
+{
+    const FakeSnapshotView view = MakeView();
+    const auto manual = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, 5);
+    const auto autosv = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Autosave, 5);
+    EXPECT_EQ(manual.checksum, autosv.checksum);
+    EXPECT_EQ(manual.simulationTick, autosv.simulationTick);
+    EXPECT_EQ(manual.entityCount, autosv.entityCount);
+}
+
+// --- Checksum sensitivity: any content change changes the checksum ------------
+TEST(SaveMetadataStep4, ChecksumSensitiveToContent)
+{
+    const std::uint64_t base = persistence::SaveMetadataBuilder::Checksum(MakeView());
+
+    {
+        FakeSnapshotView v = MakeView();
+        v.m_metadata.simulationTick = 4201; // tick changed
+        EXPECT_NE(persistence::SaveMetadataBuilder::Checksum(v), base);
+    }
+    {
+        FakeSnapshotView v = MakeView();
+        v.m_entities[1].position.x = 2.6f; // entity position changed
+        EXPECT_NE(persistence::SaveMetadataBuilder::Checksum(v), base);
+    }
+    {
+        FakeSnapshotView v = MakeView();
+        v.m_players[0].authorityFlags = 1; // player field changed
+        EXPECT_NE(persistence::SaveMetadataBuilder::Checksum(v), base);
+    }
+    {
+        FakeSnapshotView v = MakeView();
+        v.m_environment.weatherId = 3; // environment changed
+        EXPECT_NE(persistence::SaveMetadataBuilder::Checksum(v), base);
+    }
+    {
+        FakeSnapshotView v = MakeView();
+        v.m_entities.push_back(SnapEntity(3, 9.0f)); // entity count changed
+        EXPECT_NE(persistence::SaveMetadataBuilder::Checksum(v), base);
+    }
+}
+
+// --- Wall-clock is diagnostic-only: excluded from the checksum, passed through -
+TEST(SaveMetadataStep4, WallClockExcludedFromChecksumButPassedThrough)
+{
+    FakeSnapshotView a = MakeView();
+    FakeSnapshotView b = MakeView();
+    a.m_metadata.timestampWallClock = 111111u;
+    b.m_metadata.timestampWallClock = 999999u;   // differs only in diagnostic wall-clock
+    a.m_metadata.buildDurationTicks = 5u;
+    b.m_metadata.buildDurationTicks = 5000u;      // and the diagnostic build duration
+
+    // Checksum ignores both diagnostic fields.
+    EXPECT_EQ(persistence::SaveMetadataBuilder::Checksum(a), persistence::SaveMetadataBuilder::Checksum(b));
+
+    // But the wall-clock is passed through into the metadata (diagnostic field).
+    const auto ma = persistence::SaveMetadataBuilder::Build(a, persistence::SaveTrigger::Autosave, 7);
+    EXPECT_EQ(ma.timestampWallClock, 111111u);
+    EXPECT_EQ(ma.checksum, persistence::SaveMetadataBuilder::Checksum(b)); // content-equal
+}
+
+// --- Empty snapshot builds valid metadata (zero counts, stable checksum) ------
+TEST(SaveMetadataStep4, EmptySnapshot)
+{
+    const FakeSnapshotView empty; // no entities/players; tick 0
+    const auto meta = persistence::SaveMetadataBuilder::Build(empty, persistence::SaveTrigger::Shutdown, 1);
+    EXPECT_EQ(meta.entityCount, 0u);
+    EXPECT_EQ(meta.playerCount, 0u);
+    EXPECT_EQ(meta.simulationTick, 0u);
+    EXPECT_EQ(meta.checksum, persistence::SaveMetadataBuilder::Checksum(empty)); // deterministic
 }
