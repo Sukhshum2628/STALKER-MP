@@ -15,6 +15,7 @@
 #include "stalkermp/persistence/PersistenceSnapshot.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
 #include "stalkermp/persistence/SaveMetadataBuilder.h"
+#include "stalkermp/persistence/ValidationFramework.h"
 #include "stalkermp/persistence/VersionManager.h"
 #include "stalkermp/snapshot/ISnapshotView.h"
 #include "stalkermp/snapshot/SnapshotTypes.h"
@@ -609,4 +610,117 @@ TEST(PersistenceSnapshotStep5, DeterministicAndReadOnly)
     EXPECT_EQ(view.Entities().size(), 2u);
     EXPECT_EQ(view.m_metadata.simulationTick, 4200u);
     EXPECT_EQ(view.m_metadata.state, snapshot::SnapshotState::Finalized);
+}
+
+// ============================================================================
+// Step 6 — ValidationFramework
+// ============================================================================
+
+namespace
+{
+    persistence::SaveRequest MakeRequest(std::uint64_t id, std::uint64_t tick,
+                                         persistence::SaveTrigger trigger = persistence::SaveTrigger::Manual)
+    {
+        persistence::SaveRequest r{};
+        r.id = id;
+        r.trigger = trigger;
+        r.requestTick = tick;
+        return r;
+    }
+} // namespace
+
+// --- ValidateIntegrity: consistent header Ok; inconsistent => IntegrityFailure -
+TEST(ValidationStep6, ValidateIntegrity)
+{
+    const FakeSnapshotView good = MakeSealedView();
+    EXPECT_EQ(persistence::ValidationFramework::ValidateIntegrity(persistence::PersistenceSnapshot{good}),
+              persistence::PersistenceOutcome::Ok);
+
+    FakeSnapshotView bad = MakeSealedView();
+    bad.m_metadata.entityCount = 99; // header disagrees with containers
+    EXPECT_EQ(persistence::ValidationFramework::ValidateIntegrity(persistence::PersistenceSnapshot{bad}),
+              persistence::PersistenceOutcome::IntegrityFailure);
+
+    FakeSnapshotView noneId = MakeSealedView();
+    noneId.m_metadata.id = snapshot::SnapshotId{0};
+    EXPECT_EQ(persistence::ValidationFramework::ValidateIntegrity(persistence::PersistenceSnapshot{noneId}),
+              persistence::PersistenceOutcome::IntegrityFailure);
+}
+
+// --- ValidateCompleteness: sealed Ok; unsealed => IncompleteSnapshot ----------
+TEST(ValidationStep6, ValidateCompleteness)
+{
+    FakeSnapshotView v = MakeSealedView();
+
+    v.m_metadata.state = snapshot::SnapshotState::Finalized;
+    EXPECT_EQ(persistence::ValidationFramework::ValidateCompleteness(persistence::PersistenceSnapshot{v}),
+              persistence::PersistenceOutcome::Ok);
+
+    v.m_metadata.state = snapshot::SnapshotState::Published;
+    EXPECT_EQ(persistence::ValidationFramework::ValidateCompleteness(persistence::PersistenceSnapshot{v}),
+              persistence::PersistenceOutcome::Ok);
+
+    v.m_metadata.state = snapshot::SnapshotState::Building;
+    EXPECT_EQ(persistence::ValidationFramework::ValidateCompleteness(persistence::PersistenceSnapshot{v}),
+              persistence::PersistenceOutcome::IncompleteSnapshot);
+
+    v.m_metadata.state = snapshot::SnapshotState::Retired;
+    EXPECT_EQ(persistence::ValidationFramework::ValidateCompleteness(persistence::PersistenceSnapshot{v}),
+              persistence::PersistenceOutcome::IncompleteSnapshot);
+}
+
+// --- ValidateVersion: Equal/MigrationRequired Ok; Incompatible => VersionMismatch
+TEST(ValidationStep6, ValidateVersion)
+{
+    const persistence::VersionManager mgr{MakeVersions(2, 2, 2, 5)};
+
+    // Equal -> Ok
+    EXPECT_EQ(persistence::ValidationFramework::ValidateVersion(mgr, MakeVersions(2, 2, 2, 5)),
+              persistence::PersistenceOutcome::Ok);
+    // MigrationRequired (inner differs, same compatibility) -> Ok (reconcilable)
+    EXPECT_EQ(persistence::ValidationFramework::ValidateVersion(mgr, MakeVersions(1, 2, 9, 5)),
+              persistence::PersistenceOutcome::Ok);
+    // Incompatible (compatibility boundary differs) -> VersionMismatch
+    EXPECT_EQ(persistence::ValidationFramework::ValidateVersion(mgr, MakeVersions(2, 2, 2, 6)),
+              persistence::PersistenceOutcome::VersionMismatch);
+}
+
+// --- ValidateQueueOrdering: strict ascending id + non-decreasing tick ----------
+TEST(ValidationStep6, ValidateQueueOrdering)
+{
+    // No predecessor (id 0) always validates.
+    EXPECT_EQ(persistence::ValidationFramework::ValidateQueueOrdering(MakeRequest(0, 0), MakeRequest(1, 10)),
+              persistence::PersistenceOutcome::Ok);
+
+    // Ascending id, non-decreasing tick -> Ok.
+    EXPECT_EQ(persistence::ValidationFramework::ValidateQueueOrdering(MakeRequest(1, 10), MakeRequest(2, 10)),
+              persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(persistence::ValidationFramework::ValidateQueueOrdering(MakeRequest(1, 10), MakeRequest(2, 20)),
+              persistence::PersistenceOutcome::Ok);
+
+    // Non-increasing id -> IntegrityFailure.
+    EXPECT_EQ(persistence::ValidationFramework::ValidateQueueOrdering(MakeRequest(2, 10), MakeRequest(2, 20)),
+              persistence::PersistenceOutcome::IntegrityFailure);
+    EXPECT_EQ(persistence::ValidationFramework::ValidateQueueOrdering(MakeRequest(5, 10), MakeRequest(3, 20)),
+              persistence::PersistenceOutcome::IntegrityFailure);
+
+    // Regressing tick -> IntegrityFailure.
+    EXPECT_EQ(persistence::ValidationFramework::ValidateQueueOrdering(MakeRequest(1, 20), MakeRequest(2, 10)),
+              persistence::PersistenceOutcome::IntegrityFailure);
+}
+
+// --- Validators are deterministic and leave inputs unchanged ------------------
+TEST(ValidationStep6, DeterministicAndNonMutating)
+{
+    FakeSnapshotView v = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{v};
+
+    EXPECT_EQ(persistence::ValidationFramework::ValidateIntegrity(snap),
+              persistence::ValidationFramework::ValidateIntegrity(snap));
+    EXPECT_EQ(persistence::ValidationFramework::ValidateCompleteness(snap),
+              persistence::ValidationFramework::ValidateCompleteness(snap));
+
+    // Inputs unchanged by validation.
+    EXPECT_EQ(v.m_metadata.entityCount, 2u);
+    EXPECT_EQ(v.m_metadata.state, snapshot::SnapshotState::Finalized);
 }
