@@ -9,7 +9,7 @@
 |--------|-------|
 | Sprint | 011 |
 | Title | Persistence Framework |
-| Status | **FROZEN** (design scope frozen for implementation, 2026-07-18) |
+| Status | **Implemented / Verified / Closed / Frozen** (2026-07-19) |
 | Priority | Critical |
 | Estimated Duration | 2–3 Weeks |
 | Prerequisites | Sprint-001 through Sprint-010 |
@@ -444,21 +444,21 @@ Stress Test
 
 # 11. Acceptance Criteria
 
-□ Persistence Manager operational.
+☑ Persistence Manager operational. ✅
 
-□ Save Scheduler operational.
+☑ Save Scheduler operational. ✅
 
-□ Snapshot consumption complete.
+☑ Snapshot consumption complete. ✅
 
-□ Version Manager functional.
+☑ Version Manager functional. ✅
 
-□ Diagnostics operational.
+☑ Diagnostics operational. ✅
 
-□ Worker execution isolated.
+☑ Worker execution isolated. ✅ (synchronous; no thread — ADR-011)
 
-□ Tests passing.
+☑ Tests passing. ✅ (599 / 599)
 
-□ Documentation updated.
+☑ Documentation updated. ✅ (`Multiplayer/docs/Persistence.md`)
 
 ---
 
@@ -482,3 +482,45 @@ Sprint-012 – Save/Load System
 Sprint-012 builds upon the Persistence Framework by implementing complete world serialization and recovery.
 
 It introduces save file generation, loading, world reconstruction, entity restoration, ALife restoration, version migration, and deterministic recovery of the authoritative simulation after server restart.
+
+---
+
+# 14. Sprint Closure (2026-07-19)
+
+**Sprint-011 (Persistence Framework) is declared Implemented / Verified / Closed / Frozen.**
+
+All 17 steps were implemented under the mandatory workflow (implement → Antigravity verification → git commit → GitHub push → next step) — some as safe, dependency-bounded batches (07–08, 10–11, 12–13) — and each step was independently verified by Antigravity, with the tree left buildable after every step.
+
+## 14.1 Final verified baseline
+- **599 / 599 build tests passing** — Release x64 on **MSVC** and the engine-free **GCC** test build; **0 errors, 0 warnings, no regressions.** (Sprint-010 baseline 519 + the 80-test Sprint-011 persistence suite.)
+- MSVC Release clean under `EngineAbi.props`. Game testing has not started yet.
+
+## 14.2 Steps 01–17 (all implemented, verified, documented)
+01 value types (`PersistenceTypes.h`) · 02 `PersistenceConfiguration` · 03 `VersionManager` · 04 `SaveMetadataBuilder` · 05 `PersistenceSnapshot` projection · 06 `ValidationFramework` · 07 `PersistenceQueue` · 08 storage seam (`IPersistenceStore` + in-memory/null) · 09 `PersistenceWorker` (synchronous) · 10 `SaveScheduler` · 11 `PersistenceManager` · 12 error-handling/recovery hardening · 13 `PersistenceDiagnostics` · 14 composition-root wiring (`kPersistence = 500`) · 15 integration tests · 16 documentation (`Persistence.md`) · 17 sprint closure.
+
+## 14.3 Definition of Done (§12) — satisfied
+1. Persistence Framework operates independently of simulation (consumes immutable snapshots; no thread; read-only). ✅
+2. Save scheduling is configurable (`[persistence]`: interval, retries, backoff, watermarks; deterministic scheduler). ✅
+3. Workers consume immutable snapshots only (`PersistenceSnapshot` projection over `ISnapshotView`; no new capture). ✅
+4. Version tracking is implemented (`VersionManager`; Equal / MigrationRequired / Incompatible). ✅
+5. Validation framework is complete (integrity, completeness, version, queue ordering — all value outcomes). ✅
+6. Ready for Save/Load implementation (the `IPersistenceStore` seam is the Sprint-012 extension point). ✅
+
+## 14.4 Completion criteria — satisfied
+- All 17 steps implemented, each Antigravity-verified, tree buildable after each. ✅
+- The `PersistenceManager` runs as a single `IService` + `ITickable` at the **reserved** `tick_order::kPersistence = 500` (after Replication 450, before Networking 900), Bootstrap-wired with reverse-order teardown; **no new `tick_order` key**; networking-last preserved. ✅
+- One Engine Boundary **and** One Platform Boundary hold — **no engine TU and no OS/file/serialization code**; storage is behind the engine-free `IPersistenceStore` seam (real backend deferred to Sprint-012). ✅
+- ADR-007…ADR-011 all conformed to; **no thread created** (D-PF1 / ADR-011); no wire-protocol change. ✅
+- Full suite green on GCC + MSVC, MSVC Release clean, zero new warnings, no regressions; the Sprint-010 519/519 baseline preserved and extended to 599/599. ✅
+- No out-of-scope work (no save-file format, serialization, load pipeline, compression, cloud saves, or backup management — all Sprint-012). ✅
+- Subsystem doc `Multiplayer/docs/Persistence.md` written; status docs synchronized to Closed/Verified. ✅
+
+## 14.5 Evidence gates — satisfied
+- **E-G1-PF** (read-only immutable-snapshot consumption; no authoritative mutation): **PASSED**.
+- **E-G2-PF** (deterministic scheduling / metadata / validation / versioning): **PASSED**.
+- **E-G3-PF** (worker independence & failure isolation; no thread; retain-previous): **PASSED**.
+- **E-G4-PF** (bounded queue / back-pressure / robust value-outcome validation): **PASSED**.
+- **E-G5-PF** (One Platform Boundary + One Engine Boundary preserved): **PASSED**.
+
+## 14.6 Sprint-012 readiness
+The Persistence Framework coordinates scheduling, worker management, snapshot consumption, versioning, validation, and diagnostics deterministically and failure-isolated, without a save format or serialization. **Sprint-012 (Save/Load System)** implements the real filesystem backend behind the frozen `IPersistenceStore` seam plus world serialization, the load/restore pipeline, and version migration. No new authoritative `tick_order` value beyond the reserved `kPersistence = 500` is assigned or depended upon. **The project is ready for Sprint-012.**

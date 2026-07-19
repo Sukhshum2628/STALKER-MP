@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Sprint | 011 — Persistence Framework |
-| Status | **Plan — FROZEN candidate** (review → freeze → approve before Step-01) |
+| Status | **Plan — EXECUTED & CLOSED** (all 17 steps implemented, verified, frozen — 2026-07-19) |
 | Scope authority | `Documentation/SPRINTS/Sprint-011/Sprint-011-Persistence.md` (FROZEN) |
 | Baseline | Sprint-010 CLOSED & FROZEN — **519 / 519** tests passing (GCC + MSVC) |
 | Governing ADRs | ADR-007, ADR-008, ADR-009, ADR-010, ADR-011 (all preserved; none modified) |
