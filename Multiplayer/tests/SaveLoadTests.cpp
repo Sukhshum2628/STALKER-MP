@@ -15,6 +15,10 @@
 #include "stalkermp/saveload/SaveFormat.h"
 #include "stalkermp/saveload/SaveLoadConfiguration.h"
 #include "stalkermp/saveload/SaveLoadTypes.h"
+#include "stalkermp/saveload/SaveReader.h"
+#include "stalkermp/saveload/SaveWriter.h"
+#include "stalkermp/snapshot/ISnapshotView.h"
+#include "stalkermp/snapshot/SnapshotTypes.h"
 
 using namespace stalkermp;
 
@@ -420,4 +424,236 @@ TEST(SaveFormatStep3, SaveSectionNames)
     EXPECT_STREQ(saveload::SaveSectionName(saveload::SaveSection::Trailer), "Trailer");
     EXPECT_STREQ(saveload::SaveSectionName(static_cast<saveload::SaveSection>(9999)), "Unknown");
     static_assert(std::is_same_v<std::underlying_type_t<saveload::SaveSection>, std::uint16_t>);
+}
+
+// ============================================================================
+// Batch-2 shared fixture — a minimal fake ISnapshotView
+// ============================================================================
+
+namespace
+{
+    class FakeSnapshotView final : public snapshot::ISnapshotView
+    {
+    public:
+        [[nodiscard]] const snapshot::SnapshotMetadata& Metadata() const override { return m_metadata; }
+        [[nodiscard]] const std::vector<snapshot::EntitySnapshot>& Entities() const override { return m_entities; }
+        [[nodiscard]] const std::vector<snapshot::PlayerSnapshot>& Players() const override { return m_players; }
+        [[nodiscard]] const snapshot::EnvironmentSnapshot& Environment() const override { return m_environment; }
+
+        snapshot::SnapshotMetadata m_metadata{};
+        std::vector<snapshot::EntitySnapshot> m_entities;
+        std::vector<snapshot::PlayerSnapshot> m_players;
+        snapshot::EnvironmentSnapshot m_environment{};
+    };
+
+    // A representative populated view: tick 4200, 2 entities, 1 player, env set.
+    FakeSnapshotView MakeView()
+    {
+        FakeSnapshotView v;
+        v.m_metadata.id = snapshot::SnapshotId{7};
+        v.m_metadata.simulationTick = 4200;
+        v.m_metadata.version = 3;
+        v.m_metadata.state = snapshot::SnapshotState::Finalized;
+
+        snapshot::EntitySnapshot e1{};
+        e1.id = world::EntityId{1};
+        e1.position = world::Vec3{1.5f, 0.0f, -2.0f};
+        e1.velocity = world::Vec3{0.25f, 0.0f, 0.0f};
+        e1.state = 11u;
+        e1.flags = 22u;
+        e1.inventoryRef = world::EntityId{5};
+        e1.runtimeState = 0xABCDEF01u;
+        snapshot::EntitySnapshot e2{};
+        e2.id = world::EntityId{2};
+        e2.position = world::Vec3{100.0f, 1.0f, 3.0f};
+        v.m_entities.push_back(e1);
+        v.m_entities.push_back(e2);
+
+        snapshot::PlayerSnapshot p{};
+        p.id = player::PlayerId{9};
+        p.entity = world::EntityId{1};
+        p.position = world::Vec3{3.0f, 0.0f, -1.0f};
+        p.simulationState = 77u;
+        p.authorityFlags = 4u;
+        v.m_players.push_back(p);
+
+        v.m_environment.weatherId = 2;
+        v.m_environment.timeOfDaySeconds = 36000;
+        v.m_environment.emissionState = 1;
+        v.m_environment.lighting = 5;
+        v.m_environment.environmentVersion = 7;
+        return v;
+    }
+
+    persistence::SaveMetadata MakeMetadata()
+    {
+        persistence::SaveMetadata m{};
+        m.saveId = 42;
+        m.simulationTick = 4200;
+        m.playerCount = 1;
+        m.entityCount = 2;
+        m.worldVersion = 7;
+        m.buildVersion = 3;
+        m.checksum = 0x1122334455667788ull;
+        m.timestampWallClock = 999999u; // diagnostic — must NOT be serialized
+        return m;
+    }
+} // namespace
+
+// ============================================================================
+// Step 4 — SaveWriter
+// ============================================================================
+
+// --- Serialize produces a non-empty artifact with a valid header --------------
+TEST(SaveWriterStep4, ProducesFramedArtifact)
+{
+    const FakeSnapshotView view = MakeView();
+    const auto bytes = saveload::SaveWriter::Serialize(view, MakeMetadata());
+    ASSERT_GT(bytes.size(), 12u);
+
+    saveload::ByteReader r{bytes.data(), bytes.size()};
+    EXPECT_EQ(saveload::ReadHeader(r), saveload::SaveLoadOutcome::Ok); // magic + version framed
+}
+
+// --- Deterministic: identical content => byte-identical output ----------------
+TEST(SaveWriterStep4, Deterministic)
+{
+    const FakeSnapshotView a = MakeView();
+    const FakeSnapshotView b = MakeView();
+    const auto ba = saveload::SaveWriter::Serialize(a, MakeMetadata());
+    const auto bb = saveload::SaveWriter::Serialize(b, MakeMetadata());
+    EXPECT_EQ(ba, bb);
+}
+
+// --- The diagnostic wall-clock does not affect the serialized identity --------
+TEST(SaveWriterStep4, WallClockExcludedFromArtifact)
+{
+    const FakeSnapshotView view = MakeView();
+    persistence::SaveMetadata m1 = MakeMetadata();
+    persistence::SaveMetadata m2 = MakeMetadata();
+    m1.timestampWallClock = 1u;
+    m2.timestampWallClock = 123456789u; // differs only in the diagnostic field
+    EXPECT_EQ(saveload::SaveWriter::Serialize(view, m1), saveload::SaveWriter::Serialize(view, m2));
+}
+
+// --- Content changes change the artifact --------------------------------------
+TEST(SaveWriterStep4, ContentSensitive)
+{
+    const auto base = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+
+    FakeSnapshotView moved = MakeView();
+    moved.m_entities[0].position.x = 999.0f;
+    EXPECT_NE(saveload::SaveWriter::Serialize(moved, MakeMetadata()), base);
+
+    FakeSnapshotView extra = MakeView();
+    snapshot::EntitySnapshot e3{};
+    e3.id = world::EntityId{3};
+    extra.m_entities.push_back(e3);
+    EXPECT_NE(saveload::SaveWriter::Serialize(extra, MakeMetadata()), base);
+}
+
+// ============================================================================
+// Step 5 — SaveReader
+// ============================================================================
+
+// --- Round-trip: writer output parses back to the same records ----------------
+TEST(SaveReaderStep5, RoundTrip)
+{
+    const FakeSnapshotView view = MakeView();
+    const auto bytes = saveload::SaveWriter::Serialize(view, MakeMetadata());
+
+    const saveload::ParseResult result = saveload::SaveReader::Parse(bytes);
+    ASSERT_EQ(result.outcome, saveload::SaveLoadOutcome::Ok);
+    const saveload::LoadedSave& s = result.save;
+
+    // World / scheduler tick carried from the snapshot.
+    EXPECT_EQ(s.world.simulationTick, 4200u);
+    EXPECT_EQ(s.scheduler.simulationTick, 4200u);
+
+    // Environment.
+    EXPECT_EQ(s.environment.weatherId, 2u);
+    EXPECT_EQ(s.environment.timeOfDaySeconds, 36000u);
+    EXPECT_EQ(s.environment.environmentVersion, 7u);
+
+    // Entities (ascending, values preserved).
+    ASSERT_EQ(s.entities.size(), 2u);
+    EXPECT_EQ(s.entities[0].id.value, 1u);
+    EXPECT_FLOAT_EQ(s.entities[0].position.x, 1.5f);
+    EXPECT_FLOAT_EQ(s.entities[0].velocity.x, 0.25f);
+    EXPECT_EQ(s.entities[0].stateFlags, 11u);
+    EXPECT_EQ(s.entities[0].runtimeFlags, 22u);
+    EXPECT_EQ(s.entities[0].inventoryRef.value, 5u);
+    EXPECT_EQ(s.entities[0].runtimeState, 0xABCDEF01u);
+    EXPECT_EQ(s.entities[1].id.value, 2u);
+    EXPECT_FLOAT_EQ(s.entities[1].position.x, 100.0f);
+
+    // Players.
+    ASSERT_EQ(s.players.size(), 1u);
+    EXPECT_EQ(s.players[0].id.value, 9u);
+    EXPECT_EQ(s.players[0].entity.value, 1u);
+    EXPECT_FLOAT_EQ(s.players[0].position.z, -1.0f);
+    EXPECT_EQ(s.players[0].statistics, 77u);
+    EXPECT_EQ(s.players[0].connectionState, player::PlayerConnectionState::Connected);
+
+    // ALife empty (no snapshot source); metadata round-trips (wall-clock defaults 0).
+    EXPECT_TRUE(s.alife.empty());
+    EXPECT_EQ(s.metadata.saveId, 42u);
+    EXPECT_EQ(s.metadata.entityCount, 2u);
+    EXPECT_EQ(s.metadata.checksum, 0x1122334455667788ull);
+    EXPECT_EQ(s.metadata.timestampWallClock, 0u); // not serialized
+}
+
+// --- Bad magic => CorruptedSave ------------------------------------------------
+TEST(SaveReaderStep5, BadMagicRejected)
+{
+    auto bytes = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+    bytes[0] ^= 0xFFu;
+    EXPECT_EQ(saveload::SaveReader::Parse(bytes).outcome, saveload::SaveLoadOutcome::CorruptedSave);
+}
+
+// --- Wrong format version => VersionMismatch ----------------------------------
+TEST(SaveReaderStep5, WrongFormatVersionRejected)
+{
+    auto bytes = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+    // Format version is the 4 bytes after the 4-byte magic (little-endian); bump it.
+    bytes[4] = static_cast<std::uint8_t>(saveload::kSaveFormatVersion + 1u);
+    EXPECT_EQ(saveload::SaveReader::Parse(bytes).outcome, saveload::SaveLoadOutcome::VersionMismatch);
+}
+
+// --- A flipped content byte => ChecksumFailure --------------------------------
+TEST(SaveReaderStep5, ChecksumMismatchRejected)
+{
+    auto bytes = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+    // Corrupt a byte in the body (after the header, before the trailer).
+    bytes[20] ^= 0x01u;
+    EXPECT_EQ(saveload::SaveReader::Parse(bytes).outcome, saveload::SaveLoadOutcome::ChecksumFailure);
+}
+
+// --- Truncated artifact => CorruptedSave --------------------------------------
+TEST(SaveReaderStep5, TruncatedRejected)
+{
+    auto bytes = saveload::SaveWriter::Serialize(MakeView(), MakeMetadata());
+    bytes.resize(bytes.size() / 2); // cut off the tail
+    const auto outcome = saveload::SaveReader::Parse(bytes).outcome;
+    EXPECT_NE(outcome, saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(outcome, saveload::SaveLoadOutcome::CorruptedSave);
+
+    // Empty input is also structurally rejected (no header).
+    EXPECT_EQ(saveload::SaveReader::Parse(std::vector<std::uint8_t>{}).outcome,
+              saveload::SaveLoadOutcome::CorruptedSave);
+}
+
+// --- Empty world (no entities/players) still round-trips ----------------------
+TEST(SaveReaderStep5, EmptyWorldRoundTrip)
+{
+    FakeSnapshotView empty;
+    empty.m_metadata.id = snapshot::SnapshotId{1};
+    empty.m_metadata.state = snapshot::SnapshotState::Finalized;
+    const auto bytes = saveload::SaveWriter::Serialize(empty, persistence::SaveMetadata{});
+
+    const auto result = saveload::SaveReader::Parse(bytes);
+    ASSERT_EQ(result.outcome, saveload::SaveLoadOutcome::Ok);
+    EXPECT_TRUE(result.save.entities.empty());
+    EXPECT_TRUE(result.save.players.empty());
+    EXPECT_TRUE(result.save.alife.empty());
 }
