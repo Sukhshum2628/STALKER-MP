@@ -149,6 +149,7 @@
     <ClCompile Include="src\persistence\PersistenceWorker.cpp" />
     <ClCompile Include="src\persistence\SaveScheduler.cpp" />
     <ClCompile Include="src\persistence\PersistenceManager.cpp" />
+    <ClCompile Include="src\saveload\SaveLoadConfiguration.cpp" />
     <ClCompile Include="src\prediction\PredictionManager.cpp" />
     <ClCompile Include="src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="src\prediction\InterpolationManager.cpp" />
@@ -334,6 +335,9 @@
     <ClInclude Include="include\stalkermp\persistence\PersistenceManager.h" />
     <ClInclude Include="include\stalkermp\persistence\PersistenceDiagnostics.h" />
     <ClInclude Include="include\stalkermp\saveload\SaveLoadTypes.h" />
+    <ClInclude Include="include\stalkermp\saveload\SaveLoadConfiguration.h" />
+    <ClInclude Include="include\stalkermp\saveload\SaveByteCursor.h" />
+    <ClInclude Include="include\stalkermp\saveload\SaveFormat.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />

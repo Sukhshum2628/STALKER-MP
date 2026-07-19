@@ -104,7 +104,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **009** | Replication Pipeline | ✅ Verified (Closed) |
 | **010** | Client Prediction & Interpolation | ✅ Verified (Closed) |
 | **011** | Persistence Framework | ✅ Verified (Closed) |
-| **012** | **Save/Load System** | 🚧 **In progress** — Step 1 / 18 |
+| **012** | **Save/Load System** | 🚧 **In progress** — Step 3 / 18 (Batch 1) |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
@@ -132,7 +132,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Test Status
 
-- **609 / 609 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
+- **620 / 620 build tests passing** (Release x64) on **GCC** and **MSVC.** **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.

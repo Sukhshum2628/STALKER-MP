@@ -157,6 +157,7 @@
     <ClCompile Include="PredictionTests.cpp" />
     <ClCompile Include="PersistenceTests.cpp" />
     <ClCompile Include="SaveLoadTests.cpp" />
+    <ClCompile Include="..\src\saveload\SaveLoadConfiguration.cpp" />
     <ClCompile Include="..\src\persistence\PersistenceConfiguration.cpp" />
     <ClCompile Include="..\src\persistence\SaveMetadataBuilder.cpp" />
     <ClCompile Include="..\src\persistence\ValidationFramework.cpp" />

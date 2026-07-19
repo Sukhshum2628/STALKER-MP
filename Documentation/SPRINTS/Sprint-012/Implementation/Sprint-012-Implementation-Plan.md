@@ -149,6 +149,27 @@ Each step is independently buildable (clean compile, tree green after each) and 
 ```
 No cycles. Reused Sprint-011/008/005/007/003 components are pre-existing inputs (not steps).
 
+### 12.A Implementation batching strategy (approved)
+
+The 18 implementation steps above are **unchanged** — their scope, requirements, dependencies, and ordering are frozen exactly as written. This subsection defines only the **execution batching**: which consecutive steps are implemented and Antigravity-verified together as a single cycle. Batching combines steps only where doing so violates no dependency, crosses no architectural/ADR/verification boundary, keeps diagnostics non-invasive and hardening test-only, and preserves independent testability and failure isolation. The four architectural gates (Step-09, Step-10, Step-13, Step-17) remain isolated, and Step-18 is the documentation-only closure batch. Step-01 was implemented as its own initial cycle before this batching strategy was adopted.
+
+| Batch | Steps | Isolation | Nature of the batch |
+|---|---|---|---|
+| **B1** | 02 + 03 | — | Config + serialization format/byte primitives (pure, independent, engine-free foundation). |
+| **B2** | 04 + 05 | — | `SaveWriter` + `SaveReader` (tightly-coupled round-trip; deterministic). |
+| **B3** | 06 + 07 + 08 | — | Integrity validation + version/migration + `ISaveSource` read seam (three mutually-independent pure components; reuse `VersionManager`/`ValidationFramework` unchanged). |
+| **B4** | 09 | **Isolated** | Platform filesystem backend — **Singular Platform Boundary / ADR-009** (only OS/file TU; Windows smoke). |
+| **B5** | 10 | **Isolated** | Restore-sink seams — **Singular Engine Boundary / ADR-008** write-boundary decision point. |
+| **B6** | 11 + 12 | — | World/Environment + Entity/Player restorers (sibling engine-free consumers of the frozen Step-10 seams). |
+| **B7** | 13 | **Isolated** | ALife/Scheduler restoration — **One ALife Simulation / Sprint-005 sanctioned gateway** sensitivity. |
+| **B8** | 14 + 15 + 16 | — | **Recovery Subsystem** (single cohesive unit): `SaveManager` + `RecoveryPipeline`, its non-invasive diagnostics, and its additive test-only hardening/negative surface. |
+| **B9** | 17 | **Isolated** | Composition-root + engine adapters + integration + `SaveLoad.md` — **Integration gate** (ADR-008 real engine writes + ADR-009 store swap + startup-recovery-before-networking ordering; Windows smoke). |
+| **B10** | 18 | **Isolated** | Sprint closure (documentation only; no code). |
+
+**Recovery Subsystem batch (B8) — rationale.** Steps 14, 15, and 16 form one cohesive implementation unit: Step-16's negative/hardening surface exists precisely to validate Step-14's recovery-isolation guarantee (E-G5-SL), and Step-15 is a pure, non-invasive collector. The batch adds **no** engine interaction and **no** platform interaction (it uses the frozen restore-sink seams as fake/in-memory sinks and the in-memory store/source — the real engine adapters and filesystem backend are Step-09/Step-17). Recovery orchestration remains independently testable (its own `SaveManager`/`RecoveryPipeline` unit groups), diagnostics remain non-invasive, hardening remains additive and test-only, and the three separable test groups keep failure localization and Antigravity verification unambiguous.
+
+**Batching does not alter the dependency graph.** Cross-batch dependencies are the same edges listed above; batching only groups the verification cadence. Within any multi-step batch, the steps are implemented in their documented order.
+
 ---
 
 ## Step specifications
@@ -247,9 +268,11 @@ Each step: **Objective · Scope In/Out · FR · Evidence · Files · Tests · Co
 
 ---
 
-## Verification checkpoints (one per step)
+## Verification checkpoints (one per batch)
 
-Each step is its own verification boundary: implement Step-NN → clean Release|x64 build (GCC engine-free + MSVC) with zero warnings, all step tests green, baseline preserved → Antigravity verification → git commit → git push → next step. Load-bearing architectural gates (each verified in isolation, not batched across): **Step-09** (platform filesystem boundary / ADR-009), **Step-10** (restore-sink seams / ADR-008 write boundary), **Step-13** (ALife/scheduler restore via the sanctioned seam), **Step-17** (startup recovery ordering — before networking; store-backend swap). Foundational/pure steps (01-08, 11-12, 15-16) may be batched only when consecutive, mutually independent, and not crossing one of those gates.
+Each **batch** (§12.A) is a verification boundary: implement the batch's step(s) in their documented order → clean Release|x64 build (GCC engine-free + MSVC) with zero warnings, all step tests green, baseline preserved → Antigravity verification → git commit → git push → next batch. Every underlying step remains independently buildable and independently testable; batching only groups the verification cadence and never relaxes a step's own requirements.
+
+Load-bearing architectural gates are verified **in isolation** (never batched across): **Step-09 / Batch B4** (platform filesystem boundary / ADR-009), **Step-10 / Batch B5** (restore-sink seams / ADR-008 write boundary), **Step-13 / Batch B7** (ALife/scheduler restore via the sanctioned seam), **Step-17 / Batch B9** (startup recovery ordering — before networking; store-backend swap). **Step-18 / Batch B10** is the documentation-only closure boundary. Steps 14–16 are verified together as the single cohesive Recovery Subsystem boundary (**Batch B8**). Foundational/pure steps are batched only where §12.A permits — consecutive, mutually independent, and not crossing one of the isolated gates.
 
 ## Testing strategy (summary)
 
