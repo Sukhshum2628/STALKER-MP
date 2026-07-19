@@ -12,6 +12,7 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/persistence/PersistenceConfiguration.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
+#include "stalkermp/persistence/VersionManager.h"
 
 using namespace stalkermp;
 
@@ -265,4 +266,98 @@ TEST(PersistenceConfigStep2, WatermarkOrderingEnforced)
         s.Set("persistence", "backpressure_low_watermark", "8");
         EXPECT_TRUE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
     }
+}
+
+// ============================================================================
+// Step 3 — VersionManager
+// ============================================================================
+
+namespace
+{
+    persistence::VersionSet MakeVersions(std::uint32_t p, std::uint32_t w, std::uint32_t s, std::uint32_t c)
+    {
+        persistence::VersionSet v{};
+        v.persistence = p;
+        v.world = w;
+        v.schema = s;
+        v.compatibility = c;
+        return v;
+    }
+} // namespace
+
+// --- VersionSet defaults + equality ------------------------------------------
+TEST(VersionManagerStep3, VersionSetDefaultsAndEquality)
+{
+    constexpr persistence::VersionSet a{};
+    static_assert(a.persistence == 1u && a.world == 1u && a.schema == 1u && a.compatibility == 1u);
+    static_assert(persistence::VersionSet{} == persistence::VersionSet{});
+    EXPECT_TRUE(MakeVersions(1, 1, 1, 1) == persistence::VersionSet{});
+    EXPECT_TRUE(MakeVersions(2, 1, 1, 1) != persistence::VersionSet{});
+}
+
+// --- Identical version sets compare Equal + compatible + no migration ---------
+TEST(VersionManagerStep3, EqualWhenIdentical)
+{
+    const persistence::VersionManager mgr{MakeVersions(3, 4, 5, 6)};
+    const auto candidate = MakeVersions(3, 4, 5, 6);
+    EXPECT_EQ(mgr.Compare(candidate), persistence::VersionCompatibility::Equal);
+    EXPECT_TRUE(mgr.IsCompatible(candidate));
+    EXPECT_FALSE(mgr.MigrationRequired(candidate));
+    EXPECT_TRUE(mgr.Current() == MakeVersions(3, 4, 5, 6));
+}
+
+// --- Differing persistence/world/schema (same compatibility) => migration -----
+TEST(VersionManagerStep3, MigrationRequiredWhenInnerVersionsDiffer)
+{
+    const persistence::VersionManager mgr{MakeVersions(2, 2, 2, 5)};
+
+    // persistence differs
+    EXPECT_EQ(mgr.Compare(MakeVersions(1, 2, 2, 5)), persistence::VersionCompatibility::MigrationRequired);
+    // world differs
+    EXPECT_EQ(mgr.Compare(MakeVersions(2, 9, 2, 5)), persistence::VersionCompatibility::MigrationRequired);
+    // schema differs
+    EXPECT_EQ(mgr.Compare(MakeVersions(2, 2, 7, 5)), persistence::VersionCompatibility::MigrationRequired);
+
+    EXPECT_TRUE(mgr.IsCompatible(MakeVersions(1, 2, 2, 5)));       // migratable
+    EXPECT_TRUE(mgr.MigrationRequired(MakeVersions(2, 2, 7, 5)));
+}
+
+// --- Differing compatibility boundary => Incompatible (hard gate) -------------
+TEST(VersionManagerStep3, IncompatibleWhenCompatibilityDiffers)
+{
+    const persistence::VersionManager mgr{MakeVersions(2, 2, 2, 5)};
+
+    // Even when everything else matches, a differing compatibility is Incompatible.
+    EXPECT_EQ(mgr.Compare(MakeVersions(2, 2, 2, 6)), persistence::VersionCompatibility::Incompatible);
+    EXPECT_EQ(mgr.Compare(MakeVersions(2, 2, 2, 4)), persistence::VersionCompatibility::Incompatible);
+    // Compatibility gate dominates inner differences too.
+    EXPECT_EQ(mgr.Compare(MakeVersions(9, 9, 9, 6)), persistence::VersionCompatibility::Incompatible);
+
+    EXPECT_FALSE(mgr.IsCompatible(MakeVersions(2, 2, 2, 6)));
+    EXPECT_FALSE(mgr.MigrationRequired(MakeVersions(2, 2, 2, 6))); // incompatible, not migratable
+}
+
+// --- Compare is deterministic + constexpr-evaluable ---------------------------
+TEST(VersionManagerStep3, DeterministicAndConstexpr)
+{
+    constexpr persistence::VersionManager mgr{persistence::VersionSet{}};
+    static_assert(mgr.Compare(persistence::VersionSet{}) == persistence::VersionCompatibility::Equal);
+    static_assert(mgr.IsCompatible(persistence::VersionSet{}));
+
+    const persistence::VersionManager m{MakeVersions(1, 2, 3, 4)};
+    const auto cand = MakeVersions(1, 9, 3, 4);
+    EXPECT_EQ(m.Compare(cand), m.Compare(cand)); // stable/deterministic
+}
+
+// --- VersionCompatibility name helper: all enumerators + Unknown --------------
+TEST(VersionManagerStep3, CompatibilityNamesTotal)
+{
+    EXPECT_STREQ(persistence::VersionCompatibilityName(persistence::VersionCompatibility::Equal), "Equal");
+    EXPECT_STREQ(persistence::VersionCompatibilityName(persistence::VersionCompatibility::MigrationRequired),
+                 "MigrationRequired");
+    EXPECT_STREQ(persistence::VersionCompatibilityName(persistence::VersionCompatibility::Incompatible),
+                 "Incompatible");
+    EXPECT_STREQ(persistence::VersionCompatibilityName(static_cast<persistence::VersionCompatibility>(200)),
+                 "Unknown");
+    static_assert(std::is_same_v<std::underlying_type_t<persistence::VersionCompatibility>, std::uint8_t>);
 }

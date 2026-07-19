@@ -315,6 +315,7 @@
     <ClInclude Include="include\stalkermp\prediction\PredictionTypes.h" />
     <ClInclude Include="include\stalkermp\persistence\PersistenceTypes.h" />
     <ClInclude Include="include\stalkermp\persistence\PersistenceConfiguration.h" />
+    <ClInclude Include="include\stalkermp\persistence\VersionManager.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
