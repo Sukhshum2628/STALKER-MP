@@ -9,7 +9,7 @@
 |--------|-------|
 | Sprint | 011 |
 | Title | Persistence Framework |
-| Status | Planned |
+| Status | **FROZEN** (design scope frozen for implementation, 2026-07-18) |
 | Priority | Critical |
 | Estimated Duration | 2–3 Weeks |
 | Prerequisites | Sprint-001 through Sprint-010 |
