@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "stalkermp/core/Config.h"
+#include "stalkermp/persistence/PersistenceConfiguration.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
 
 using namespace stalkermp;
@@ -136,4 +138,131 @@ TEST(PersistenceTypesStep1, NameHelpersAreConstexpr)
     static_assert(persistence::SaveTriggerName(persistence::SaveTrigger::Autosave)[0] == 'A');
     static_assert(persistence::SaveStateName(persistence::SaveState::Failed)[0] == 'F');
     SUCCEED();
+}
+
+// ============================================================================
+// Step 2 — PersistenceConfiguration::FromConfig
+// ============================================================================
+
+// --- Missing [persistence] section => all documented defaults -----------------
+TEST(PersistenceConfigStep2, DefaultsWhenSectionAbsent)
+{
+    core::ConfigStore store;
+    const auto r = persistence::PersistenceConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.queueDepth, 16u);
+    EXPECT_EQ(c.autosaveIntervalTicks, 0u);
+    EXPECT_EQ(c.maxRetries, 3u);
+    EXPECT_EQ(c.retryBackoffTicks, 30u);
+    EXPECT_EQ(c.backpressureHighWatermark, 12u);
+    EXPECT_EQ(c.backpressureLowWatermark, 4u);
+    EXPECT_EQ(c.version, 1u);
+}
+
+// --- Each field parses a valid supplied value (override) ----------------------
+TEST(PersistenceConfigStep2, OverridesParsed)
+{
+    core::ConfigStore store;
+    store.Set("persistence", "queue_depth", "64");
+    store.Set("persistence", "autosave_interval_ticks", "1800");
+    store.Set("persistence", "max_retries", "5");
+    store.Set("persistence", "retry_backoff_ticks", "60");
+    store.Set("persistence", "backpressure_high_watermark", "50");
+    store.Set("persistence", "backpressure_low_watermark", "10");
+    store.Set("persistence", "version", "2");
+    const auto r = persistence::PersistenceConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.queueDepth, 64u);
+    EXPECT_EQ(c.autosaveIntervalTicks, 1800u);
+    EXPECT_EQ(c.maxRetries, 5u);
+    EXPECT_EQ(c.retryBackoffTicks, 60u);
+    EXPECT_EQ(c.backpressureHighWatermark, 50u);
+    EXPECT_EQ(c.backpressureLowWatermark, 10u);
+    EXPECT_EQ(c.version, 2u);
+}
+
+// --- Zeroable fields accept 0 (autosave disabled; no retry/backoff; wm off) ----
+TEST(PersistenceConfigStep2, ZeroableFieldsAcceptZero)
+{
+    core::ConfigStore store;
+    store.Set("persistence", "autosave_interval_ticks", "0");
+    store.Set("persistence", "max_retries", "0");
+    store.Set("persistence", "retry_backoff_ticks", "0");
+    store.Set("persistence", "backpressure_high_watermark", "0");
+    store.Set("persistence", "backpressure_low_watermark", "0");
+    const auto r = persistence::PersistenceConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.autosaveIntervalTicks, 0u);
+    EXPECT_EQ(c.maxRetries, 0u);
+    EXPECT_EQ(c.retryBackoffTicks, 0u);
+    EXPECT_EQ(c.backpressureHighWatermark, 0u);
+    EXPECT_EQ(c.backpressureLowWatermark, 0u);
+}
+
+// --- Boundary minimums accepted (queueDepth = version = 1; wm = queueDepth) ----
+TEST(PersistenceConfigStep2, BoundaryMinimumsAccepted)
+{
+    core::ConfigStore store;
+    store.Set("persistence", "queue_depth", "1");
+    store.Set("persistence", "backpressure_high_watermark", "1"); // == queueDepth
+    store.Set("persistence", "backpressure_low_watermark", "1");  // == high
+    store.Set("persistence", "version", "1");
+    const auto r = persistence::PersistenceConfiguration::FromConfig(store);
+    ASSERT_TRUE(r.HasValue());
+    const auto& c = r.Value();
+    EXPECT_EQ(c.queueDepth, 1u);
+    EXPECT_EQ(c.backpressureHighWatermark, 1u);
+    EXPECT_EQ(c.backpressureLowWatermark, 1u);
+    EXPECT_EQ(c.version, 1u);
+}
+
+// --- Invalid per-field values are rejected (value outcome) --------------------
+TEST(PersistenceConfigStep2, InvalidPerFieldValuesRejected)
+{
+    {
+        core::ConfigStore s;
+        s.Set("persistence", "queue_depth", "0"); // below min 1
+        EXPECT_FALSE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("persistence", "version", "0"); // below min 1
+        EXPECT_FALSE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        core::ConfigStore s;
+        s.Set("persistence", "queue_depth", "-5"); // negative
+        EXPECT_FALSE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
+    }
+}
+
+// --- Cross-field watermark ordering enforced: low <= high <= queueDepth --------
+TEST(PersistenceConfigStep2, WatermarkOrderingEnforced)
+{
+    {
+        // low > high
+        core::ConfigStore s;
+        s.Set("persistence", "backpressure_high_watermark", "4");
+        s.Set("persistence", "backpressure_low_watermark", "8");
+        EXPECT_FALSE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        // high > queueDepth
+        core::ConfigStore s;
+        s.Set("persistence", "queue_depth", "8");
+        s.Set("persistence", "backpressure_high_watermark", "16");
+        s.Set("persistence", "backpressure_low_watermark", "2");
+        EXPECT_FALSE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
+    }
+    {
+        // valid ordering accepted
+        core::ConfigStore s;
+        s.Set("persistence", "queue_depth", "8");
+        s.Set("persistence", "backpressure_high_watermark", "8");
+        s.Set("persistence", "backpressure_low_watermark", "8");
+        EXPECT_TRUE(persistence::PersistenceConfiguration::FromConfig(s).HasValue());
+    }
 }

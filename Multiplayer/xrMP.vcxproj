@@ -142,6 +142,7 @@
     <ClCompile Include="src\snapshot\SnapshotDiagnostics.cpp" />
     <ClCompile Include="src\replication\ReplicationConfiguration.cpp" />
     <ClCompile Include="src\prediction\PredictionConfiguration.cpp" />
+    <ClCompile Include="src\persistence\PersistenceConfiguration.cpp" />
     <ClCompile Include="src\prediction\PredictionManager.cpp" />
     <ClCompile Include="src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="src\prediction\InterpolationManager.cpp" />
@@ -313,6 +314,7 @@
     <ClInclude Include="include\stalkermp\replication\ReplicationDiagnostics.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionTypes.h" />
     <ClInclude Include="include\stalkermp\persistence\PersistenceTypes.h" />
+    <ClInclude Include="include\stalkermp\persistence\PersistenceConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
