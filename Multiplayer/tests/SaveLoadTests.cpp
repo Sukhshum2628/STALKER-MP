@@ -18,8 +18,10 @@
 #include "stalkermp/saveload/InMemorySaveSource.h"
 #include "stalkermp/saveload/IRestoreSinks.h"
 #include "stalkermp/saveload/ISaveSource.h"
+#include "stalkermp/saveload/AlifeRestorer.h"
 #include "stalkermp/saveload/EntityRestorer.h"
 #include "stalkermp/saveload/NullSaveSource.h"
+#include "stalkermp/saveload/SchedulerRestorer.h"
 #include "stalkermp/saveload/PlayerRestorer.h"
 #include "stalkermp/saveload/RecordingRestoreSinks.h"
 #include "stalkermp/saveload/WorldRestorer.h"
@@ -1150,4 +1152,72 @@ TEST(EntityPlayerRestoreStep12, EmptySave)
     EXPECT_EQ(saveload::PlayerRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
     EXPECT_TRUE(sinks.entities.empty());
     EXPECT_TRUE(sinks.players.empty());
+}
+
+// ============================================================================
+// Step 13 — AlifeRestorer + SchedulerRestorer
+// ============================================================================
+
+namespace
+{
+    saveload::AlifeRestoreRecord AlifeRec(std::uint32_t smartTerrainId)
+    {
+        saveload::AlifeRestoreRecord a{};
+        a.smartTerrainId = smartTerrainId;
+        return a;
+    }
+} // namespace
+
+// --- ALife records restored in save order through the seam --------------------
+TEST(AlifeSchedulerRestoreStep13, AlifeRestoredInOrder)
+{
+    saveload::LoadedSave save{};
+    save.alife.push_back(AlifeRec(10));
+    save.alife.push_back(AlifeRec(20));
+    save.alife.push_back(AlifeRec(30));
+    saveload::RecordingRestoreSinks sinks;
+
+    EXPECT_EQ(saveload::AlifeRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    ASSERT_EQ(sinks.alife.size(), 3u);
+    EXPECT_EQ(sinks.alife[0].smartTerrainId, 10u);
+    EXPECT_EQ(sinks.alife[1].smartTerrainId, 20u);
+    EXPECT_EQ(sinks.alife[2].smartTerrainId, 30u);
+}
+
+// --- An ALife-sink failure short-circuits -------------------------------------
+TEST(AlifeSchedulerRestoreStep13, AlifeFailureShortCircuits)
+{
+    saveload::LoadedSave save{};
+    save.alife.push_back(AlifeRec(10));
+    save.alife.push_back(AlifeRec(20));
+    saveload::RecordingRestoreSinks sinks;
+    sinks.SetOutcome(saveload::SaveLoadOutcome::IntegrityFailure);
+
+    EXPECT_EQ(saveload::AlifeRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::IntegrityFailure);
+    EXPECT_EQ(sinks.alife.size(), 1u); // stopped after the first failing apply
+}
+
+// --- Empty ALife restores nothing and succeeds --------------------------------
+TEST(AlifeSchedulerRestoreStep13, AlifeEmpty)
+{
+    saveload::LoadedSave save{}; // no alife records
+    saveload::RecordingRestoreSinks sinks;
+    EXPECT_EQ(saveload::AlifeRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    EXPECT_TRUE(sinks.alife.empty());
+}
+
+// --- Scheduler restored through the seam; failure propagates ------------------
+TEST(AlifeSchedulerRestoreStep13, SchedulerRestored)
+{
+    const saveload::LoadedSave save = MakeLoadedSave(); // scheduler tick 4200
+    saveload::RecordingRestoreSinks sinks;
+
+    EXPECT_EQ(saveload::SchedulerRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    ASSERT_EQ(sinks.schedulers.size(), 1u);
+    EXPECT_EQ(sinks.schedulers[0].simulationTick, 4200u);
+
+    saveload::RecordingRestoreSinks failing;
+    failing.SetOutcome(saveload::SaveLoadOutcome::CorruptedSave);
+    EXPECT_EQ(saveload::SchedulerRestorer::Restore(save, failing), saveload::SaveLoadOutcome::CorruptedSave);
+    EXPECT_EQ(failing.schedulers.size(), 1u); // the attempt is recorded
 }
