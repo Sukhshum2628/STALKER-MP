@@ -1618,3 +1618,151 @@ TEST(PersistenceDiagnosticsStep13, DeterministicAggregates)
     EXPECT_EQ(diag.WorkerSamples(), 4u);
     EXPECT_EQ(diag.DurationSamples(), 3u);
 }
+
+// ============================================================================
+// Step 15 — Composed-stack integration (manager + real snapshot queue)
+// ============================================================================
+
+// --- Snapshot consumption: a manual save persists the published snapshot -------
+TEST(PersistenceIntegrationStep15, SnapshotConsumptionEndToEnd)
+{
+    PersistRig rig{ManagerConfig(8, 0)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(1234);
+
+    EXPECT_EQ(rig.manager.RequestSave(persistence::SaveTrigger::Manual), persistence::PersistenceOutcome::Ok);
+    rig.manager.Tick(0.016);
+
+    ASSERT_EQ(rig.store.CommittedCount(), 1u);
+    // The committed metadata reflects the consumed snapshot (tick + real checksum).
+    EXPECT_EQ(rig.store.LastCommitted().simulationTick, 1234u);
+    EXPECT_NE(rig.store.LastCommitted().checksum, 0u);
+    EXPECT_EQ(rig.store.LastCommitted().entityCount, 1u);
+}
+
+// --- Scheduler timing: autosave cadence is exact through the manager ----------
+TEST(PersistenceIntegrationStep15, AutosaveCadenceThroughManager)
+{
+    PersistRig rig{ManagerConfig(8, /*autosave*/ 3)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(10);
+
+    for (int i = 0; i < 10; ++i) // ticks 1..10; arm at 1 -> autosave at 4, 7, 10
+    {
+        rig.manager.Tick(0.016);
+    }
+    const auto stats = rig.manager.Statistics();
+    EXPECT_EQ(stats.autosaves, 3u);
+    EXPECT_EQ(stats.completedSaves, 3u);
+    EXPECT_EQ(rig.store.CommittedCount(), 3u);
+}
+
+// --- Queue stability + back-pressure under burst (no snapshot), then drain -----
+TEST(PersistenceIntegrationStep15, QueueStabilityUnderBurst)
+{
+    // Autosave every tick, tiny queue, and NO snapshot -> the queue fills and
+    // overflows but stays strictly bounded.
+    persistence::PersistenceConfiguration cfg = ManagerConfig(3, /*autosave*/ 1);
+    cfg.backpressureHighWatermark = 2;
+    cfg.backpressureLowWatermark = 1;
+    PersistRig rig{cfg};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+
+    for (int i = 0; i < 20; ++i)
+    {
+        rig.manager.Tick(0.016); // autosave enqueued each tick; nothing drains it
+    }
+    const auto stats = rig.manager.Statistics();
+    EXPECT_LE(rig.manager.QueueDepth(), 3u);      // bounded — never exceeds capacity
+    EXPECT_LE(stats.maxQueueDepth, 3u);
+    EXPECT_GT(stats.queueOverflows, 0u);          // burst overflowed
+    EXPECT_EQ(rig.store.CommittedCount(), 0u);    // no snapshot -> nothing persisted
+
+    // Once a snapshot arrives, the backlog drains deterministically (bounded batch).
+    rig.PublishSnapshot(99);
+    rig.manager.Tick(0.016);
+    EXPECT_GT(rig.store.CommittedCount(), 0u);
+    EXPECT_LE(rig.manager.QueueDepth(), 3u);
+}
+
+// --- Version compatibility: committed versions match the build ----------------
+TEST(PersistenceIntegrationStep15, VersionCompatibility)
+{
+    PersistRig rig{ManagerConfig(8, 0)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(7);
+    (void)rig.manager.RequestSave(persistence::SaveTrigger::Manual);
+    rig.manager.Tick(0.016);
+    ASSERT_EQ(rig.store.CommittedCount(), 1u);
+
+    // The save's versions are self-consistent with a matching build (Equal), and a
+    // differing compatibility boundary would be Incompatible (load-time gate).
+    const auto& meta = rig.store.LastCommitted();
+    const persistence::VersionManager build{
+        MakeVersions(1, meta.worldVersion, 1, 1)}; // world version from the snapshot
+    EXPECT_TRUE(build.IsCompatible(MakeVersions(1, meta.worldVersion, 1, 1)));
+    EXPECT_FALSE(build.IsCompatible(MakeVersions(1, meta.worldVersion, 1, 2)));
+}
+
+// --- Failure isolation: a store failure never blocks the manager or corrupts ----
+TEST(PersistenceIntegrationStep15, FailureIsolationInComposedStack)
+{
+    PersistRig rig{ManagerConfig(8, /*autosave*/ 2)};
+    ASSERT_TRUE(rig.manager.Initialize().HasValue());
+    rig.PublishSnapshot(55);
+
+    // Commit one good save (the "previous").
+    (void)rig.manager.RequestSave(persistence::SaveTrigger::Manual);
+    rig.manager.Tick(0.016);
+    ASSERT_EQ(rig.store.CommittedCount(), 1u);
+    const std::uint64_t previousSaveId = rig.store.LastCommitted().saveId;
+
+    // Now the backend fails: the manager keeps ticking, nothing new commits, and the
+    // previous save is retained.
+    rig.store.SetFailWrites(true);
+    for (int i = 0; i < 10; ++i)
+    {
+        rig.manager.Tick(0.016); // autosaves attempted + fail; retain-previous
+    }
+    EXPECT_EQ(rig.store.CommittedCount(), 1u);
+    EXPECT_EQ(rig.store.LastCommitted().saveId, previousSaveId);
+    EXPECT_GT(rig.manager.Statistics().failedSaves, 0u);
+
+    // Recovery: once the backend is healthy again, saving resumes.
+    rig.store.SetFailWrites(false);
+    for (int i = 0; i < 4; ++i)
+    {
+        rig.manager.Tick(0.016);
+    }
+    EXPECT_GT(rig.store.CommittedCount(), 1u);
+}
+
+// --- Determinism / replay: two composed stacks agree exactly ------------------
+TEST(PersistenceIntegrationStep15, DeterministicReplay)
+{
+    auto drive = [](PersistRig& rig) {
+        (void)rig.manager.Initialize();
+        rig.PublishSnapshot(321);
+        (void)rig.manager.RequestSave(persistence::SaveTrigger::Manual);
+        for (int i = 0; i < 30; ++i)
+        {
+            rig.manager.Tick(0.016);
+        }
+    };
+
+    PersistRig a{ManagerConfig(6, /*autosave*/ 4)};
+    PersistRig b{ManagerConfig(6, /*autosave*/ 4)};
+    drive(a);
+    drive(b);
+
+    ASSERT_EQ(a.store.CommittedCount(), b.store.CommittedCount());
+    EXPECT_GT(a.store.CommittedCount(), 0u);
+    EXPECT_EQ(a.store.LastCommitted().checksum, b.store.LastCommitted().checksum);
+    EXPECT_EQ(a.store.LastCommitted().saveId, b.store.LastCommitted().saveId);
+    const auto sa = a.manager.Statistics();
+    const auto sb = b.manager.Statistics();
+    EXPECT_EQ(sa.completedSaves, sb.completedSaves);
+    EXPECT_EQ(sa.autosaves, sb.autosaves);
+    EXPECT_EQ(sa.saveRequests, sb.saveRequests);
+    EXPECT_EQ(sa.maxQueueDepth, sb.maxQueueDepth);
+}
