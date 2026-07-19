@@ -18,6 +18,7 @@
 #include "stalkermp/persistence/PersistenceQueue.h"
 #include "stalkermp/persistence/PersistenceSnapshot.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
+#include "stalkermp/persistence/PersistenceWorker.h"
 #include "stalkermp/persistence/SaveMetadataBuilder.h"
 #include "stalkermp/persistence/ValidationFramework.h"
 #include "stalkermp/persistence/VersionManager.h"
@@ -938,4 +939,175 @@ TEST(PersistenceStoreStep8, NullStoreInert)
     auto b2 = seam.Begin(meta);
     ASSERT_TRUE(b2.HasValue());
     EXPECT_EQ(seam.Commit(b2.Value()), persistence::PersistenceOutcome::Ok);
+}
+
+// ============================================================================
+// Step 9 — PersistenceWorker (synchronous; no thread)
+// ============================================================================
+
+// --- Lifecycle: a stopped worker rejects work with WorkerUnavailable ----------
+TEST(PersistenceWorkerStep9, StoppedWorkerRejects)
+{
+    persistence::PersistenceWorker worker; // default: stopped
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+    const auto meta = persistence::SaveMetadataBuilder::Build(view, persistence::SaveTrigger::Manual, 1);
+
+    EXPECT_FALSE(worker.IsRunning());
+    EXPECT_EQ(worker.Persist(meta, snap, store), persistence::PersistenceOutcome::WorkerUnavailable);
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(1, 10), snap, versions, store),
+              persistence::PersistenceOutcome::WorkerUnavailable);
+    EXPECT_EQ(store.CommittedCount(), 0u);
+
+    worker.Start();
+    EXPECT_TRUE(worker.IsRunning());
+}
+
+// --- Success: Consume -> build metadata -> Persist commits a save -------------
+TEST(PersistenceWorkerStep9, ProcessRequestSuccess)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+
+    EXPECT_EQ(worker.Consume(snap, versions), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(7, 100, persistence::SaveTrigger::Autosave), snap, versions, store),
+              persistence::PersistenceOutcome::Ok);
+
+    ASSERT_EQ(store.CommittedCount(), 1u);
+    EXPECT_EQ(store.LastCommitted().saveId, 7u);
+    EXPECT_EQ(store.LastCommitted().checksum, persistence::SaveMetadataBuilder::Checksum(view));
+}
+
+// --- Consume rejects an invalid snapshot (no persist attempted) ---------------
+TEST(PersistenceWorkerStep9, ConsumeRejectsInvalidSnapshot)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+
+    // Not sealed -> IncompleteSnapshot; nothing persisted.
+    FakeSnapshotView building = MakeSealedView();
+    building.m_metadata.state = snapshot::SnapshotState::Building;
+    const persistence::PersistenceSnapshot bsnap{building};
+    EXPECT_EQ(worker.Consume(bsnap, versions), persistence::PersistenceOutcome::IncompleteSnapshot);
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(1, 1), bsnap, versions, store),
+              persistence::PersistenceOutcome::IncompleteSnapshot);
+    EXPECT_EQ(store.CommittedCount(), 0u);
+
+    // Inconsistent header -> IntegrityFailure.
+    FakeSnapshotView bad = MakeSealedView();
+    bad.m_metadata.entityCount = 42;
+    const persistence::PersistenceSnapshot badsnap{bad};
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(2, 2), badsnap, versions, store),
+              persistence::PersistenceOutcome::IntegrityFailure);
+    EXPECT_EQ(store.CommittedCount(), 0u);
+}
+
+// --- Failure isolation: a store failure aborts and retains the previous save ---
+TEST(PersistenceWorkerStep9, FailureRetainsPrevious)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+
+    // First save commits (the "previous").
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(1, 10), snap, versions, store),
+              persistence::PersistenceOutcome::Ok);
+    ASSERT_EQ(store.CommittedCount(), 1u);
+    EXPECT_EQ(store.LastCommitted().saveId, 1u);
+
+    // Next save hits a write failure -> StorageUnavailable, aborted, previous retained.
+    store.SetFailWrites(true);
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(2, 20), snap, versions, store),
+              persistence::PersistenceOutcome::StorageUnavailable);
+    EXPECT_EQ(store.CommittedCount(), 1u);          // no new commit
+    EXPECT_EQ(store.LastCommitted().saveId, 1u);    // previous save retained
+    EXPECT_EQ(store.PendingCount(), 0u);            // aborted, no dangling transaction
+
+    // Backend unavailable at Begin -> StorageUnavailable, previous still retained.
+    store.SetFailWrites(false);
+    store.SetAvailable(false);
+    EXPECT_EQ(worker.ProcessRequest(MakeRequest(3, 30), snap, versions, store),
+              persistence::PersistenceOutcome::StorageUnavailable);
+    EXPECT_EQ(store.CommittedCount(), 1u);
+    EXPECT_EQ(store.LastCommitted().saveId, 1u);
+}
+
+// --- Flush drains the queue on success; re-enqueues failures for a later pass ---
+TEST(PersistenceWorkerStep9, FlushQueueInteraction)
+{
+    persistence::PersistenceWorker worker;
+    worker.Start();
+    persistence::InMemoryPersistenceStore store;
+    const persistence::VersionManager versions{};
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+
+    persistence::PersistenceQueue queue{QueueConfig(8, 0, 0)};
+    EXPECT_EQ(queue.Publish(MakeRequest(1, 10)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(queue.Publish(MakeRequest(2, 20)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(queue.Publish(MakeRequest(3, 30)), persistence::PersistenceOutcome::Ok);
+
+    // Empty-queue flush is a value outcome, nothing persisted.
+    persistence::PersistenceQueue emptyQ{QueueConfig(4, 0, 0)};
+    EXPECT_EQ(worker.Flush(emptyQ, snap, versions, store), persistence::PersistenceOutcome::NothingToPersist);
+
+    // Successful drain: all three commit, queue emptied.
+    EXPECT_EQ(worker.Flush(queue, snap, versions, store), persistence::PersistenceOutcome::Ok);
+    EXPECT_TRUE(queue.Empty());
+    EXPECT_EQ(store.CommittedCount(), 3u);
+    EXPECT_EQ(worker.CompletedCount(), 3u);
+    EXPECT_EQ(worker.FailedCount(), 0u);
+
+    // Now make the store fail: the three requeued items are re-enqueued (retry path),
+    // and no new save commits (retain previous count of 3).
+    EXPECT_EQ(queue.Publish(MakeRequest(4, 40)), persistence::PersistenceOutcome::Ok);
+    EXPECT_EQ(queue.Publish(MakeRequest(5, 50)), persistence::PersistenceOutcome::Ok);
+    store.SetFailWrites(true);
+    EXPECT_EQ(worker.Flush(queue, snap, versions, store), persistence::PersistenceOutcome::StorageUnavailable);
+    EXPECT_EQ(store.CommittedCount(), 3u);      // retain previous; nothing new committed
+    EXPECT_EQ(queue.Size(), 2u);                // both failures re-enqueued for a later Flush
+    EXPECT_EQ(worker.FailedCount(), 2u);
+    EXPECT_EQ(queue.RetryCount(), 2u);
+}
+
+// --- Deterministic: two workers with identical inputs agree exactly -----------
+TEST(PersistenceWorkerStep9, Deterministic)
+{
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+    const persistence::VersionManager versions{};
+
+    auto run = [&](persistence::InMemoryPersistenceStore& store, persistence::PersistenceWorker& worker) {
+        worker.Start();
+        persistence::PersistenceQueue queue{QueueConfig(8, 0, 0)};
+        for (std::uint64_t i = 1; i <= 4; ++i)
+        {
+            (void)queue.Publish(MakeRequest(i, i * 10, persistence::SaveTrigger::Autosave));
+        }
+        (void)worker.Flush(queue, snap, versions, store);
+    };
+
+    persistence::InMemoryPersistenceStore sa;
+    persistence::PersistenceWorker wa;
+    persistence::InMemoryPersistenceStore sb;
+    persistence::PersistenceWorker wb;
+    run(sa, wa);
+    run(sb, wb);
+
+    ASSERT_EQ(sa.CommittedCount(), sb.CommittedCount());
+    EXPECT_EQ(sa.LastCommitted().saveId, sb.LastCommitted().saveId);
+    EXPECT_EQ(sa.LastCommitted().checksum, sb.LastCommitted().checksum);
+    EXPECT_EQ(wa.CompletedCount(), wb.CompletedCount());
+    EXPECT_EQ(wa.ProcessedCount(), wb.ProcessedCount());
 }
