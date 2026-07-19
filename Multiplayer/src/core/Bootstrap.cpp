@@ -70,6 +70,10 @@
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationManager.h"
+#include "stalkermp/persistence/InMemoryPersistenceStore.h"   // Sprint-011 storage seam (default/test backend)
+#include "stalkermp/persistence/IPersistenceStore.h"
+#include "stalkermp/persistence/PersistenceConfiguration.h"
+#include "stalkermp/persistence/PersistenceManager.h"
 #include "stalkermp/world/WorldConfiguration.h"
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
@@ -117,7 +121,18 @@ namespace stalkermp
             "; real-time minutes per in-world day at speed 1.0\n"
             "day_length_minutes = 90\n"
             "; verbose per-tick world logging (development aid)\n"
-            "debug_logging = false\n";
+            "debug_logging = false\n"
+            "\n"
+            "; Persistence Framework (Sprint-011). Queue/interval/backoff are tick or\n"
+            "; entry counts; autosave 0 = disabled. All optional (defaults shown).\n"
+            "[persistence]\n"
+            "queue_depth = 16\n"
+            "autosave_interval_ticks = 0\n"
+            "max_retries = 3\n"
+            "retry_backoff_ticks = 30\n"
+            "backpressure_high_watermark = 12\n"
+            "backpressure_low_watermark = 4\n"
+            "version = 1\n";
 
         constexpr std::string_view kDefaultClientConfig =
             "; STALKER-MP client configuration\n"
@@ -246,6 +261,16 @@ namespace stalkermp
             std::unique_ptr<prediction::IPresentationSink> presentationSink;
             std::unique_ptr<prediction::ClientPresentationDriver> clientPresentationDriver;
             std::uint64_t clientPresentationTick = 0;
+
+            // Persistence Framework (Sprint-011). The storage seam is Runtime-owned so
+            // it outlives the ServiceRegistry-owned PersistenceManager that references
+            // it (the manager never dereferences it at destruction). The default/test
+            // backend is the engine-free in-memory store; the real filesystem backend
+            // arrives in Sprint-012 behind the same IPersistenceStore seam. Only the
+            // PersistenceManager ticks (at kPersistence = 500); cached here for frame
+            // subscription/teardown. Read-only snapshot consumption; no thread.
+            std::unique_ptr<persistence::IPersistenceStore> persistenceStore;
+            persistence::PersistenceManager* persistenceManager = nullptr;
         };
 
         // The single module-global. See file header for justification.
@@ -686,6 +711,39 @@ namespace stalkermp
             }
             runtime.replicationManager = replicationManagerPtr;
 
+            // Persistence Framework (Sprint-011). Registered AFTER the SnapshotManager
+            // (its read-only snapshot source) and the Replication consumer, so
+            // registration-order InitializeAll initializes it last among the consumers.
+            // It consumes the Sprint-008 snapshot queue read-only, owns its
+            // scheduler/queue/worker/version-manager, and hands validated saves to the
+            // engine-free IPersistenceStore seam (the in-memory backend here; the real
+            // filesystem backend is Sprint-012). No thread; no OS/file code.
+            auto persistenceConfiguration = persistence::PersistenceConfiguration::FromConfig(runtime.serverConfig);
+            if (!persistenceConfiguration)
+            {
+                return persistenceConfiguration.GetError();
+            }
+            runtime.persistenceStore = std::make_unique<persistence::InMemoryPersistenceStore>();
+            auto persistenceManager = std::make_unique<persistence::PersistenceManager>(
+                persistenceConfiguration.Value(), snapshotManagerPtr->Queue(), *runtime.persistenceStore);
+            persistence::PersistenceManager* persistenceManagerPtr = persistenceManager.get();
+            if (auto registered = runtime.services.Register(std::move(persistenceManager)); !registered)
+            {
+                return registered;
+            }
+
+            // Single persistence tick at the reserved tick_order::kPersistence = 500,
+            // strictly after Replication (450) and before Networking (900): consumes the
+            // just-published snapshot and runs one synchronous persistence pass. Uses the
+            // single existing FrameDispatcher; no new tick_order key.
+            if (auto subscribed = runtime.frameDispatcher.Subscribe(
+                    *persistenceManagerPtr, tick_order::kPersistence, "Persistence");
+                !subscribed)
+            {
+                return subscribed;
+            }
+            runtime.persistenceManager = persistenceManagerPtr;
+
             runtime.worldManager = managerPtr;
             return Success();
         }
@@ -876,6 +934,20 @@ namespace stalkermp
                     Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
                 }
                 g_runtime->entityFeed.reset();
+            }
+
+            // Persistence Framework runtime (Sprint-011): unsubscribe FIRST among the
+            // consumers (persistence subscribed last, at kPersistence = 500), before
+            // ShutdownAll. The Runtime-owned store outlives ShutdownAll and is destroyed
+            // with the Runtime; the manager never dereferences it at destruction.
+            if (g_runtime->persistenceManager != nullptr)
+            {
+                if (auto unsubscribed = g_runtime->frameDispatcher.Unsubscribe(*g_runtime->persistenceManager);
+                    !unsubscribed && IsLogAvailable())
+                {
+                    Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
+                }
+                g_runtime->persistenceManager = nullptr;
             }
 
             // Replication Pipeline runtime (Sprint-009): unsubscribe from the
