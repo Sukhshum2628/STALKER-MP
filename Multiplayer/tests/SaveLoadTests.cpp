@@ -22,6 +22,8 @@
 #include "stalkermp/saveload/SaveMigrator.h"
 #include "stalkermp/saveload/SaveReader.h"
 #include "stalkermp/saveload/SaveWriter.h"
+#include "stalkermp/adapters/PlatformSaveStore.h"
+#include "stalkermp/persistence/PersistenceSnapshot.h"
 #include "stalkermp/snapshot/ISnapshotView.h"
 #include "stalkermp/snapshot/SnapshotTypes.h"
 
@@ -888,4 +890,85 @@ TEST(SaveSourceStep8, NullSourceInert)
     EXPECT_TRUE(seam.Enumerate().empty());
     EXPECT_FALSE(seam.Exists(1));
     EXPECT_FALSE(seam.Read(1).HasValue());
+}
+
+// ============================================================================
+// Step 9 — PlatformSaveStore (platform boundary: in-memory + filesystem backends)
+// ============================================================================
+
+namespace
+{
+    // Exercise the ISaveBackend contract against any backend: Begin -> Write ->
+    // Commit; read back + parse; enumerate; abort discards; delete removes.
+    void ExerciseBackend(adapters::ISaveBackend& backend)
+    {
+        const FakeSnapshotView view = MakeView();
+        const persistence::SaveMetadata meta = MakeMetadata(); // saveId 42, tick 4200
+        const persistence::PersistenceSnapshot snap{view};
+
+        // Write path: Begin -> Write -> Commit.
+        auto begin = backend.Store().Begin(meta);
+        ASSERT_TRUE(begin.HasValue());
+        const persistence::StoreHandle handle = begin.Value();
+        EXPECT_EQ(backend.Store().Write(handle, snap), persistence::PersistenceOutcome::Ok);
+        EXPECT_EQ(backend.Store().Commit(handle), persistence::PersistenceOutcome::Ok);
+
+        // Read path: the committed save exists, reads back, and round-trips.
+        EXPECT_TRUE(backend.Source().Exists(meta.saveId));
+        auto read = backend.Source().Read(meta.saveId);
+        ASSERT_TRUE(read.HasValue());
+        const saveload::ParseResult parsed = saveload::SaveReader::Parse(read.Value());
+        EXPECT_EQ(parsed.outcome, saveload::SaveLoadOutcome::Ok);
+        EXPECT_EQ(parsed.save.world.simulationTick, 4200u);
+        EXPECT_EQ(parsed.save.metadata.saveId, 42u);
+
+        // Enumerate lists exactly the one save.
+        auto list = backend.Source().Enumerate();
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].saveId, 42u);
+
+        // Abort discards a transaction without touching the committed save.
+        auto begin2 = backend.Store().Begin(meta);
+        ASSERT_TRUE(begin2.HasValue());
+        backend.Store().Abort(begin2.Value());
+        EXPECT_EQ(backend.Source().Enumerate().size(), 1u);
+
+        // A written-but-not-committed transaction cannot commit twice; delete removes.
+        EXPECT_EQ(backend.Delete(meta.saveId), saveload::SaveLoadOutcome::Ok);
+        EXPECT_FALSE(backend.Source().Exists(meta.saveId));
+        EXPECT_TRUE(backend.Source().Enumerate().empty());
+    }
+} // namespace
+
+// --- In-memory backend satisfies the backend contract -------------------------
+TEST(PlatformSaveStoreStep9, InMemoryBackendContract)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    ExerciseBackend(*backend);
+}
+
+// --- Real filesystem backend satisfies the same contract ----------------------
+TEST(PlatformSaveStoreStep9, FilesystemBackendContract)
+{
+    auto result = adapters::CreatePlatformSaveBackend("saveload_step9_testdir");
+    ASSERT_TRUE(result.HasValue());
+    ExerciseBackend(*result.Value());
+}
+
+// --- An unwritten transaction cannot be committed -----------------------------
+TEST(PlatformSaveStoreStep9, CommitWithoutWriteRejected)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    auto begin = backend->Store().Begin(MakeMetadata());
+    ASSERT_TRUE(begin.HasValue());
+    EXPECT_EQ(backend->Store().Commit(begin.Value()), persistence::PersistenceOutcome::IncompleteSnapshot);
+    EXPECT_TRUE(backend->Source().Enumerate().empty());
+}
+
+// --- An empty save-directory token is rejected --------------------------------
+TEST(PlatformSaveStoreStep9, EmptyTokenRejected)
+{
+    EXPECT_FALSE(adapters::CreatePlatformSaveBackend("").HasValue());
 }
