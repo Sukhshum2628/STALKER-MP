@@ -18,8 +18,11 @@
 #include "stalkermp/saveload/InMemorySaveSource.h"
 #include "stalkermp/saveload/IRestoreSinks.h"
 #include "stalkermp/saveload/ISaveSource.h"
+#include "stalkermp/saveload/EntityRestorer.h"
 #include "stalkermp/saveload/NullSaveSource.h"
+#include "stalkermp/saveload/PlayerRestorer.h"
 #include "stalkermp/saveload/RecordingRestoreSinks.h"
+#include "stalkermp/saveload/WorldRestorer.h"
 #include "stalkermp/saveload/SaveIntegrityValidator.h"
 #include "stalkermp/saveload/SaveMigrator.h"
 #include "stalkermp/saveload/SaveReader.h"
@@ -1066,4 +1069,85 @@ TEST(RestoreSinksStep10, ClearAndNonMutating)
     sinks.Clear();
     EXPECT_TRUE(sinks.entities.empty());
     EXPECT_TRUE(sinks.worlds.empty());
+}
+
+// ============================================================================
+// Step 11 — WorldRestorer (World + Environment)
+// ============================================================================
+
+// --- World then Environment applied in order through the seams ----------------
+TEST(WorldRestoreStep11, AppliesWorldThenEnvironment)
+{
+    const saveload::LoadedSave save = MakeLoadedSave(); // tick 4200, env version 7
+    saveload::RecordingRestoreSinks sinks;
+
+    EXPECT_EQ(saveload::WorldRestorer::Restore(save, sinks, sinks), saveload::SaveLoadOutcome::Ok);
+
+    ASSERT_EQ(sinks.worlds.size(), 1u);
+    EXPECT_EQ(sinks.worlds[0].simulationTick, 4200u);
+    ASSERT_EQ(sinks.environments.size(), 1u);
+    EXPECT_EQ(sinks.environments[0].environmentVersion, 7u);
+}
+
+// --- A world-sink failure short-circuits before Environment -------------------
+TEST(WorldRestoreStep11, FailureShortCircuits)
+{
+    const saveload::LoadedSave save = MakeLoadedSave();
+    saveload::RecordingRestoreSinks sinks;
+    sinks.SetOutcome(saveload::SaveLoadOutcome::IntegrityFailure);
+
+    EXPECT_EQ(saveload::WorldRestorer::Restore(save, sinks, sinks),
+              saveload::SaveLoadOutcome::IntegrityFailure);
+    EXPECT_EQ(sinks.worlds.size(), 1u);        // world attempted
+    EXPECT_TRUE(sinks.environments.empty());   // environment not reached
+}
+
+// ============================================================================
+// Step 12 — EntityRestorer + PlayerRestorer
+// ============================================================================
+
+// --- Entities restored in ascending order through the seam --------------------
+TEST(EntityPlayerRestoreStep12, EntitiesRestoredInOrder)
+{
+    const saveload::LoadedSave save = MakeLoadedSave(); // entities id 1, 2 (ascending)
+    saveload::RecordingRestoreSinks sinks;
+
+    EXPECT_EQ(saveload::EntityRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    ASSERT_EQ(sinks.entities.size(), 2u);
+    EXPECT_EQ(sinks.entities[0].id.value, 1u);
+    EXPECT_EQ(sinks.entities[1].id.value, 2u);
+}
+
+// --- An entity-sink failure short-circuits ------------------------------------
+TEST(EntityPlayerRestoreStep12, EntityFailureShortCircuits)
+{
+    const saveload::LoadedSave save = MakeLoadedSave();
+    saveload::RecordingRestoreSinks sinks;
+    sinks.SetOutcome(saveload::SaveLoadOutcome::CorruptedSave);
+
+    EXPECT_EQ(saveload::EntityRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::CorruptedSave);
+    EXPECT_EQ(sinks.entities.size(), 1u); // stopped after the first failing apply
+}
+
+// --- Players restored (offline) through the seam ------------------------------
+TEST(EntityPlayerRestoreStep12, PlayersRestored)
+{
+    const saveload::LoadedSave save = MakeLoadedSave(); // 1 player, id 9
+    saveload::RecordingRestoreSinks sinks;
+
+    EXPECT_EQ(saveload::PlayerRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    ASSERT_EQ(sinks.players.size(), 1u);
+    EXPECT_EQ(sinks.players[0].id.value, 9u);
+    EXPECT_EQ(sinks.players[0].entity.value, 1u);
+}
+
+// --- Empty save restores nothing and succeeds ---------------------------------
+TEST(EntityPlayerRestoreStep12, EmptySave)
+{
+    saveload::LoadedSave save{}; // no entities/players
+    saveload::RecordingRestoreSinks sinks;
+    EXPECT_EQ(saveload::EntityRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(saveload::PlayerRestorer::Restore(save, sinks), saveload::SaveLoadOutcome::Ok);
+    EXPECT_TRUE(sinks.entities.empty());
+    EXPECT_TRUE(sinks.players.empty());
 }

@@ -165,6 +165,9 @@
     <ClCompile Include="..\src\saveload\InMemorySaveSource.cpp" />
     <ClCompile Include="..\src\adapters\PlatformSaveStore.cpp" />
     <ClCompile Include="..\src\adapters\InMemorySaveBackend.cpp" />
+    <ClCompile Include="..\src\saveload\WorldRestorer.cpp" />
+    <ClCompile Include="..\src\saveload\EntityRestorer.cpp" />
+    <ClCompile Include="..\src\saveload\PlayerRestorer.cpp" />
     <ClCompile Include="..\src\persistence\PersistenceConfiguration.cpp" />
     <ClCompile Include="..\src\persistence\SaveMetadataBuilder.cpp" />
     <ClCompile Include="..\src\persistence\ValidationFramework.cpp" />

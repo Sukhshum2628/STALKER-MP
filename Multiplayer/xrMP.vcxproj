@@ -157,6 +157,9 @@
     <ClCompile Include="src\saveload\InMemorySaveSource.cpp" />
     <ClCompile Include="src\adapters\PlatformSaveStore.cpp" />
     <ClCompile Include="src\adapters\InMemorySaveBackend.cpp" />
+    <ClCompile Include="src\saveload\WorldRestorer.cpp" />
+    <ClCompile Include="src\saveload\EntityRestorer.cpp" />
+    <ClCompile Include="src\saveload\PlayerRestorer.cpp" />
     <ClCompile Include="src\prediction\PredictionManager.cpp" />
     <ClCompile Include="src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="src\prediction\InterpolationManager.cpp" />
@@ -355,6 +358,9 @@
     <ClInclude Include="include\stalkermp\saveload\InMemorySaveSource.h" />
     <ClInclude Include="include\stalkermp\saveload\IRestoreSinks.h" />
     <ClInclude Include="include\stalkermp\saveload\RecordingRestoreSinks.h" />
+    <ClInclude Include="include\stalkermp\saveload\WorldRestorer.h" />
+    <ClInclude Include="include\stalkermp\saveload\EntityRestorer.h" />
+    <ClInclude Include="include\stalkermp\saveload\PlayerRestorer.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
