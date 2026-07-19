@@ -12,6 +12,7 @@
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/persistence/PersistenceConfiguration.h"
+#include "stalkermp/persistence/PersistenceSnapshot.h"
 #include "stalkermp/persistence/PersistenceTypes.h"
 #include "stalkermp/persistence/SaveMetadataBuilder.h"
 #include "stalkermp/persistence/VersionManager.h"
@@ -517,4 +518,95 @@ TEST(SaveMetadataStep4, EmptySnapshot)
     EXPECT_EQ(meta.playerCount, 0u);
     EXPECT_EQ(meta.simulationTick, 0u);
     EXPECT_EQ(meta.checksum, persistence::SaveMetadataBuilder::Checksum(empty)); // deterministic
+}
+
+// ============================================================================
+// Step 5 — PersistenceSnapshot projection
+// ============================================================================
+
+namespace
+{
+    // A sealed, structurally-consistent view: id 100, tick 4200, 2 entities, 1
+    // player, header counts matching the containers, state Finalized.
+    FakeSnapshotView MakeSealedView()
+    {
+        FakeSnapshotView v = MakeView(); // tick 4200, 2 entities, 1 player
+        v.m_metadata.id = snapshot::SnapshotId{100};
+        v.m_metadata.entityCount = 2; // matches Entities().size()
+        v.m_metadata.playerCount = 1; // matches Players().size()
+        v.m_metadata.state = snapshot::SnapshotState::Finalized;
+        return v;
+    }
+} // namespace
+
+// --- Projection accessors mirror the underlying view (no copy) -----------------
+TEST(PersistenceSnapshotStep5, AccessorsProjectView)
+{
+    const FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+
+    EXPECT_EQ(snap.Tick(), 4200u);
+    EXPECT_EQ(snap.EntityCount(), 2u);
+    EXPECT_EQ(snap.PlayerCount(), 1u);
+    EXPECT_EQ(&snap.View(), &static_cast<const snapshot::ISnapshotView&>(view)); // borrows, no copy
+}
+
+// --- IsComplete: sealed (Finalized/Published) is complete; Building/Retired not -
+TEST(PersistenceSnapshotStep5, IsCompleteReflectsSealedState)
+{
+    FakeSnapshotView v = MakeSealedView();
+
+    v.m_metadata.state = snapshot::SnapshotState::Finalized;
+    EXPECT_TRUE(persistence::PersistenceSnapshot{v}.IsComplete());
+
+    v.m_metadata.state = snapshot::SnapshotState::Published;
+    EXPECT_TRUE(persistence::PersistenceSnapshot{v}.IsComplete());
+
+    v.m_metadata.state = snapshot::SnapshotState::Building;
+    EXPECT_FALSE(persistence::PersistenceSnapshot{v}.IsComplete());
+
+    v.m_metadata.state = snapshot::SnapshotState::Retired;
+    EXPECT_FALSE(persistence::PersistenceSnapshot{v}.IsComplete());
+}
+
+// --- IntegrityOk: real id + header counts agree with the containers -----------
+TEST(PersistenceSnapshotStep5, IntegrityOkRequiresConsistentHeader)
+{
+    // Consistent + real id -> ok.
+    EXPECT_TRUE(persistence::PersistenceSnapshot{MakeSealedView()}.IntegrityOk());
+
+    // None id -> not ok.
+    {
+        FakeSnapshotView v = MakeSealedView();
+        v.m_metadata.id = snapshot::SnapshotId{0};
+        EXPECT_FALSE(persistence::PersistenceSnapshot{v}.IntegrityOk());
+    }
+    // entityCount mismatch -> not ok.
+    {
+        FakeSnapshotView v = MakeSealedView();
+        v.m_metadata.entityCount = 5; // containers hold 2
+        EXPECT_FALSE(persistence::PersistenceSnapshot{v}.IntegrityOk());
+    }
+    // playerCount mismatch -> not ok.
+    {
+        FakeSnapshotView v = MakeSealedView();
+        v.m_metadata.playerCount = 9; // containers hold 1
+        EXPECT_FALSE(persistence::PersistenceSnapshot{v}.IntegrityOk());
+    }
+}
+
+// --- Deterministic + non-mutating: repeated reads are stable, view unchanged ---
+TEST(PersistenceSnapshotStep5, DeterministicAndReadOnly)
+{
+    FakeSnapshotView view = MakeSealedView();
+    const persistence::PersistenceSnapshot snap{view};
+
+    EXPECT_EQ(snap.Tick(), snap.Tick());
+    EXPECT_EQ(snap.IsComplete(), snap.IsComplete());
+    EXPECT_EQ(snap.IntegrityOk(), snap.IntegrityOk());
+
+    // The projection never mutates the underlying view.
+    EXPECT_EQ(view.Entities().size(), 2u);
+    EXPECT_EQ(view.m_metadata.simulationTick, 4200u);
+    EXPECT_EQ(view.m_metadata.state, snapshot::SnapshotState::Finalized);
 }
