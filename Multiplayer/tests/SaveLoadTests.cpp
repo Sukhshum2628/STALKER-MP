@@ -23,6 +23,7 @@
 #include "stalkermp/saveload/NullSaveSource.h"
 #include "stalkermp/saveload/SchedulerRestorer.h"
 #include "stalkermp/saveload/PlayerRestorer.h"
+#include "stalkermp/adapters/SaveLoadSeams.h"
 #include "stalkermp/saveload/RecordingRestoreSinks.h"
 #include "stalkermp/saveload/RecoveryPipeline.h"
 #include "stalkermp/saveload/SaveLoadDiagnostics.h"
@@ -1514,4 +1515,164 @@ TEST(SaveLoadHardeningStep16, DeterministicRecovery)
         EXPECT_EQ(a.entities[i].id.value, b.entities[i].id.value);
     }
     EXPECT_EQ(a.schedulers.size(), b.schedulers.size());
+}
+
+// ============================================================================
+// Step 17 — Composition integration (SaveManager + backend + RecoveryPipeline)
+//
+// These exercise the composed subsystem the way Bootstrap wires it (Step 17):
+// SaveManager writes through the in-memory ISaveBackend; a fresh RecoveryPipeline
+// reads that backend's Source() and restores through the (recording) restore-sink
+// boundary — modelling a server restart with no engine dependency. The real engine
+// sinks + filesystem backend are Antigravity-smoke-verified on Windows.
+// ============================================================================
+
+namespace
+{
+    persistence::SaveMetadata MakeMetadataId(std::uint64_t id)
+    {
+        persistence::SaveMetadata m = MakeMetadata();
+        m.saveId = id;
+        return m;
+    }
+
+    // Recover the newest save in `backend` through fresh recording sinks (a restart).
+    saveload::RecoveryReport RestartAndRecover(adapters::ISaveBackend& backend,
+                                               saveload::RecordingRestoreSinks& sinks)
+    {
+        const std::vector<saveload::SaveDescriptor> saves = backend.Source().Enumerate();
+        if (saves.empty())
+        {
+            return saveload::RecoveryReport{}; // NothingToLoad default
+        }
+        saveload::SaveMigrator migrator;
+        saveload::RecoveryPipeline pipeline{backend.Source(), MakeBuild(3, 7), migrator, /*target*/ 3};
+        return pipeline.Recover(saves.back().saveId, AllSinks(sinks));
+    }
+} // namespace
+
+// --- Server restart: save, drop the manager, recover through fresh sinks ------
+TEST(SaveLoadIntegrationStep17, ServerRestartRecovery)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+
+    // Session 1: the running server autosaves.
+    {
+        saveload::SaveManager manager{*backend, MakeBuild(3, 7)};
+        EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+    } // manager destroyed — the backend (storage) persists, as Bootstrap owns it.
+
+    // Session 2: a fresh process recovers before networking.
+    saveload::RecordingRestoreSinks sinks;
+    const saveload::RecoveryReport report = RestartAndRecover(*backend, sinks);
+
+    EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(report.finalState, saveload::LoadState::Completed);
+    EXPECT_EQ(report.reachedPhase, saveload::RestorePhase::Complete);
+    EXPECT_EQ(report.entitiesRestored, 2u);
+    EXPECT_EQ(report.playersRestored, 1u);
+
+    // Authoritative writes crossed ONLY the restore-sink boundary, in order.
+    EXPECT_EQ(sinks.worlds.size(), 1u);
+    EXPECT_EQ(sinks.environments.size(), 1u);
+    ASSERT_EQ(sinks.entities.size(), 2u);
+    EXPECT_EQ(sinks.entities[0].id.value, 1u); // ascending
+    EXPECT_EQ(sinks.entities[1].id.value, 2u);
+    ASSERT_EQ(sinks.players.size(), 1u);
+    EXPECT_EQ(sinks.players[0].id.value, 9u);
+    EXPECT_EQ(sinks.schedulers.size(), 1u);
+}
+
+// --- Autosave across multiple generations: newest is recovered ----------------
+TEST(SaveLoadIntegrationStep17, MultipleGenerationsRecoverNewest)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    saveload::SaveManager manager{*backend, MakeBuild(3, 7)};
+
+    EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadataId(100)), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadataId(200)), saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadataId(300)), saveload::SaveLoadOutcome::Ok);
+
+    const std::vector<saveload::SaveDescriptor> saves = manager.EnumerateSaves();
+    ASSERT_EQ(saves.size(), 3u);
+    EXPECT_EQ(saves.back().saveId, 300u); // ascending -> newest last
+
+    saveload::RecordingRestoreSinks sinks;
+    const saveload::RecoveryReport report = RestartAndRecover(*backend, sinks);
+    EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(report.saveId, 300u);
+}
+
+// --- Player reconnect: players restore OFFLINE, awaiting reconnect ------------
+TEST(SaveLoadIntegrationStep17, PlayersRestoreOfflineForReconnect)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    {
+        saveload::SaveManager manager{*backend, MakeBuild(3, 7)};
+        EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+    }
+
+    saveload::RecordingRestoreSinks sinks;
+    const saveload::RecoveryReport report = RestartAndRecover(*backend, sinks);
+    ASSERT_EQ(report.outcome, saveload::SaveLoadOutcome::Ok);
+    ASSERT_EQ(sinks.players.size(), 1u);
+    // The player is restored with its owning entity; connection is re-established by
+    // the networking layer AFTER recovery (recovery runs before networking).
+    EXPECT_EQ(sinks.players[0].entity.value, 1u);
+}
+
+// --- Null restore boundary: recovery still completes, writes nothing ----------
+//     Models the engine build's boundary shape via the inert null sinks: the whole
+//     Load -> Validate -> Migrate -> Restore pipeline runs deterministically and
+//     reports success without any observable state (writes owned elsewhere).
+TEST(SaveLoadIntegrationStep17, NullRestoreBoundaryCompletes)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    {
+        saveload::SaveManager manager{*backend, MakeBuild(3, 7)};
+        EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+    }
+
+    auto bundle = adapters::CreateEngineRestoreSinks(); // test build -> NullRestoreSinkBundle
+    ASSERT_NE(bundle, nullptr);
+    const std::vector<saveload::SaveDescriptor> saves = backend->Source().Enumerate();
+    ASSERT_EQ(saves.size(), 1u);
+    saveload::SaveMigrator migrator;
+    saveload::RecoveryPipeline pipeline{backend->Source(), MakeBuild(3, 7), migrator, 3};
+    const saveload::RecoveryReport report = pipeline.Recover(saves.back().saveId, bundle->Sinks());
+
+    EXPECT_EQ(report.outcome, saveload::SaveLoadOutcome::Ok);
+    EXPECT_EQ(report.finalState, saveload::LoadState::Completed);
+    EXPECT_EQ(report.entitiesRestored, 2u);
+    EXPECT_EQ(report.playersRestored, 1u);
+}
+
+// --- Deterministic restart: two independent recoveries agree exactly ----------
+TEST(SaveLoadIntegrationStep17, DeterministicRestart)
+{
+    auto backend = adapters::CreateInMemorySaveBackend();
+    ASSERT_NE(backend, nullptr);
+    {
+        saveload::SaveManager manager{*backend, MakeBuild(3, 7)};
+        EXPECT_EQ(manager.CreateSave(MakeView(), MakeMetadata()), saveload::SaveLoadOutcome::Ok);
+    }
+
+    saveload::RecordingRestoreSinks a;
+    saveload::RecordingRestoreSinks b;
+    const auto ra = RestartAndRecover(*backend, a);
+    const auto rb = RestartAndRecover(*backend, b);
+
+    EXPECT_EQ(ra.outcome, rb.outcome);
+    EXPECT_EQ(ra.saveId, rb.saveId);
+    EXPECT_EQ(ra.entitiesRestored, rb.entitiesRestored);
+    ASSERT_EQ(a.entities.size(), b.entities.size());
+    for (std::size_t i = 0; i < a.entities.size(); ++i)
+    {
+        EXPECT_EQ(a.entities[i].id.value, b.entities[i].id.value);
+        EXPECT_EQ(a.entities[i].position.x, b.entities[i].position.x);
+    }
 }

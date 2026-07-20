@@ -185,6 +185,35 @@ TEST(Bootstrap, WorldSubsystemWiredThroughCompositionRoot)
     EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
 }
 
+// --- Sprint-012 Step-17: Save/Load wiring — startup recovery, not a subscriber ---
+TEST(Bootstrap, SaveLoadRecoveryIsStartupPhaseNotASubscriber)
+{
+    const auto params = MakeParams("saveload");
+
+    ASSERT_TRUE(stalkermp::Initialize(params));
+
+    // Step-17 swaps the persistence store for the build-selected save backend (the
+    // in-memory backend in tests) and runs RecoveryPipeline ONCE during Initialize —
+    // BEFORE the frame bridge and networking. With no prior save it is a non-fatal
+    // "fresh world" path, so Initialize still succeeds. Crucially, recovery is NOT a
+    // FrameDispatcher subscriber and introduces NO new tick_order key: the subscriber
+    // count is UNCHANGED from the Sprint-011 baseline of nine.
+    auto* dispatcher = stalkermp::detail::GetModuleFrameDispatcher();
+    ASSERT_NE(dispatcher, nullptr);
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(9));
+
+    // The swapped save backend still ticks persistence at kPersistence = 500 (a save
+    // path), and driving frames remains a deterministic no-op on an empty world.
+    for (int i = 0; i < 4; ++i)
+    {
+        dispatcher->Dispatch(0.016);
+    }
+    EXPECT_EQ(dispatcher->SubscriberCount(), static_cast<std::size_t>(9));
+
+    stalkermp::Shutdown();
+    EXPECT_EQ(stalkermp::detail::GetModuleFrameDispatcher(), nullptr);
+}
+
 // --- Sprint-010 Step-16: ClientPresentationDriver composition-root wiring ------
 TEST(Bootstrap, ClientPresentationDriverWiredInIdentityMode)
 {

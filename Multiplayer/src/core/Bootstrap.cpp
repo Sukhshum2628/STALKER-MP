@@ -70,10 +70,18 @@
 #include "stalkermp/replication/ReplicationClientRegistry.h"
 #include "stalkermp/replication/ReplicationConfiguration.h"
 #include "stalkermp/replication/ReplicationManager.h"
-#include "stalkermp/persistence/InMemoryPersistenceStore.h"   // Sprint-011 storage seam (default/test backend)
 #include "stalkermp/persistence/IPersistenceStore.h"
 #include "stalkermp/persistence/PersistenceConfiguration.h"
 #include "stalkermp/persistence/PersistenceManager.h"
+// Save/Load System (Sprint-012, Step 17) — composition-root wiring: build-selected
+// save backend + restoration write boundary + startup recovery (before networking).
+#include "stalkermp/adapters/PlatformSaveStore.h"          // adapters::ISaveBackend
+#include "stalkermp/adapters/SaveLoadSeams.h"              // CreateEngineSaveBackend / CreateEngineRestoreSinks
+#include "stalkermp/saveload/IRestoreSinkBundle.h"         // saveload::IRestoreSinkBundle
+#include "stalkermp/saveload/RecoveryPipeline.h"           // saveload::RecoveryPipeline
+#include "stalkermp/saveload/SaveFormat.h"                 // saveload::kSaveFormatVersion (recovery target)
+#include "stalkermp/saveload/SaveLoadConfiguration.h"      // saveload::SaveLoadConfiguration
+#include "stalkermp/saveload/SaveMigrator.h"               // saveload::SaveMigrator
 #include "stalkermp/world/WorldConfiguration.h"
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
@@ -262,15 +270,27 @@ namespace stalkermp
             std::unique_ptr<prediction::ClientPresentationDriver> clientPresentationDriver;
             std::uint64_t clientPresentationTick = 0;
 
-            // Persistence Framework (Sprint-011). The storage seam is Runtime-owned so
-            // it outlives the ServiceRegistry-owned PersistenceManager that references
-            // it (the manager never dereferences it at destruction). The default/test
-            // backend is the engine-free in-memory store; the real filesystem backend
-            // arrives in Sprint-012 behind the same IPersistenceStore seam. Only the
+            // Persistence Framework (Sprint-011) + Save/Load System (Sprint-012). The
+            // save backend is the Runtime-owned storage seam so it outlives the
+            // ServiceRegistry-owned PersistenceManager that references its Store() (the
+            // manager never dereferences it at destruction). Sprint-012, Step 17 swaps
+            // the default in-memory persistence store for the build-selected save
+            // backend: the real filesystem backend in the engine build, the in-memory
+            // backend in tests (adapters::CreateEngineSaveBackend). The write seam
+            // (Store(), IPersistenceStore) is the frozen Sprint-011 one, unchanged; the
+            // paired read seam (Source(), ISaveSource) feeds startup recovery. Only the
             // PersistenceManager ticks (at kPersistence = 500); cached here for frame
             // subscription/teardown. Read-only snapshot consumption; no thread.
-            std::unique_ptr<persistence::IPersistenceStore> persistenceStore;
+            std::unique_ptr<adapters::ISaveBackend> saveBackend;
+            saveload::SaveLoadConfiguration saveLoadConfig;
             persistence::PersistenceManager* persistenceManager = nullptr;
+
+            // Restoration write boundary (Sprint-012, Step 17). Owned here (outlives the
+            // one-shot startup RecoveryPipeline). Engine build: the real EngineAdapters
+            // sinks writing authoritative state through the sanctioned Sprint-003/005/007
+            // seams. Test build: inert null sinks. NOT a FrameDispatcher subscriber —
+            // recovery runs ONCE at Initialize, before the frame bridge and networking.
+            std::unique_ptr<saveload::IRestoreSinkBundle> restoreSinks;
         };
 
         // The single module-global. See file header for justification.
@@ -723,9 +743,29 @@ namespace stalkermp
             {
                 return persistenceConfiguration.GetError();
             }
-            runtime.persistenceStore = std::make_unique<persistence::InMemoryPersistenceStore>();
+
+            // Save/Load System (Sprint-012, Step 17). Parse the [saveload] config block
+            // and bind the build-selected save backend. The backend's write store
+            // (Store(), the frozen IPersistenceStore seam) replaces the Sprint-011
+            // in-memory store behind the SAME seam — the PersistenceManager and the
+            // kPersistence = 500 tick are otherwise unchanged. The backend's read source
+            // (Source(), ISaveSource) feeds startup recovery below. Filesystem I/O stays
+            // confined to PlatformSaveStore.cpp (engine build); tests use in-memory.
+            auto saveLoadConfiguration = saveload::SaveLoadConfiguration::FromConfig(runtime.serverConfig);
+            if (!saveLoadConfiguration)
+            {
+                return saveLoadConfiguration.GetError();
+            }
+            runtime.saveLoadConfig = saveLoadConfiguration.Value();
+            auto saveBackend = adapters::CreateEngineSaveBackend(runtime.saveLoadConfig);
+            if (!saveBackend)
+            {
+                return saveBackend.GetError();
+            }
+            runtime.saveBackend = std::move(saveBackend).Value();
+
             auto persistenceManager = std::make_unique<persistence::PersistenceManager>(
-                persistenceConfiguration.Value(), snapshotManagerPtr->Queue(), *runtime.persistenceStore);
+                persistenceConfiguration.Value(), snapshotManagerPtr->Queue(), runtime.saveBackend->Store());
             persistence::PersistenceManager* persistenceManagerPtr = persistenceManager.get();
             if (auto registered = runtime.services.Register(std::move(persistenceManager)); !registered)
             {
@@ -889,6 +929,50 @@ namespace stalkermp
                 return started;
             }
 
+            // 7b. Save/Load startup recovery (Sprint-012, Step 17). Runs ONCE here —
+            //     AFTER world Start groundwork, BEFORE the engine frame bridge and before
+            //     networking accepts connections — guaranteeing "simulation starts before
+            //     networking". This is NOT a FrameDispatcher subscriber and introduces NO
+            //     new tick_order key. Restoration crosses the engine boundary ONLY through
+            //     the Step-10 restore-sink seams (the Runtime-owned bundle). Recovery is
+            //     isolated (E-G5-SL): a missing/corrupted/partial save is a logged value
+            //     outcome that leaves the freshly-started world intact — never fatal.
+            runtime.restoreSinks = adapters::CreateEngineRestoreSinks();
+            if (runtime.saveLoadConfig.loadOnStartup)
+            {
+                const std::vector<saveload::SaveDescriptor> saves = runtime.saveBackend->Source().Enumerate();
+                if (saves.empty())
+                {
+                    runtime.logger.Info(kLogCategory, "Save/Load: no save to recover; starting a fresh world");
+                }
+                else
+                {
+                    // Enumerate() is ascending; the last descriptor is the newest save.
+                    const std::uint64_t newest = saves.back().saveId;
+                    saveload::SaveMigrator migrator;
+                    saveload::RecoveryPipeline pipeline(runtime.saveBackend->Source(), persistence::VersionManager{},
+                                                        migrator, saveload::kSaveFormatVersion);
+                    const saveload::RecoveryReport report =
+                        pipeline.Recover(newest, runtime.restoreSinks->Sinks());
+                    if (report.outcome == saveload::SaveLoadOutcome::Ok)
+                    {
+                        runtime.logger.Info(
+                            kLogCategory,
+                            common::Format("Save/Load: recovered save {} ({} entities, {} players) before networking",
+                                           report.saveId, report.entitiesRestored, report.playersRestored));
+                    }
+                    else
+                    {
+                        // Non-fatal: the world remains as freshly started (recovery isolation).
+                        runtime.logger.Warning(
+                            kLogCategory,
+                            common::Format("Save/Load: recovery of save {} did not complete (outcome {}); "
+                                           "continuing with the freshly-started world",
+                                           newest, static_cast<int>(report.outcome)));
+                    }
+                }
+            }
+
             // 8. Engine frame registration — strictly LAST: no engine
             //    callback may arrive before the module is fully ready
             //    (register-last / remove-first, Design Review §5).
@@ -936,10 +1020,13 @@ namespace stalkermp
                 g_runtime->entityFeed.reset();
             }
 
-            // Persistence Framework runtime (Sprint-011): unsubscribe FIRST among the
-            // consumers (persistence subscribed last, at kPersistence = 500), before
-            // ShutdownAll. The Runtime-owned store outlives ShutdownAll and is destroyed
-            // with the Runtime; the manager never dereferences it at destruction.
+            // Persistence Framework runtime (Sprint-011) + Save/Load System (Sprint-012):
+            // unsubscribe FIRST among the consumers (persistence subscribed last, at
+            // kPersistence = 500), before ShutdownAll. The Runtime-owned save backend
+            // (whose Store() the manager references) and the one-shot restore-sink bundle
+            // outlive ShutdownAll and are destroyed with the Runtime; the manager never
+            // dereferences the store at destruction. The restore-sink bundle is not a
+            // subscriber (recovery ran once at Initialize) — nothing to unsubscribe.
             if (g_runtime->persistenceManager != nullptr)
             {
                 if (auto unsubscribed = g_runtime->frameDispatcher.Unsubscribe(*g_runtime->persistenceManager);

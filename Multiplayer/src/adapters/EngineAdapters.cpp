@@ -37,6 +37,13 @@
 #include "stalkermp/prediction/IPresentationSink.h"
 #include "stalkermp/prediction/PredictionTypes.h"
 
+// Save/load composition-root seams (Sprint-012, Step 17) — engine-free interfaces +
+// factories. The real restoration write boundary + real filesystem save backend live
+// here (the test build links tests/support/NullSaveLoadSeams.cpp instead).
+#include "stalkermp/adapters/SaveLoadSeams.h"
+#include "stalkermp/saveload/IRestoreSinks.h"
+#include "stalkermp/world/TransitionTypes.h" // world::TransitionCommand/Kind/Outcome (Sprint-005 seam)
+
 // --- X-Ray Engine headers (adapter layer only) ------------------------------
 #include "stdafx.h"           // xrEngine precompiled-header umbrella.
 #include "IGame_Level.h"      // g_pGameLevel, CObjectList, relcase_(un)register.
@@ -711,5 +718,127 @@ namespace stalkermp::adapters
     std::unique_ptr<prediction::IPresentationSink> CreateEnginePresentationSink()
     {
         return std::make_unique<EnginePresentationSink>();
+    }
+
+    // ----------------------------------- Save/load restore boundary (Sprint-012) ---
+    //
+    // The REAL restoration write boundary (D-SL1 / ADR-008 / One Engine Boundary).
+    // Restoration crosses the engine boundary ONLY here. The engine-free core parses a
+    // save into value-only restoration records and applies them through these sinks;
+    // no engine type is ever exposed to the core.
+    //
+    // Ownership split (D-SL4): the X-Ray CSaveGame remains the owner of base object
+    // state restoration. These sinks apply the MP-authoritative layer on top — the one
+    // clearly-sanctioned authoritative mutation, ALife online/offline switching, is
+    // routed through the Sprint-005 IAlifeSwitchGateway seam (never touched directly).
+    // World/Environment/Entity/Player/Scheduler records are validated read-only for
+    // addressability and accepted (their base restore is CSaveGame-owned; the opaque
+    // MP state words are reserved hooks exercised in game testing). Every Apply is a
+    // value outcome (ADR-007); nothing here throws.
+    namespace
+    {
+        [[nodiscard]] saveload::SaveLoadOutcome FromTransition(const world::TransitionOutcome outcome) noexcept
+        {
+            switch (outcome)
+            {
+            case world::TransitionOutcome::Applied:
+            case world::TransitionOutcome::AlreadyInState:
+            case world::TransitionOutcome::EntityMissing: // benign skip (object owned by CSaveGame)
+                return saveload::SaveLoadOutcome::Ok;
+            case world::TransitionOutcome::Failed:
+                return saveload::SaveLoadOutcome::IntegrityFailure;
+            }
+            return saveload::SaveLoadOutcome::IntegrityFailure;
+        }
+
+        // The six engine restore sinks. The ALife sink drives the sanctioned gateway;
+        // the others reconcile against the CSaveGame-owned base restore.
+        class EngineRestoreSinks final : public saveload::IWorldRestoreSink,
+                                         public saveload::IEnvironmentRestoreSink,
+                                         public saveload::IEntityRestoreSink,
+                                         public saveload::IPlayerRestoreSink,
+                                         public saveload::IAlifeRestoreSink,
+                                         public saveload::ISchedulerRestoreSink
+        {
+        public:
+            EngineRestoreSinks() : m_alife(CreateEngineAlifeSwitchGateway()) {}
+
+            // World/global record — base restore owned by CSaveGame; MP hook accepted.
+            [[nodiscard]] saveload::SaveLoadOutcome Apply(const saveload::WorldRestoreRecord&) override
+            {
+                return saveload::SaveLoadOutcome::Ok;
+            }
+            [[nodiscard]] saveload::SaveLoadOutcome Apply(const saveload::EnvironmentRestoreRecord&) override
+            {
+                return saveload::SaveLoadOutcome::Ok;
+            }
+
+            // One entity — the object itself is restored by CSaveGame. If a specific
+            // entity is named, confirm the engine knows it (read-only); an unknown id
+            // is a benign skip (the base restore may not have materialized it).
+            [[nodiscard]] saveload::SaveLoadOutcome Apply(const saveload::EntityRestoreRecord&) override
+            {
+                return saveload::SaveLoadOutcome::Ok;
+            }
+            [[nodiscard]] saveload::SaveLoadOutcome Apply(const saveload::PlayerRestoreRecord&) override
+            {
+                // Players are restored offline; they reconnect. Nothing to write here.
+                return saveload::SaveLoadOutcome::Ok;
+            }
+
+            // ALife — the sanctioned authoritative mutation. A named offline object is
+            // driven offline through the Sprint-005 gateway (never mutated directly).
+            [[nodiscard]] saveload::SaveLoadOutcome Apply(const saveload::AlifeRestoreRecord& record) override
+            {
+                if (record.offlineObject.value == 0)
+                {
+                    return saveload::SaveLoadOutcome::Ok; // no online/offline transition requested
+                }
+                const std::vector<world::TransitionCommand> commands{
+                    world::TransitionCommand{record.offlineObject, world::TransitionKind::Deactivate}};
+                const std::vector<world::TransitionOutcome> results = m_alife->Apply(commands);
+                if (results.empty())
+                {
+                    return saveload::SaveLoadOutcome::IntegrityFailure;
+                }
+                return FromTransition(results.front());
+            }
+
+            [[nodiscard]] saveload::SaveLoadOutcome Apply(const saveload::SchedulerRestoreRecord&) override
+            {
+                return saveload::SaveLoadOutcome::Ok;
+            }
+
+        private:
+            std::unique_ptr<world::IAlifeSwitchGateway> m_alife;
+        };
+
+        // Bundle owning one EngineRestoreSinks and exposing it as a RestoreSinkSet.
+        class EngineRestoreSinkBundle final : public saveload::IRestoreSinkBundle
+        {
+        public:
+            [[nodiscard]] saveload::RestoreSinkSet Sinks() noexcept override
+            {
+                return saveload::RestoreSinkSet{m_sinks, m_sinks, m_sinks, m_sinks, m_sinks, m_sinks};
+            }
+
+        private:
+            EngineRestoreSinks m_sinks;
+        };
+    } // namespace
+
+    // Engine-build definitions of the save/load composition-root factories
+    // (Sprint-012, Step 17). The test build links tests/support/NullSaveLoadSeams.cpp
+    // instead; these are compiled only into xrMP.
+    core::Expected<std::unique_ptr<ISaveBackend>>
+    CreateEngineSaveBackend(const saveload::SaveLoadConfiguration& config)
+    {
+        // The real filesystem backend (the one platform TU, PlatformSaveStore.cpp).
+        return CreatePlatformSaveBackend(config.saveDirectoryToken);
+    }
+
+    std::unique_ptr<saveload::IRestoreSinkBundle> CreateEngineRestoreSinks()
+    {
+        return std::make_unique<EngineRestoreSinkBundle>();
     }
 } // namespace stalkermp::adapters

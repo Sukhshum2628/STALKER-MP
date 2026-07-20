@@ -370,6 +370,9 @@
     <ClInclude Include="include\stalkermp\saveload\SaveManager.h" />
     <ClInclude Include="include\stalkermp\saveload\RecoveryPipeline.h" />
     <ClInclude Include="include\stalkermp\saveload\SaveLoadDiagnostics.h" />
+    <ClInclude Include="include\stalkermp\saveload\IRestoreSinkBundle.h" />
+    <ClInclude Include="include\stalkermp\saveload\NullRestoreSinks.h" />
+    <ClInclude Include="include\stalkermp\adapters\SaveLoadSeams.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
