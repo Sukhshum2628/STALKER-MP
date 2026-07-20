@@ -104,8 +104,8 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **009** | Replication Pipeline | ✅ Verified (Closed) |
 | **010** | Client Prediction & Interpolation | ✅ Verified (Closed) |
 | **011** | Persistence Framework | ✅ Verified (Closed) |
-| **012** | **Save/Load System** | ✅ **Verified (Closed)** — all 18 steps |
-| 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
+| **012** | **Save/Load System** | ✅ **Verified (Closed)**  |
+| 013–014 | Extensibility (Lua, plugin loader) | Progress(7/18)|
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
 **Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified.
