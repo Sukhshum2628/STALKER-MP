@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Sprint | 012 — Save/Load System |
-| Status | **Plan — FROZEN candidate** (review → freeze → approve before Step-01) |
+| Status | **EXECUTED & CLOSED** (2026-07-20) — all 18 steps implemented, Antigravity-verified, and frozen |
 | Scope authority | `Documentation/SPRINTS/Sprint-012/Sprint-012-Save-Load.md` (approved) |
 | Baseline | Sprint-011 CLOSED & FROZEN — **599 / 599** tests passing (GCC + MSVC) |
 | Governing ADRs | ADR-007, ADR-008, ADR-009, ADR-010, ADR-011 (all preserved; none modified) |

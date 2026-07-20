@@ -104,7 +104,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **009** | Replication Pipeline | ✅ Verified (Closed) |
 | **010** | Client Prediction & Interpolation | ✅ Verified (Closed) |
 | **011** | Persistence Framework | ✅ Verified (Closed) |
-| **012** | **Save/Load System** | 🚧 **In progress** — Step 17 / 18 (Batch 9) |
+| **012** | **Save/Load System** | ✅ **Verified (Closed)** — all 18 steps |
 | 013–014 | Extensibility (Lua, plugin loader) | ⏳ Planned |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
@@ -116,7 +116,9 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 **Sprint-011 (Persistence Framework) — Verified (Closed):** the host-side infrastructure that coordinates when and how safely authoritative snapshots are handed off for saving — scheduling, a synchronous (no-thread) worker, a bounded queue with back-pressure, read-only snapshot consumption, version tracking, validation, and diagnostics — without any save format or serialization (Sprint-012). All 17 steps were implemented one at a time (some as safe batches) and independently verified; the `PersistenceManager` ticks at the reserved `tick_order::kPersistence = 500`, storage is behind the engine-free `IPersistenceStore` seam, and no thread is created (ADR-011). Subsystem documentation: `Multiplayer/docs/Persistence.md`.
 
-**Current focus — Sprint-012 (Save/Load System):** the real filesystem backend behind the frozen `IPersistenceStore` seam, plus world serialization, the load/restore pipeline, and version migration.
+**Sprint-012 (Save/Load System) — Verified (Closed):** the authoritative world is serialized deterministically (byte-identical, wall-clock excluded) and reconstructed host-side before networking. All 18 steps were implemented across ten verification batches (with the four architectural gates verified in isolation) and independently verified: the deterministic serialization format + `SaveWriter`/`SaveReader`; integrity validation + version migration; the real filesystem backend behind the frozen `IPersistenceStore` seam (confined to `PlatformSaveStore.cpp`); the engine-free restore-sink boundary with the real authoritative writes confined to `EngineAdapters.cpp`; `SaveManager` + `RecoveryPipeline` (Load → Validate → Migrate → Restore, failure-isolated); and diagnostics. Recovery runs once during `Bootstrap Initialize` **before** the frame bridge and networking — no new `tick_order` key, no new subscriber, no thread (ADR-011); the wire protocol is untouched (ADR-010). Subsystem documentation: `Multiplayer/docs/SaveLoad.md`.
+
+**Current focus — Sprint-013 (Lua Integration):** script integration and API bindings atop the now functionally-complete multiplayer framework.
 
 ---
 
