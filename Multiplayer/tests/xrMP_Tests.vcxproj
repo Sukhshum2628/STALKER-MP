@@ -128,6 +128,7 @@
     <ClCompile Include="support\NullEntitySnapshotSource.cpp" />
     <ClCompile Include="support\NullPredictionSeams.cpp" />
     <ClCompile Include="support\NullSaveLoadSeams.cpp" />
+    <ClCompile Include="support\NullLuaSeams.cpp" />
     <ClCompile Include="..\src\common\FileSystemUtil.cpp" />
     <ClCompile Include="..\src\common\StringUtil.cpp" />
     <ClCompile Include="..\src\common\Time.cpp" />

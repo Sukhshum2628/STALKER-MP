@@ -82,6 +82,16 @@
 #include "stalkermp/saveload/SaveFormat.h"                 // saveload::kSaveFormatVersion (recovery target)
 #include "stalkermp/saveload/SaveLoadConfiguration.h"      // saveload::SaveLoadConfiguration
 #include "stalkermp/saveload/SaveMigrator.h"               // saveload::SaveMigrator
+// Lua Integration (Sprint-013, Step 17) — composition-root wiring: build-selected Lua
+// runtime + Public API facades + script source; ScriptManager at kScripting = 375.
+#include "stalkermp/adapters/LuaSeams.h"                   // CreateEngineLuaRuntime / ScriptApi / ScriptSource
+#include "stalkermp/lua/ILuaApiBundle.h"                   // lua::ILuaApiBundle
+#include "stalkermp/lua/IScriptSource.h"                   // lua::IScriptSource
+#include "stalkermp/lua/LuaConfiguration.h"                // lua::LuaConfiguration
+#include "stalkermp/lua/LuaDiagnostics.h"                  // lua::LuaDiagnostics
+#include "stalkermp/lua/LuaManager.h"                      // lua::LuaManager
+#include "stalkermp/lua/ScriptManager.h"                   // lua::ScriptManager
+#include "stalkermp/lua/ScriptThreadGuard.h"               // lua::ScriptThreadGuard
 #include "stalkermp/world/WorldConfiguration.h"
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
@@ -291,6 +301,26 @@ namespace stalkermp
             // seams. Test build: inert null sinks. NOT a FrameDispatcher subscriber —
             // recovery runs ONCE at Initialize, before the frame bridge and networking.
             std::unique_ptr<saveload::IRestoreSinkBundle> restoreSinks;
+
+            // Lua Integration (Sprint-013, Step 17). Runtime-owned seams: the concrete Lua
+            // runtime (real VM binding / null in tests), the Public API facade bundle (real
+            // engine facades / recording in tests), and the script source (real filesystem
+            // via PlatformScriptStore / in-memory in tests). The LuaManager owns runtime
+            // init + API registration. The ScriptManager is ServiceRegistry-owned (cached
+            // here as a raw pointer) and subscribed to the FrameDispatcher at the reserved
+            // tick_order::kScripting = 375 (Gameplay phase). The diagnostics collector and
+            // thread guard are non-invasive Runtime-owned surfaces (the guard is bound to
+            // the simulation thread at Initialize). These seams are declared AFTER the
+            // ServiceRegistry-owning members are used and are destroyed with the Runtime;
+            // the ScriptManager never dereferences them at destruction.
+            lua::LuaConfiguration luaConfig;
+            std::unique_ptr<lua::ILuaRuntime> luaRuntime;
+            std::unique_ptr<lua::ILuaApiBundle> luaApis;
+            std::unique_ptr<lua::IScriptSource> scriptSource;
+            std::unique_ptr<lua::LuaManager> luaManager;
+            lua::ScriptManager* scriptManager = nullptr; // owned by ServiceRegistry
+            lua::LuaDiagnostics luaDiagnostics;          // non-invasive collector
+            lua::ScriptThreadGuard scriptThreadGuard;    // single-thread enforcement (bound at Init)
         };
 
         // The single module-global. See file header for justification.
@@ -784,6 +814,47 @@ namespace stalkermp
             }
             runtime.persistenceManager = persistenceManagerPtr;
 
+            // Lua Integration (Sprint-013, Step 17). Parse [lua]; bind the build-selected
+            // Lua runtime, Public API facade bundle, and script source behind engine-free
+            // factories (real LuaJIT + engine facades + PlatformScriptStore in the engine
+            // build; null/recording/in-memory in tests). The ScriptManager is registered as
+            // an IService and subscribed at the reserved tick_order::kScripting = 375 — the
+            // Gameplay phase, strictly after ALifeTransition (350) and before Snapshot
+            // (kReplication = 400) — so authoritative effects a script applies through the
+            // sanctioned seams are captured in the same-frame snapshot. LuaManager.Init +
+            // ScriptManager.LoadAll run once at Initialize (before networking). Engine code
+            // is confined to EngineAdapters.cpp; script-file I/O to PlatformScriptStore.cpp.
+            auto luaConfiguration = lua::LuaConfiguration::FromConfig(runtime.serverConfig);
+            if (!luaConfiguration)
+            {
+                return luaConfiguration.GetError();
+            }
+            runtime.luaConfig = luaConfiguration.Value();
+            runtime.luaRuntime = adapters::CreateEngineLuaRuntime();
+            runtime.luaApis = adapters::CreateEngineScriptApi();
+            runtime.scriptSource = adapters::CreateEngineScriptSource(runtime.luaConfig);
+            runtime.luaManager = std::make_unique<lua::LuaManager>(*runtime.luaRuntime, runtime.luaApis->Apis());
+
+            auto scriptManager = std::make_unique<lua::ScriptManager>(
+                *runtime.luaRuntime, *runtime.scriptSource, runtime.luaConfig.version,
+                runtime.luaConfig.strictApiVersion);
+            lua::ScriptManager* scriptManagerPtr = scriptManager.get();
+            if (auto registered = runtime.services.Register(std::move(scriptManager)); !registered)
+            {
+                return registered;
+            }
+
+            // Single scripting tick at the reserved tick_order::kScripting = 375 (Gameplay
+            // phase; after ALifeTransition 350, before Snapshot 400). Uses the single
+            // existing FrameDispatcher; networking-last (kNetworking = 900) preserved.
+            if (auto subscribed = runtime.frameDispatcher.Subscribe(
+                    *scriptManagerPtr, tick_order::kScripting, "Scripting");
+                !subscribed)
+            {
+                return subscribed;
+            }
+            runtime.scriptManager = scriptManagerPtr;
+
             runtime.worldManager = managerPtr;
             return Success();
         }
@@ -973,6 +1044,30 @@ namespace stalkermp
                 }
             }
 
+            // 7c. Lua Integration startup (Sprint-013, Step 17). Runs ONCE here — before
+            //     the engine frame bridge and before networking. Bind the thread guard to
+            //     the simulation thread (single-thread enforcement), then LuaManager.Init
+            //     (create the VM state, load libraries, register the Public API facades as
+            //     host functions) and ScriptManager.LoadAll (discover + load host-side
+            //     scripts). A runtime-init or load failure is NON-fatal: scripting is left
+            //     disabled and the engine continues (fault isolation). The per-frame OnTick
+            //     runs at kScripting = 375.
+            runtime.scriptThreadGuard.Bind(1); // sanctioned simulation-thread token
+            if (const lua::ScriptOutcome o = runtime.luaManager->Init(); o != lua::ScriptOutcome::Ok)
+            {
+                runtime.logger.Warning(
+                    kLogCategory,
+                    common::Format("Lua: runtime init failed (outcome {}); scripting disabled",
+                                   static_cast<int>(o)));
+            }
+            else
+            {
+                const lua::ScriptLoadReport report = runtime.scriptManager->LoadAll();
+                runtime.logger.Info(kLogCategory,
+                                    common::Format("Lua: loaded {}/{} scripts before networking",
+                                                   report.loaded, report.attempted));
+            }
+
             // 8. Engine frame registration — strictly LAST: no engine
             //    callback may arrive before the module is fully ready
             //    (register-last / remove-first, Design Review §5).
@@ -1035,6 +1130,25 @@ namespace stalkermp
                     Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
                 }
                 g_runtime->persistenceManager = nullptr;
+            }
+
+            // Lua Integration runtime (Sprint-013): unsubscribe the ScriptManager from the
+            // dispatcher (subscribed at kScripting = 375), then shut down the runtime state
+            // (LuaManager.Shutdown -> DestroyState), before ShutdownAll. The Runtime-owned
+            // Lua runtime / API bundle / script source outlive ShutdownAll and are destroyed
+            // with the Runtime; the ScriptManager never dereferences them at destruction.
+            if (g_runtime->scriptManager != nullptr)
+            {
+                if (auto unsubscribed = g_runtime->frameDispatcher.Unsubscribe(*g_runtime->scriptManager);
+                    !unsubscribed && IsLogAvailable())
+                {
+                    Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
+                }
+                g_runtime->scriptManager = nullptr;
+            }
+            if (g_runtime->luaManager)
+            {
+                g_runtime->luaManager->Shutdown();
             }
 
             // Replication Pipeline runtime (Sprint-009): unsubscribe from the

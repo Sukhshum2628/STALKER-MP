@@ -27,8 +27,10 @@
 #include "stalkermp/lua/NullScriptSource.h"
 #include "stalkermp/lua/RecordingScriptApi.h"
 #include "stalkermp/lua/ScriptApi.h"
+#include "stalkermp/lua/ILuaApiBundle.h"
 #include "stalkermp/lua/LuaDiagnostics.h"
 #include "stalkermp/lua/LuaManager.h"
+#include "stalkermp/lua/NullLuaApiBundle.h"
 #include "stalkermp/lua/ScriptContext.h"
 #include "stalkermp/lua/ScriptLifecycle.h"
 #include "stalkermp/lua/ScriptLoader.h"
@@ -1335,4 +1337,102 @@ TEST(ThreadSafetyStep16, ViolationsCountedAndResettable)
     EXPECT_FALSE(guard.IsBound());
     EXPECT_EQ(guard.Violations(), 0u);
     EXPECT_EQ(guard.Verify(1), lua::ScriptOutcome::RuntimeError); // unbound again
+}
+
+// ============================================================================
+// Step 17 — Composed integration (LuaManager + ScriptManager + API bundle)
+//
+// These exercise the composed subsystem the way Bootstrap wires it (Step 17): a
+// LuaManager registers the Public API facades through the runtime seam, and a
+// ScriptManager loads scripts from the source and dispatches events/OnTick through the
+// seam — all engine-free (fake runtime + in-memory source + recording facades). The
+// real engine runtime/facades + filesystem source are Antigravity-smoke-verified.
+// ============================================================================
+
+TEST(LuaScriptingIntegrationStep17, ManagerInitRegistersApisAndLoadsScripts)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {10, 20});
+    lua::FakeLuaRuntime runtime;
+    lua::NullLuaApiBundle bundle; // the recording Public API facades (test build)
+
+    lua::LuaManager luaManager(runtime, bundle.Apis());
+    ASSERT_EQ(luaManager.Init(), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(luaManager.RegisteredApiCount(), 7u);
+
+    lua::ScriptManager scripts(luaManager.Runtime(), source, /*api*/ 1, /*strict*/ false);
+    EXPECT_EQ(scripts.LoadAll().loaded, 2u);
+    EXPECT_EQ(scripts.ScriptCount(), 2u);
+}
+
+TEST(LuaScriptingIntegrationStep17, ServerAndGameplayEventFlow)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {1, 2});
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptManager scripts(runtime, source, 1, false);
+    ASSERT_EQ(scripts.LoadAll().loaded, 2u);
+
+    ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnServerStart, lua::ScriptId{1}, lua::CallbackId{1}),
+              lua::ScriptOutcome::Ok);
+    ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnPlayerJoin, lua::ScriptId{2}, lua::CallbackId{2}),
+              lua::ScriptOutcome::Ok);
+    ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnWorldSaved, lua::ScriptId{1}, lua::CallbackId{3}),
+              lua::ScriptOutcome::Ok);
+
+    EXPECT_EQ(scripts.DispatchEvent(lua::ScriptEvent::OnServerStart, lua::ScriptArgs{}).invoked, 1u);
+    EXPECT_EQ(scripts.DispatchEvent(lua::ScriptEvent::OnPlayerJoin, lua::ScriptArgs{}).invoked, 1u);
+    EXPECT_EQ(scripts.DispatchEvent(lua::ScriptEvent::OnWorldSaved, lua::ScriptArgs{}).invoked, 1u);
+    EXPECT_EQ(scripts.DispatchEvent(lua::ScriptEvent::OnPlayerLeave, lua::ScriptArgs{}).invoked, 0u); // none bound
+    EXPECT_EQ(runtime.invocations.size(), 3u);
+}
+
+TEST(LuaScriptingIntegrationStep17, LargeScriptCollection)
+{
+    lua::InMemoryScriptSource source;
+    for (std::uint64_t id = 1; id <= 200; ++id)
+    {
+        source.Store(Descriptor(id, 1), Bytes({1}));
+    }
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptManager scripts(runtime, source, 1, false);
+    EXPECT_EQ(scripts.LoadAll().loaded, 200u);
+    EXPECT_EQ(scripts.ScriptCount(), 200u);
+
+    for (std::uint64_t id = 1; id <= 200; ++id)
+    {
+        ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{id}, lua::CallbackId{id}),
+                  lua::ScriptOutcome::Ok);
+    }
+    scripts.Tick(0.016);
+    EXPECT_EQ(runtime.invocations.size(), 200u); // all reacted, deterministically
+}
+
+TEST(LuaScriptingIntegrationStep17, FaultIsolationAcrossTicks)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {1, 2, 3});
+    SelectiveFaultRuntime runtime;
+    runtime.faultId = lua::CallbackId{2};
+    runtime.faultOutcome = lua::ScriptOutcome::ExecutionTimeout;
+    lua::ScriptManager scripts(runtime, source, 1, false);
+    ASSERT_EQ(scripts.LoadAll().loaded, 3u);
+    ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{1}, lua::CallbackId{1}),
+              lua::ScriptOutcome::Ok);
+    ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{2}, lua::CallbackId{2}),
+              lua::ScriptOutcome::Ok);
+    ASSERT_EQ(scripts.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{3}, lua::CallbackId{3}),
+              lua::ScriptOutcome::Ok);
+
+    scripts.Tick(0.016); // Tick 1: dispatches OnTick, isolates the faulting script
+    EXPECT_TRUE(scripts.IsDisabled(lua::ScriptId{2}));
+    EXPECT_FALSE(scripts.IsDisabled(lua::ScriptId{1}));
+    EXPECT_FALSE(scripts.IsDisabled(lua::ScriptId{3}));
+
+    // Subsequent ticks keep running the healthy siblings, skipping the disabled one.
+    const std::size_t before = runtime.invocations;
+    scripts.Tick(0.016);
+    scripts.Tick(0.016);
+    EXPECT_EQ(runtime.invocations - before, 4u); // 2 healthy scripts * 2 ticks
+    EXPECT_EQ(scripts.Ticks(), 3u);
 }

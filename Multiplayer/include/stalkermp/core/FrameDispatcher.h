@@ -45,6 +45,7 @@ namespace stalkermp::core
         inline constexpr std::uint32_t kPlayerLifecycle = 250; // Sprint-007 (additive; EntityRegistry -> Player -> Bubble)
         inline constexpr std::uint32_t kBubble = 300;         // Sprint-004
         inline constexpr std::uint32_t kAlifeTransition = 350; // Sprint-005 (additive; wired at Step 10)
+        inline constexpr std::uint32_t kScripting = 375;      // Sprint-013 (Gameplay phase: after ALife, before Snapshot)
         inline constexpr std::uint32_t kReplication = 400;    // Sprint-008 (Snapshot producer)
         inline constexpr std::uint32_t kReplicationPipeline = 450; // Sprint-009 (Replication consumer; after Snapshot, before Persistence)
         inline constexpr std::uint32_t kPersistence = 500;    // Sprint-011
