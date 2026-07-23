@@ -178,6 +178,7 @@
     <ClCompile Include="..\src\saveload\RecoveryPipeline.cpp" />
     <ClCompile Include="..\src\lua\LuaConfiguration.cpp" />
     <ClCompile Include="..\src\plugin\PluginConfiguration.cpp" />
+    <ClCompile Include="..\src\plugin\PluginRegistry.cpp" />
     <ClCompile Include="..\src\lua\ScriptRegistry.cpp" />
     <ClCompile Include="..\src\lua\EventBinding.cpp" />
     <ClCompile Include="..\src\lua\ScriptValidator.cpp" />
