@@ -27,12 +27,14 @@
 #include "stalkermp/lua/NullScriptSource.h"
 #include "stalkermp/lua/RecordingScriptApi.h"
 #include "stalkermp/lua/ScriptApi.h"
+#include "stalkermp/lua/LuaDiagnostics.h"
 #include "stalkermp/lua/LuaManager.h"
 #include "stalkermp/lua/ScriptContext.h"
 #include "stalkermp/lua/ScriptLifecycle.h"
 #include "stalkermp/lua/ScriptLoader.h"
 #include "stalkermp/lua/ScriptManager.h"
 #include "stalkermp/lua/ScriptRegistry.h"
+#include "stalkermp/lua/ScriptThreadGuard.h"
 #include "stalkermp/lua/ScriptValidator.h"
 
 namespace
@@ -1225,4 +1227,112 @@ TEST(ScriptHardeningStep14, EachFaultKindIsolates)
         EXPECT_EQ(r.isolated, 1u);
         EXPECT_TRUE(manager.IsDisabled(lua::ScriptId{1})); // engine continues; script disabled
     }
+}
+
+// ============================================================================
+// Step 15 — LuaDiagnostics (non-invasive collector)
+// ============================================================================
+
+TEST(LuaDiagnosticsStep15, CountersAveragesAndReset)
+{
+    lua::LuaDiagnostics diag;
+    diag.RecordScriptLoaded();
+    diag.RecordScriptLoaded();
+    diag.RecordScriptUnloaded();
+    diag.RecordApiCall();
+    diag.RecordApiCall();
+    diag.RecordCallback();
+    diag.RecordScriptError();
+    diag.RecordExecutionTime(100);
+    diag.RecordExecutionTime(300); // avg 200, last 300
+    diag.RecordMemory(4096);
+
+    const auto s = diag.Snapshot();
+    EXPECT_EQ(s.loadedScripts, 1u); // 2 loaded - 1 unloaded
+    EXPECT_EQ(s.apiCalls, 2u);
+    EXPECT_EQ(s.callbackCount, 1u);
+    EXPECT_EQ(s.scriptErrors, 1u);
+    EXPECT_EQ(s.executionTimeMicros, 300u); // last (diagnostic)
+    EXPECT_EQ(s.memoryBytes, 4096u);
+    EXPECT_EQ(diag.AverageExecutionMicros(), 200u);
+
+    // Snapshot is an immutable copy: mutating it does not affect the collector.
+    lua::ScriptStatistics copy = diag.Snapshot();
+    copy.apiCalls = 999u;
+    EXPECT_EQ(copy.apiCalls, 999u);
+    EXPECT_EQ(diag.Snapshot().apiCalls, 2u);
+
+    diag.Reset();
+    EXPECT_EQ(diag.Snapshot().loadedScripts, 0u);
+    EXPECT_EQ(diag.Snapshot().apiCalls, 0u);
+    EXPECT_EQ(diag.AverageExecutionMicros(), 0u);
+}
+
+TEST(LuaDiagnosticsStep15, TimelineAndConsoleAreBoundedAndOrdered)
+{
+    lua::LuaDiagnostics diag;
+    diag.RecordTimeline(lua::LuaDiagnostics::TimelineEntry{1, lua::ScriptId{5}, lua::ScriptEvent::OnTick,
+                                                           lua::ScriptOutcome::Ok, 42});
+    diag.RecordTimeline(lua::LuaDiagnostics::TimelineEntry{2, lua::ScriptId{5}, lua::ScriptEvent::OnPlayerJoin,
+                                                           lua::ScriptOutcome::RuntimeError, 7});
+    ASSERT_EQ(diag.Timeline().size(), 2u);
+    EXPECT_EQ(diag.Timeline()[0].tick, 1u);
+    EXPECT_EQ(diag.Timeline()[1].outcome, lua::ScriptOutcome::RuntimeError);
+
+    // Bounded: never exceeds kMaxTimeline; keeps the most recent.
+    for (std::uint64_t i = 0; i < lua::LuaDiagnostics::kMaxTimeline + 50; ++i)
+    {
+        diag.RecordTimeline(lua::LuaDiagnostics::TimelineEntry{i, lua::ScriptId{1}, lua::ScriptEvent::OnTick,
+                                                               lua::ScriptOutcome::Ok, 0});
+    }
+    EXPECT_EQ(diag.Timeline().size(), lua::LuaDiagnostics::kMaxTimeline);
+    EXPECT_EQ(diag.Timeline().back().tick, lua::LuaDiagnostics::kMaxTimeline + 50 - 1);
+
+    diag.RecordConsole("hello");
+    diag.RecordConsole("world");
+    ASSERT_EQ(diag.Console().size(), 2u);
+    EXPECT_EQ(diag.Console()[0], "hello");
+    for (std::size_t i = 0; i < lua::LuaDiagnostics::kMaxConsole + 10; ++i)
+    {
+        diag.RecordConsole("line");
+    }
+    EXPECT_EQ(diag.Console().size(), lua::LuaDiagnostics::kMaxConsole);
+}
+
+// ============================================================================
+// Step 16 — ScriptThreadGuard (single-thread enforcement)
+// ============================================================================
+
+TEST(ThreadSafetyStep16, OwnerAdmittedNonOwnerRejected)
+{
+    lua::ScriptThreadGuard guard;
+    EXPECT_FALSE(guard.IsBound());
+    // Unbound entry is a violation (value outcome), never an abort.
+    EXPECT_EQ(guard.Verify(1), lua::ScriptOutcome::RuntimeError);
+
+    constexpr std::uint64_t kSimThread = 0xA11CE;
+    guard.Bind(kSimThread);
+    EXPECT_TRUE(guard.IsBound());
+    EXPECT_TRUE(guard.IsOnOwner(kSimThread));
+    EXPECT_EQ(guard.Verify(kSimThread), lua::ScriptOutcome::Ok); // Simulation Thread admitted
+
+    // Simulated worker thread (different token) is rejected — never enters scripts.
+    constexpr std::uint64_t kWorkerThread = 0xB0B;
+    EXPECT_FALSE(guard.IsOnOwner(kWorkerThread));
+    EXPECT_EQ(guard.Verify(kWorkerThread), lua::ScriptOutcome::RuntimeError);
+}
+
+TEST(ThreadSafetyStep16, ViolationsCountedAndResettable)
+{
+    lua::ScriptThreadGuard guard;
+    guard.Bind(1);
+    EXPECT_EQ(guard.Verify(1), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(guard.Verify(2), lua::ScriptOutcome::RuntimeError);
+    EXPECT_EQ(guard.Verify(3), lua::ScriptOutcome::RuntimeError);
+    EXPECT_EQ(guard.Violations(), 2u); // the two non-owner entries
+
+    guard.Reset();
+    EXPECT_FALSE(guard.IsBound());
+    EXPECT_EQ(guard.Violations(), 0u);
+    EXPECT_EQ(guard.Verify(1), lua::ScriptOutcome::RuntimeError); // unbound again
 }

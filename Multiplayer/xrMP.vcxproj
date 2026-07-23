@@ -400,6 +400,8 @@
     <ClInclude Include="include\stalkermp\lua\ScriptLoader.h" />
     <ClInclude Include="include\stalkermp\lua\LuaManager.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptManager.h" />
+    <ClInclude Include="include\stalkermp\lua\LuaDiagnostics.h" />
+    <ClInclude Include="include\stalkermp\lua\ScriptThreadGuard.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
