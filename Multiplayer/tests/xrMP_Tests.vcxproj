@@ -182,6 +182,8 @@
     <ClCompile Include="..\src\adapters\PlatformScriptStore.cpp" />
     <ClCompile Include="..\src\lua\ScriptLifecycle.cpp" />
     <ClCompile Include="..\src\lua\ScriptLoader.cpp" />
+    <ClCompile Include="..\src\lua\LuaManager.cpp" />
+    <ClCompile Include="..\src\lua\ScriptManager.cpp" />
     <ClCompile Include="..\src\persistence\PersistenceConfiguration.cpp" />
     <ClCompile Include="..\src\persistence\SaveMetadataBuilder.cpp" />
     <ClCompile Include="..\src\persistence\ValidationFramework.cpp" />

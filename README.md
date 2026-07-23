@@ -105,7 +105,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **010** | Client Prediction & Interpolation | ✅ Verified (Closed) |
 | **011** | Persistence Framework | ✅ Verified (Closed) |
 | **012** | **Save/Load System** | ✅ **Verified (Closed)**  |
-| **013** | **Lua Integration** | 🚧 **In progress** — Batch 7 / 11 (Steps 01–11 of 18) |
+| **013** | **Lua Integration** | 🚧 **In progress** — Batch 8 / 11 (Steps 01–14 of 18) |
 | 013–014 | Extensibility (Lua, plugin loader) | Progress(7/18)|
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
@@ -119,7 +119,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 **Sprint-012 (Save/Load System) — Verified (Closed):** the authoritative world is serialized deterministically (byte-identical, wall-clock excluded) and reconstructed host-side before networking. All 18 steps were implemented across ten verification batches (with the four architectural gates verified in isolation) and independently verified: the deterministic serialization format + `SaveWriter`/`SaveReader`; integrity validation + version migration; the real filesystem backend behind the frozen `IPersistenceStore` seam (confined to `PlatformSaveStore.cpp`); the engine-free restore-sink boundary with the real authoritative writes confined to `EngineAdapters.cpp`; `SaveManager` + `RecoveryPipeline` (Load → Validate → Migrate → Restore, failure-isolated); and diagnostics. Recovery runs once during `Bootstrap Initialize` **before** the frame bridge and networking — no new `tick_order` key, no new subscriber, no thread (ADR-011); the wire protocol is untouched (ADR-010). Subsystem documentation: `Multiplayer/docs/SaveLoad.md`.
 
-**Current focus — Sprint-013 (Lua Integration) — in progress:** a controlled, engine-free scripting layer through which host-side scripts observe the authoritative world and effect change only via sanctioned subsystem seams, on the Simulation Thread only. Progress by verification batch (each independently verified): **B1** value types + `LuaConfiguration`; **B2** the engine-free `ILuaRuntime` VM seam (+ fake/null) + `ScriptContext`/`ScriptRegistry`; **B3** event-binding registry + script validation; **B4** the `IScriptSource` read seam (+ null/in-memory); **B5** the single platform script-source TU (`PlatformScriptStore`, ADR-009); **B6** the seven Public API facade seams (no engine object exposed, ADR-008); **B7** the script lifecycle state machine + `ScriptLoader` (discover → validate → runtime-load → register → lifecycle, per-script failure isolation). Steps 01–11 of 18 complete. No Lua VM instantiated, no script execution, no Composition-Root change, no new `tick_order` key, no thread yet — engine adapters + wiring are the isolated Step-17 gate.
+**Current focus — Sprint-013 (Lua Integration) — in progress:** a controlled, engine-free scripting layer through which host-side scripts observe the authoritative world and effect change only via sanctioned subsystem seams, on the Simulation Thread only. Progress by verification batch (each independently verified): **B1** value types + `LuaConfiguration`; **B2** the engine-free `ILuaRuntime` VM seam (+ fake/null) + `ScriptContext`/`ScriptRegistry`; **B3** event-binding registry + script validation; **B4** the `IScriptSource` read seam (+ null/in-memory); **B5** the single platform script-source TU (`PlatformScriptStore`, ADR-009); **B6** the seven Public API facade seams (no engine object exposed, ADR-008); **B7** the script lifecycle state machine + `ScriptLoader` (discover → validate → runtime-load → register → lifecycle, per-script failure isolation); **B8** the Scripting Runtime Subsystem — `LuaManager` (runtime init/shutdown + Public-API host-function registration), `ScriptManager` (`IService`+`ITickable` orchestrating load/unload/reload + deterministic event/OnTick dispatch through the seam), and fault isolation (any callback fault disables only that script; siblings keep running; the engine continues). Steps 01–14 of 18 complete. No Lua VM instantiated, no script execution, no Composition-Root change, no new `tick_order` key, no thread yet — engine adapters + wiring are the isolated Step-17 gate.
 
 ---
 
@@ -135,7 +135,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Test Status
 
-- **720 / 720 build tests passing** (Release x64) on **GCC** and **MSVC** (675 Sprint-012 baseline + 45 Sprint-013 through Batch-7). **Game testing has not started yet**.
+- **727 / 727 build tests passing** (Release x64) on **GCC** and **MSVC** (675 Sprint-012 baseline + 52 Sprint-013 through Batch-8). **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.

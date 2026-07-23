@@ -27,9 +27,11 @@
 #include "stalkermp/lua/NullScriptSource.h"
 #include "stalkermp/lua/RecordingScriptApi.h"
 #include "stalkermp/lua/ScriptApi.h"
+#include "stalkermp/lua/LuaManager.h"
 #include "stalkermp/lua/ScriptContext.h"
 #include "stalkermp/lua/ScriptLifecycle.h"
 #include "stalkermp/lua/ScriptLoader.h"
+#include "stalkermp/lua/ScriptManager.h"
 #include "stalkermp/lua/ScriptRegistry.h"
 #include "stalkermp/lua/ScriptValidator.h"
 
@@ -1000,4 +1002,227 @@ TEST(ScriptLoaderStep11, DuplicateAgainstExistingRegistryIsIsolated)
     ASSERT_EQ(report.failures.size(), 1u);
     EXPECT_EQ(report.failures[0].second, lua::ScriptOutcome::DuplicateScript);
     EXPECT_TRUE(runtime.loads.empty()); // short-circuited before the runtime load
+}
+
+// ============================================================================
+// Step 12 — LuaManager
+// ============================================================================
+
+TEST(LuaManagerStep12, InitRegistersApisAndShutdownTearsDown)
+{
+    lua::FakeLuaRuntime runtime;
+    lua::RecordingScriptApi api;
+    lua::LuaManager manager(runtime, api.AsSet());
+
+    EXPECT_EQ(manager.Init(), lua::ScriptOutcome::Ok);
+    EXPECT_TRUE(manager.Initialized());
+    EXPECT_TRUE(runtime.stateCreated);
+    EXPECT_TRUE(runtime.librariesLoaded);
+    EXPECT_EQ(runtime.registrations.size(), 7u); // seven Public API facades
+    EXPECT_EQ(manager.RegisteredApiCount(), 7u);
+
+    // Idempotent: a second Init does not re-register.
+    EXPECT_EQ(manager.Init(), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(runtime.registrations.size(), 7u);
+
+    manager.Shutdown();
+    EXPECT_FALSE(manager.Initialized());
+    EXPECT_FALSE(runtime.stateCreated); // DestroyState called
+}
+
+TEST(LuaManagerStep12, InitFailurePropagatesValueOutcome)
+{
+    lua::FakeLuaRuntime runtime;
+    runtime.createOutcome = lua::ScriptOutcome::RuntimeError; // state creation fails
+    lua::RecordingScriptApi api;
+    lua::LuaManager manager(runtime, api.AsSet());
+
+    EXPECT_EQ(manager.Init(), lua::ScriptOutcome::RuntimeError);
+    EXPECT_FALSE(manager.Initialized());
+    EXPECT_TRUE(runtime.registrations.empty()); // never reached registration
+}
+
+// ============================================================================
+// Step 13 — ScriptManager (orchestration + dispatch)
+// ============================================================================
+
+namespace
+{
+    // Loads N scripts (ids 1..N, api 1) into a source; returns it populated.
+    void PopulateSource(lua::InMemoryScriptSource& source, std::initializer_list<std::uint64_t> ids)
+    {
+        for (std::uint64_t id : ids)
+        {
+            source.Store(Descriptor(id, 1), Bytes({1}));
+        }
+    }
+} // namespace
+
+TEST(ScriptManagerStep13, LoadBindDispatchDeterministic)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {10, 20});
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptManager manager(runtime, source, /*api*/ 1, /*strict*/ false);
+
+    const auto report = manager.LoadAll();
+    EXPECT_EQ(report.loaded, 2u);
+    EXPECT_EQ(manager.ScriptCount(), 2u);
+
+    EXPECT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{10}, lua::CallbackId{1}),
+              lua::ScriptOutcome::Ok);
+    EXPECT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{20}, lua::CallbackId{2}),
+              lua::ScriptOutcome::Ok);
+    // Binding to an unknown script fails.
+    EXPECT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{99}, lua::CallbackId{3}),
+              lua::ScriptOutcome::NotFound);
+
+    const auto dispatch = manager.DispatchEvent(lua::ScriptEvent::OnTick, lua::ScriptArgs{});
+    EXPECT_EQ(dispatch.invoked, 2u);
+    EXPECT_EQ(dispatch.isolated, 0u);
+    ASSERT_EQ(runtime.invocations.size(), 2u);
+    EXPECT_EQ(runtime.invocations[0].id.value, 1u); // ascending by (script, callback)
+    EXPECT_EQ(runtime.invocations[1].id.value, 2u);
+}
+
+TEST(ScriptManagerStep13, TickDispatchesOnTickWithCounter)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {5});
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptManager manager(runtime, source, 1, false);
+    ASSERT_EQ(manager.LoadAll().loaded, 1u);
+    ASSERT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{5}, lua::CallbackId{1}),
+              lua::ScriptOutcome::Ok);
+
+    manager.Tick(0.016);
+    manager.Tick(0.016);
+    EXPECT_EQ(manager.Ticks(), 2u);
+    ASSERT_EQ(runtime.invocations.size(), 2u);
+    // Deterministic tick counter passed as the first arg word (not wall-clock).
+    EXPECT_EQ(runtime.invocations[0].args.words[0], 1u);
+    EXPECT_EQ(runtime.invocations[1].args.words[0], 2u);
+}
+
+TEST(ScriptManagerStep13, UnloadAndReload)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {10, 20});
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptManager manager(runtime, source, 1, false);
+    ASSERT_EQ(manager.LoadAll().loaded, 2u);
+    ASSERT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{10}, lua::CallbackId{1}),
+              lua::ScriptOutcome::Ok);
+
+    // Unload removes the script and its bindings.
+    EXPECT_EQ(manager.Unload(lua::ScriptId{10}), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(manager.ScriptCount(), 1u);
+    const auto afterUnload = manager.DispatchEvent(lua::ScriptEvent::OnTick, lua::ScriptArgs{});
+    EXPECT_EQ(afterUnload.invoked, 0u); // its OnTick binding is gone
+
+    EXPECT_EQ(manager.Unload(lua::ScriptId{999}), lua::ScriptOutcome::NotFound);
+
+    // Reload re-registers from the source.
+    EXPECT_EQ(manager.Reload(lua::ScriptId{10}), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(manager.ScriptCount(), 2u);
+    EXPECT_EQ(manager.Reload(lua::ScriptId{999}), lua::ScriptOutcome::NotFound); // absent from source
+}
+
+// ============================================================================
+// Step 14 — Fault isolation
+// ============================================================================
+
+namespace
+{
+    // Test-only runtime implementing the ILuaRuntime seam directly (FakeLuaRuntime is
+    // final). It loads deterministically and faults a chosen callback id.
+    class SelectiveFaultRuntime final : public lua::ILuaRuntime
+    {
+    public:
+        lua::CallbackId faultId{};
+        lua::ScriptOutcome faultOutcome = lua::ScriptOutcome::RuntimeError;
+        std::size_t invocations = 0;
+
+        [[nodiscard]] lua::ScriptOutcome CreateState() override { return lua::ScriptOutcome::Ok; }
+        void DestroyState() noexcept override {}
+        [[nodiscard]] lua::ScriptOutcome LoadStandardLibraries() override { return lua::ScriptOutcome::Ok; }
+        [[nodiscard]] core::Expected<lua::ScriptId> LoadChunk(std::string_view,
+                                                              const std::vector<std::byte>&) override
+        {
+            return lua::ScriptId{++m_next};
+        }
+        [[nodiscard]] lua::ScriptOutcome Execute(lua::ScriptId) override { return lua::ScriptOutcome::Ok; }
+        [[nodiscard]] lua::ScriptOutcome RegisterFunction(std::string_view, lua::HostFunctionId) override
+        {
+            return lua::ScriptOutcome::Ok;
+        }
+        [[nodiscard]] lua::ScriptOutcome InvokeCallback(lua::CallbackId id, const lua::ScriptArgs&) override
+        {
+            ++invocations;
+            if (!faultId.IsNone() && id == faultId)
+            {
+                return faultOutcome;
+            }
+            return lua::ScriptOutcome::Ok;
+        }
+
+    private:
+        std::uint64_t m_next = 0;
+    };
+} // namespace
+
+TEST(ScriptHardeningStep14, FaultingCallbackIsolatesOnlyThatScript)
+{
+    lua::InMemoryScriptSource source;
+    PopulateSource(source, {1, 2, 3});
+    SelectiveFaultRuntime runtime;
+    runtime.faultId = lua::CallbackId{20}; // script 2's callback faults
+    runtime.faultOutcome = lua::ScriptOutcome::RuntimeError;
+    lua::ScriptManager manager(runtime, source, 1, false);
+    ASSERT_EQ(manager.LoadAll().loaded, 3u);
+    ASSERT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{1}, lua::CallbackId{10}),
+              lua::ScriptOutcome::Ok);
+    ASSERT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{2}, lua::CallbackId{20}),
+              lua::ScriptOutcome::Ok);
+    ASSERT_EQ(manager.BindCallback(lua::ScriptEvent::OnTick, lua::ScriptId{3}, lua::CallbackId{30}),
+              lua::ScriptOutcome::Ok);
+
+    const auto first = manager.DispatchEvent(lua::ScriptEvent::OnTick, lua::ScriptArgs{});
+    EXPECT_EQ(first.invoked, 3u);   // all three attempted
+    EXPECT_EQ(first.isolated, 1u);  // only script 2 disabled
+    EXPECT_FALSE(manager.IsDisabled(lua::ScriptId{1}));
+    EXPECT_TRUE(manager.IsDisabled(lua::ScriptId{2}));
+    EXPECT_FALSE(manager.IsDisabled(lua::ScriptId{3}));
+    // The offending script's state is Failed; siblings still healthy.
+    ASSERT_NE(manager.Registry().Find(lua::ScriptId{2}), nullptr);
+    EXPECT_EQ(manager.Registry().Find(lua::ScriptId{2})->state, lua::ScriptState::Failed);
+
+    // Next dispatch skips the disabled script; siblings keep running.
+    const auto second = manager.DispatchEvent(lua::ScriptEvent::OnTick, lua::ScriptArgs{});
+    EXPECT_EQ(second.invoked, 2u);
+    EXPECT_EQ(second.skipped, 1u);
+    EXPECT_EQ(second.isolated, 0u);
+}
+
+TEST(ScriptHardeningStep14, EachFaultKindIsolates)
+{
+    const lua::ScriptOutcome faults[] = {lua::ScriptOutcome::RuntimeError, lua::ScriptOutcome::RecursionLimit,
+                                         lua::ScriptOutcome::ExecutionTimeout, lua::ScriptOutcome::InvalidCallback,
+                                         lua::ScriptOutcome::ScriptDisabled};
+    for (const lua::ScriptOutcome fault : faults)
+    {
+        lua::InMemoryScriptSource source;
+        PopulateSource(source, {1});
+        SelectiveFaultRuntime runtime;
+        runtime.faultId = lua::CallbackId{9};
+        runtime.faultOutcome = fault;
+        lua::ScriptManager manager(runtime, source, 1, false);
+        ASSERT_EQ(manager.LoadAll().loaded, 1u);
+        ASSERT_EQ(manager.BindCallback(lua::ScriptEvent::OnPlayerDeath, lua::ScriptId{1}, lua::CallbackId{9}),
+                  lua::ScriptOutcome::Ok);
+
+        const auto r = manager.DispatchEvent(lua::ScriptEvent::OnPlayerDeath, lua::ScriptArgs{});
+        EXPECT_EQ(r.isolated, 1u);
+        EXPECT_TRUE(manager.IsDisabled(lua::ScriptId{1})); // engine continues; script disabled
+    }
 }
