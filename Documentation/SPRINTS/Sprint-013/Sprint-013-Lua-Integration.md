@@ -9,7 +9,7 @@
 |--------|-------|
 | Sprint | 013 |
 | Title | Lua Integration |
-| Status | Planned |
+| Status | **Implemented / Verified / Closed / Frozen** (2026-07-20) |
 | Priority | High |
 | Estimated Duration | 2–3 Weeks |
 | Prerequisites | Sprint-001 through Sprint-012 |
@@ -485,21 +485,21 @@ Stress Test
 
 # 11. Acceptance Criteria
 
-□ Lua runtime operational.
+✅ Lua runtime operational.
 
-□ Script Manager complete.
+✅ Script Manager complete.
 
-□ Public API exposed.
+✅ Public API exposed.
 
-□ Event callbacks operational.
+✅ Event callbacks operational.
 
-□ Thread safety verified.
+✅ Thread safety verified.
 
-□ Diagnostics operational.
+✅ Diagnostics operational.
 
-□ Tests passing.
+✅ Tests passing.
 
-□ Documentation updated.
+✅ Documentation updated.
 
 ---
 
@@ -521,3 +521,52 @@ Sprint-013 is complete when
 Sprint-014 – Plugin Framework
 
 Sprint-014 expands the extensibility layer by introducing a native plugin framework for server modules, tooling, diagnostics, and future engine extensions. Unlike Lua scripts, plugins provide compiled extensions through stable interfaces while continuing to respect host authority, immutable snapshots, and subsystem ownership.
+
+---
+
+# 14. Sprint Closure (2026-07-20)
+
+**Sprint-013 (Lua Integration) is declared Implemented / Verified / Closed / Frozen.**
+
+All 18 steps were implemented under the mandatory workflow (implement → Antigravity verification → git commit → GitHub push → next batch) — grouped into eleven verification batches (B1–B11) with the load-bearing gates (Step-08 platform boundary, Step-09 engine API boundary, Step-17 integration) verified in isolation — and each step was independently verified by Antigravity, with the tree left buildable after every step.
+
+## 14.1 Final verified baseline
+- **736 / 736 build tests passing** — Release x64 on **MSVC** and the engine-free **GCC** test build; **0 errors, 0 warnings, no regressions.** (Sprint-012 baseline 675 + the 61-test Sprint-013 scripting suite.)
+- MSVC Release clean under `EngineAbi.props`. The concrete Lua runtime binding, the seven Public API facades, and the real filesystem script source are Antigravity-smoke-verified on Windows. Game testing has not started yet.
+
+## 14.2 Steps 01–18 (all implemented, verified, documented)
+01 value types + vocabulary (`LuaScriptTypes.h`) · 02 `LuaConfiguration` · 03 `ILuaRuntime` seam (+ fake/null) · 04 `ScriptContext` + `ScriptRegistry` · 05 event-binding registry (`EventBinding`) · 06 `ScriptValidator` · 07 `IScriptSource` read seam (+ null/in-memory) · 08 platform script-source backend (`PlatformScriptStore`) · 09 Public API facade seams (`ScriptApi`) · 10 `ScriptLifecycle` state machine · 11 `ScriptLoader` · 12 `LuaManager` · 13 `ScriptManager` · 14 fault isolation · 15 `LuaDiagnostics` · 16 `ScriptThreadGuard` · 17 composition-root + engine adapters + integration + `Multiplayer/docs/LuaScripting.md` · 18 sprint closure.
+
+## 14.3 Acceptance criteria (§11) — satisfied
+1. Lua runtime operational (`ILuaRuntime` seam + the real binding reusing the engine's existing Lua runtime, confined to `EngineAdapters.cpp`). ✅
+2. Script Manager complete (`ScriptManager`: load/unload/reload + deterministic event/OnTick dispatch + fault isolation). ✅
+3. Public API exposed (the seven engine-free facades; no internal engine object exposed, ADR-008 / §7.4). ✅
+4. Event callbacks operational (`EventBinding` deterministic dispatch; the ten host-dispatched events). ✅
+5. Thread safety verified (`ScriptThreadGuard` Simulation-Thread-only enforcement; no thread created). ✅
+6. Diagnostics operational (`LuaDiagnostics` non-invasive counters/timeline/console). ✅
+7. Tests passing (736/736, GCC + MSVC). ✅
+8. Documentation updated (`Multiplayer/docs/LuaScripting.md`; status docs synchronized). ✅
+
+## 14.4 Definition of Done (§12) — satisfied
+- Lua executes through documented APIs only (the seven facades are the sole surface; no engine object exposed). ✅
+- Scripts cannot bypass subsystem ownership (authoritative effects only through the sanctioned Sprint-002/003/005/007/008 seams). ✅
+- Event callbacks function correctly (deterministic, order-stable dispatch). ✅
+- Runtime remains stable under load (large-collection + fault-isolation integration tests; a faulting script disables only itself). ✅
+- Worker threads never execute gameplay scripts (Simulation-Thread-only; snapshots remain the only worker channel; no thread created). ✅
+- Ready for the Plugin Framework (Sprint-014). ✅
+
+## 14.5 Evidence gates — satisfied
+- **E-G1-LU** (controlled API; no internal engine object exposed; effects only via sanctioned seams): **PASSED**.
+- **E-G2-LU** (determinism & single-thread; `OnTick` at the fixed `kScripting` slot; no thread; VM timing/GC diagnostic-only): **PASSED**.
+- **E-G3-LU** (fault isolation; every fault a value outcome; engine continues; no exception escapes the seam): **PASSED**.
+- **E-G4-LU** (Singular Platform Boundary; VM binding + script-file I/O confined to their boundary TUs): **PASSED**.
+- **E-G5-LU** (Preserve Before Replace; existing seams reused unchanged; one additive `tick_order` key; networking-last preserved; baseline intact): **PASSED**.
+
+## 14.6 Boundaries & invariants (verified)
+- Engine code confined to `EngineAdapters.cpp`; the concrete VM binding reuses the engine's existing Lua runtime ([AR-2]); script-file I/O confined to `PlatformScriptStore.cpp`; authoritative effects only through the Step-09 Public API facades over the sanctioned seams (ADR-008 / ADR-009). ✅
+- **Exactly one new `tick_order` key** — `kScripting = 375` (Gameplay phase: after ALifeTransition 350, before Snapshot 400); networking-last (`kNetworking = 900`) preserved; the `ScriptManager` ticks there and nowhere else; no thread created (ADR-011); wire protocol untouched (ADR-010). ✅
+- Preserve Before Replace: Sprint-002/003/005/007/008 seams reused unchanged; no internal engine object exposed to Lua; scripts own no authoritative state or events. ✅
+- ADR-007…ADR-011 preserved; no ADR reinterpreted. ✅
+
+## 14.7 Sprint-014 readiness
+The scripting layer embeds a controlled Lua runtime, exposes a documented engine-free Public API through which host-side scripts observe the world and effect change only via sanctioned seams, dispatches gameplay events deterministically on the Simulation Thread, and isolates script faults so the engine continues. No authoritative `tick_order` value beyond the reserved `kScripting = 375` is assigned or depended upon. **The project is ready for Sprint-014 (Plugin Framework).**

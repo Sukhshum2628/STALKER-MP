@@ -9,7 +9,7 @@
 |--------|-------|
 | Sprint | 014 |
 | Title | Plugin Framework |
-| Status | Planned |
+| Status | **FROZEN** (2026-07-20) |
 | Priority | High |
 | Estimated Duration | 2–3 Weeks |
 | Prerequisites | Sprint-001 through Sprint-013 |

@@ -160,6 +160,7 @@
     <ClCompile Include="PersistenceTests.cpp" />
     <ClCompile Include="SaveLoadTests.cpp" />
     <ClCompile Include="LuaScriptingTests.cpp" />
+    <ClCompile Include="PluginTests.cpp" />
     <ClCompile Include="..\src\saveload\SaveLoadConfiguration.cpp" />
     <ClCompile Include="..\src\saveload\SaveWriter.cpp" />
     <ClCompile Include="..\src\saveload\SaveReader.cpp" />
@@ -176,6 +177,7 @@
     <ClCompile Include="..\src\saveload\SaveManager.cpp" />
     <ClCompile Include="..\src\saveload\RecoveryPipeline.cpp" />
     <ClCompile Include="..\src\lua\LuaConfiguration.cpp" />
+    <ClCompile Include="..\src\plugin\PluginConfiguration.cpp" />
     <ClCompile Include="..\src\lua\ScriptRegistry.cpp" />
     <ClCompile Include="..\src\lua\EventBinding.cpp" />
     <ClCompile Include="..\src\lua\ScriptValidator.cpp" />

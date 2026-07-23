@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Sprint | 013 — Lua Integration |
-| Status | **FROZEN** (2026-07-20) — all §0.B items resolved, audit passed; step scope, dependency chain, and batching are now immutable |
+| Status | **EXECUTED & CLOSED** (2026-07-20) — all 18 steps implemented across 11 batches, Antigravity-verified; 736/736 tests passing |
 | Scope authority | `Documentation/SPRINTS/Sprint-013/Sprint-013-Lua-Integration.md` (approved) |
 | Baseline | Sprint-012 CLOSED & FROZEN — **675 / 675** tests passing (GCC + MSVC) |
 | Governing ADRs | ADR-007, ADR-008, ADR-009, ADR-010, ADR-011 (all preserved; none modified) |
@@ -19,7 +19,17 @@ This plan moves through three distinct states. It is currently at **③ Frozen**
 
 - **① DRAFT** — content under construction; may contain open `[AR-n]` items, TODOs, or unresolved architecture. *(Passed: all §0.B items were resolved and the final documentation audit passed.)*
 - **② FREEZE REVIEW** — content complete, internally consistent, fully traceable, with no open architectural items, TODOs, or Approval-Required markers. *(Passed: the plan cleared freeze review.)*
-- **③ FROZEN — current state (2026-07-20).** The step scope, dependency chain, and batching are immutable; changes now require a new revision. Batch-1 (Steps 01 + 02) is eligible for implementation under the standard workflow (implement → Antigravity verification → commit → push → next batch). *Freezing records readiness only; this document update does not itself begin implementation.*
+- **③ FROZEN → EXECUTED & CLOSED (2026-07-20).** The plan was frozen, then all 11 batches (Steps 01–18) were implemented and independently Antigravity-verified; the step scope, dependency chain, and batching are immutable. Sprint-013 is now **COMPLETED** — see the completion summary below.
+
+## Completion summary (2026-07-20)
+
+**Sprint-013 (Lua Integration) is COMPLETED — Implemented / Verified / Closed / Frozen.**
+
+- **Batches:** B1 (01–02) · B2 (03–04) · B3 (05–06) · B4 (07) · B5 (08) · B6 (09) · B7 (10–11) · B8 (12–14) · B9 (15–16) · B10 (17) · B11 (18). Every batch independently verified; the load-bearing gates (Step-08 platform boundary / ADR-009, Step-09 engine API boundary / ADR-008, Step-17 integration) verified in isolation.
+- **Final passing test count:** **736 / 736** (Release x64, GCC + MSVC) — Sprint-012 baseline 675 + 61 Sprint-013 tests; 0 warnings, no regressions.
+- **Boundaries:** engine code confined to `EngineAdapters.cpp`; script-file I/O confined to `PlatformScriptStore.cpp`; exactly one new `tick_order` key (`kScripting = 375`, Gameplay phase); no thread created; wire protocol untouched; ADR-007…ADR-011 preserved; E-G1-LU…E-G5-LU PASSED.
+- **Deliverable doc:** `Multiplayer/docs/LuaScripting.md`. Engine/VM/filesystem build + smoke Antigravity-verified on Windows.
+- **Readiness:** the project is ready for **Sprint-014 (Plugin Framework)**.
 
 ---
 

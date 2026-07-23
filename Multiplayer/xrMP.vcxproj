@@ -165,6 +165,7 @@
     <ClCompile Include="src\saveload\SaveManager.cpp" />
     <ClCompile Include="src\saveload\RecoveryPipeline.cpp" />
     <ClCompile Include="src\lua\LuaConfiguration.cpp" />
+    <ClCompile Include="src\plugin\PluginConfiguration.cpp" />
     <ClCompile Include="src\lua\ScriptRegistry.cpp" />
     <ClCompile Include="src\lua\EventBinding.cpp" />
     <ClCompile Include="src\lua\ScriptValidator.cpp" />
@@ -385,6 +386,8 @@
     <ClInclude Include="include\stalkermp\adapters\SaveLoadSeams.h" />
     <ClInclude Include="include\stalkermp\lua\LuaScriptTypes.h" />
     <ClInclude Include="include\stalkermp\lua\LuaConfiguration.h" />
+    <ClInclude Include="include\stalkermp\plugin\PluginTypes.h" />
+    <ClInclude Include="include\stalkermp\plugin\PluginConfiguration.h" />
     <ClInclude Include="include\stalkermp\lua\ILuaRuntime.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptContext.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptRegistry.h" />
