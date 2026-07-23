@@ -11,11 +11,16 @@
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/lua/RecordingScriptApi.h"
+#include "stalkermp/plugin/EventBinding.h"
 #include "stalkermp/plugin/IPlugin.h"
+#include "stalkermp/plugin/IPluginSource.h"
+#include "stalkermp/plugin/InMemoryPluginSource.h"
+#include "stalkermp/plugin/NullPluginSource.h"
 #include "stalkermp/plugin/PluginConfiguration.h"
 #include "stalkermp/plugin/PluginContext.h"
 #include "stalkermp/plugin/PluginRegistry.h"
 #include "stalkermp/plugin/PluginTypes.h"
+#include "stalkermp/plugin/PluginValidator.h"
 
 namespace
 {
@@ -343,4 +348,259 @@ TEST(PluginRegistryStep4, MutableFindAllowsInPlaceStateUpdate)
     EXPECT_EQ(again->state, plugin::PluginState::Active);
     ASSERT_EQ(again->hooks.size(), 1u);
     EXPECT_EQ(again->hooks[0], plugin::PluginEvent::OnTick);
+}
+
+// ============================================================================
+// Step 05 — EventBinding registry
+// ============================================================================
+
+TEST(PluginEventBindingStep5, BindQueryAscendingOrder)
+{
+    plugin::EventBinding eb;
+    // Bind out of order across two events; queries must be ascending by plugin id.
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{3}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{2}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnPlayerJoin, plugin::PluginId{5}), plugin::PluginOutcome::Ok);
+
+    const auto tick = eb.SubscribersFor(plugin::PluginEvent::OnTick);
+    ASSERT_EQ(tick.size(), 3u);
+    EXPECT_EQ(tick[0].value, 1u);
+    EXPECT_EQ(tick[1].value, 2u);
+    EXPECT_EQ(tick[2].value, 3u);
+
+    EXPECT_EQ(eb.CountFor(plugin::PluginEvent::OnPlayerJoin), 1u);
+    EXPECT_EQ(eb.CountFor(plugin::PluginEvent::OnServerStop), 0u);
+    EXPECT_EQ(eb.Count(), 4u);
+    EXPECT_TRUE(eb.SubscribersFor(plugin::PluginEvent::OnServerStop).empty());
+}
+
+TEST(PluginEventBindingStep5, DuplicateBindingRejected)
+{
+    plugin::EventBinding eb;
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::DuplicatePlugin);
+    EXPECT_EQ(eb.Count(), 1u);
+    // Same plugin under a DIFFERENT event is a distinct, allowed subscription.
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnPlayerLeave, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Count(), 2u);
+}
+
+TEST(PluginEventBindingStep5, NonePluginRejected)
+{
+    plugin::EventBinding eb;
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{0}), plugin::PluginOutcome::InvalidHook);
+    EXPECT_EQ(eb.Count(), 0u);
+}
+
+TEST(PluginEventBindingStep5, UnbindRemovesAndMissingIsNotFound)
+{
+    plugin::EventBinding eb;
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{2}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.Unbind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(eb.CountFor(plugin::PluginEvent::OnTick), 1u);
+    EXPECT_EQ(eb.SubscribersFor(plugin::PluginEvent::OnTick)[0].value, 2u);
+    EXPECT_EQ(eb.Unbind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::NotFound);
+    EXPECT_EQ(eb.Unbind(plugin::PluginEvent::OnPlayerJoin, plugin::PluginId{9}), plugin::PluginOutcome::NotFound);
+}
+
+// ============================================================================
+// Step 06 — PluginValidator
+// ============================================================================
+
+namespace
+{
+    plugin::PluginConfiguration EnabledConfig(std::uint32_t version = 5, bool strict = true)
+    {
+        plugin::PluginConfiguration c;
+        c.enabled = true;
+        c.version = version;         // host API version target
+        c.strictApiVersion = strict;
+        return c;
+    }
+
+    plugin::PluginDescriptor Descriptor(std::uint64_t id, std::uint32_t minApi, std::uint32_t maxApi)
+    {
+        plugin::PluginDescriptor d;
+        d.id = plugin::PluginId{id};
+        d.version = plugin::PluginVersion{1, 0, 0};
+        d.minApiVersion = minApi;
+        d.maxApiVersion = maxApi;
+        return d;
+    }
+} // namespace
+
+TEST(PluginValidatorStep6, IndividualChecks)
+{
+    plugin::PluginRegistry reg;
+    {
+        plugin::PluginContext c;
+        c.id = plugin::PluginId{1};
+        ASSERT_EQ(reg.Register(c), plugin::PluginOutcome::Ok);
+    }
+
+    // Configuration: disabled framework rejects.
+    plugin::PluginConfiguration disabled;
+    disabled.enabled = false;
+    EXPECT_EQ(plugin::PluginValidator::ValidateConfiguration(disabled), plugin::PluginOutcome::PluginDisabled);
+    EXPECT_EQ(plugin::PluginValidator::ValidateConfiguration(EnabledConfig()), plugin::PluginOutcome::Ok);
+
+    // Descriptor: none id -> NotFound; inverted range -> VersionMismatch.
+    EXPECT_EQ(plugin::PluginValidator::ValidateDescriptor(Descriptor(0, 1, 2)), plugin::PluginOutcome::NotFound);
+    EXPECT_EQ(plugin::PluginValidator::ValidateDescriptor(Descriptor(2, 5, 3)),
+              plugin::PluginOutcome::VersionMismatch);
+    EXPECT_EQ(plugin::PluginValidator::ValidateDescriptor(Descriptor(2, 1, 9)), plugin::PluginOutcome::Ok);
+
+    // Duplicate.
+    EXPECT_EQ(plugin::PluginValidator::ValidateDuplicate(plugin::PluginId{1}, reg),
+              plugin::PluginOutcome::DuplicatePlugin);
+    EXPECT_EQ(plugin::PluginValidator::ValidateDuplicate(plugin::PluginId{2}, reg), plugin::PluginOutcome::Ok);
+
+    // Version negotiation (host = 5): host < min -> ApiIncompatible; strict host > max -> VersionMismatch.
+    EXPECT_EQ(plugin::PluginValidator::ValidateVersion(Descriptor(2, 6, 9), 5, true),
+              plugin::PluginOutcome::ApiIncompatible);
+    EXPECT_EQ(plugin::PluginValidator::ValidateVersion(Descriptor(2, 1, 4), 5, true),
+              plugin::PluginOutcome::VersionMismatch);
+    EXPECT_EQ(plugin::PluginValidator::ValidateVersion(Descriptor(2, 1, 4), 5, false), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(plugin::PluginValidator::ValidateVersion(Descriptor(2, 3, 7), 5, true), plugin::PluginOutcome::Ok);
+
+    // Required APIs.
+    EXPECT_EQ(plugin::PluginValidator::ValidateRequiredApis({10, 20}, {10, 20, 30}), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(plugin::PluginValidator::ValidateRequiredApis({10, 99}, {10, 20, 30}),
+              plugin::PluginOutcome::ApiIncompatible);
+
+    // Dependency declaration validity.
+    plugin::PluginDescriptor okDeps = Descriptor(2, 1, 9);
+    okDeps.optionalDependencies = {plugin::PluginId{5}, plugin::PluginId{6}};
+    EXPECT_EQ(plugin::PluginValidator::ValidateDependencies(okDeps), plugin::PluginOutcome::Ok);
+
+    plugin::PluginDescriptor selfDep = Descriptor(2, 1, 9);
+    selfDep.optionalDependencies = {plugin::PluginId{2}}; // self-reference
+    EXPECT_EQ(plugin::PluginValidator::ValidateDependencies(selfDep), plugin::PluginOutcome::MissingDependency);
+
+    plugin::PluginDescriptor dupDep = Descriptor(2, 1, 9);
+    dupDep.optionalDependencies = {plugin::PluginId{5}, plugin::PluginId{5}}; // duplicate
+    EXPECT_EQ(plugin::PluginValidator::ValidateDependencies(dupDep), plugin::PluginOutcome::MissingDependency);
+
+    plugin::PluginDescriptor noneDep = Descriptor(2, 1, 9);
+    noneDep.optionalDependencies = {plugin::PluginId{0}}; // none id
+    EXPECT_EQ(plugin::PluginValidator::ValidateDependencies(noneDep), plugin::PluginOutcome::MissingDependency);
+}
+
+TEST(PluginValidatorStep6, CompositeValidatePassesWhenAllGood)
+{
+    plugin::PluginRegistry reg;
+    plugin::PluginDescriptor d = Descriptor(20, /*min*/ 3, /*max*/ 7);
+    d.requiredApis = {10};
+    d.optionalDependencies = {plugin::PluginId{99}}; // optional; declaration valid (non-none, not self)
+
+    EXPECT_EQ(plugin::PluginValidator::Validate(d, reg, /*available*/ {10, 20}, EnabledConfig(/*host*/ 5, true)),
+              plugin::PluginOutcome::Ok);
+}
+
+TEST(PluginValidatorStep6, CompositeValidateShortCircuitsInOrder)
+{
+    plugin::PluginRegistry reg;
+    {
+        plugin::PluginContext existing;
+        existing.id = plugin::PluginId{20};
+        ASSERT_EQ(reg.Register(existing), plugin::PluginOutcome::Ok);
+    }
+    // Disabled config is checked FIRST, before duplicate/version/etc.
+    plugin::PluginConfiguration disabled = EnabledConfig();
+    disabled.enabled = false;
+    plugin::PluginDescriptor d = Descriptor(20, 6, 9); // also duplicate + version-incompatible
+    d.requiredApis = {99};                             // also missing api
+    EXPECT_EQ(plugin::PluginValidator::Validate(d, reg, {10}, disabled), plugin::PluginOutcome::PluginDisabled);
+
+    // With config enabled, duplicate is the next failing gate.
+    EXPECT_EQ(plugin::PluginValidator::Validate(d, reg, {10}, EnabledConfig(5, true)),
+              plugin::PluginOutcome::DuplicatePlugin);
+}
+
+// ============================================================================
+// Step 07 — IPluginSource discovery seam (InMemoryPluginSource / NullPluginSource)
+// ============================================================================
+
+namespace
+{
+    plugin::PluginDescriptor Manifest(std::uint64_t id, std::uint32_t minApi = 1, std::uint32_t maxApi = 1)
+    {
+        plugin::PluginDescriptor d;
+        d.id = plugin::PluginId{id};
+        d.version = plugin::PluginVersion{1, 0, 0};
+        d.minApiVersion = minApi;
+        d.maxApiVersion = maxApi;
+        return d;
+    }
+} // namespace
+
+TEST(PluginSourceStep7, InMemoryStoreEnumerateAscending)
+{
+    plugin::InMemoryPluginSource src;
+    // Store out of order; enumeration must be ascending by id.
+    src.Store(Manifest(30));
+    src.Store(Manifest(10));
+    src.Store(Manifest(20));
+    EXPECT_EQ(src.Count(), 3u);
+
+    const auto all = src.Enumerate();
+    ASSERT_EQ(all.size(), 3u);
+    EXPECT_EQ(all[0].id.value, 10u);
+    EXPECT_EQ(all[1].id.value, 20u);
+    EXPECT_EQ(all[2].id.value, 30u);
+}
+
+TEST(PluginSourceStep7, InMemoryReadManifestAndExists)
+{
+    plugin::InMemoryPluginSource src;
+    src.Store(Manifest(7, /*min*/ 2, /*max*/ 5));
+
+    EXPECT_TRUE(src.Exists(plugin::PluginId{7}));
+    EXPECT_FALSE(src.Exists(plugin::PluginId{8}));
+
+    const auto ok = src.ReadManifest(plugin::PluginId{7});
+    ASSERT_TRUE(ok.HasValue());
+    EXPECT_EQ(ok.Value().id.value, 7u);
+    EXPECT_EQ(ok.Value().minApiVersion, 2u);
+    EXPECT_EQ(ok.Value().maxApiVersion, 5u);
+
+    // Missing -> value outcome (NotFound), nothing thrown.
+    EXPECT_FALSE(src.ReadManifest(plugin::PluginId{8}).HasValue());
+}
+
+TEST(PluginSourceStep7, InMemoryStoreReplacesAndRemove)
+{
+    plugin::InMemoryPluginSource src;
+    src.Store(Manifest(5, /*min*/ 1, /*max*/ 1));
+    src.Store(Manifest(5, /*min*/ 3, /*max*/ 9)); // replace same id
+    EXPECT_EQ(src.Count(), 1u);
+    ASSERT_TRUE(src.ReadManifest(plugin::PluginId{5}).HasValue());
+    EXPECT_EQ(src.ReadManifest(plugin::PluginId{5}).Value().maxApiVersion, 9u);
+
+    src.Remove(plugin::PluginId{5});
+    EXPECT_EQ(src.Count(), 0u);
+    EXPECT_FALSE(src.Exists(plugin::PluginId{5}));
+    src.Remove(plugin::PluginId{5}); // benign when absent
+    EXPECT_EQ(src.Count(), 0u);
+}
+
+TEST(PluginSourceStep7, NullSourceIsInert)
+{
+    plugin::NullPluginSource src;
+    EXPECT_TRUE(src.Enumerate().empty());
+    EXPECT_FALSE(src.Exists(plugin::PluginId{1}));
+    EXPECT_FALSE(src.ReadManifest(plugin::PluginId{1}).HasValue());
+}
+
+TEST(PluginSourceStep7, UsableThroughInterfaceReferenceAndFakeAlias)
+{
+    plugin::FakePluginSource concrete; // alias of InMemoryPluginSource
+    concrete.Store(Manifest(1));
+    const plugin::IPluginSource& src = concrete; // engine-free polymorphic use
+    EXPECT_EQ(src.Enumerate().size(), 1u);
+    EXPECT_TRUE(src.Exists(plugin::PluginId{1}));
+    ASSERT_TRUE(src.ReadManifest(plugin::PluginId{1}).HasValue());
+    EXPECT_EQ(src.ReadManifest(plugin::PluginId{1}).Value().id.value, 1u);
 }

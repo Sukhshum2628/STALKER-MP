@@ -167,6 +167,11 @@
     <ClCompile Include="src\lua\LuaConfiguration.cpp" />
     <ClCompile Include="src\plugin\PluginConfiguration.cpp" />
     <ClCompile Include="src\plugin\PluginRegistry.cpp" />
+    <ClCompile Include="src\plugin\EventBinding.cpp">
+      <ObjectFileName>$(IntDir)plugin_EventBinding.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="src\plugin\PluginValidator.cpp" />
+    <ClCompile Include="src\plugin\InMemoryPluginSource.cpp" />
     <ClCompile Include="src\lua\ScriptRegistry.cpp" />
     <ClCompile Include="src\lua\EventBinding.cpp" />
     <ClCompile Include="src\lua\ScriptValidator.cpp" />
@@ -392,6 +397,11 @@
     <ClInclude Include="include\stalkermp\plugin\IPlugin.h" />
     <ClInclude Include="include\stalkermp\plugin\PluginContext.h" />
     <ClInclude Include="include\stalkermp\plugin\PluginRegistry.h" />
+    <ClInclude Include="include\stalkermp\plugin\EventBinding.h" />
+    <ClInclude Include="include\stalkermp\plugin\PluginValidator.h" />
+    <ClInclude Include="include\stalkermp\plugin\IPluginSource.h" />
+    <ClInclude Include="include\stalkermp\plugin\NullPluginSource.h" />
+    <ClInclude Include="include\stalkermp\plugin\InMemoryPluginSource.h" />
     <ClInclude Include="include\stalkermp\lua\ILuaRuntime.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptContext.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptRegistry.h" />

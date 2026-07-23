@@ -179,6 +179,11 @@
     <ClCompile Include="..\src\lua\LuaConfiguration.cpp" />
     <ClCompile Include="..\src\plugin\PluginConfiguration.cpp" />
     <ClCompile Include="..\src\plugin\PluginRegistry.cpp" />
+    <ClCompile Include="..\src\plugin\EventBinding.cpp">
+      <ObjectFileName>$(IntDir)plugin_EventBinding.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="..\src\plugin\PluginValidator.cpp" />
+    <ClCompile Include="..\src\plugin\InMemoryPluginSource.cpp" />
     <ClCompile Include="..\src\lua\ScriptRegistry.cpp" />
     <ClCompile Include="..\src\lua\EventBinding.cpp" />
     <ClCompile Include="..\src\lua\ScriptValidator.cpp" />
