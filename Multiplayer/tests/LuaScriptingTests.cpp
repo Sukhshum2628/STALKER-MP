@@ -28,6 +28,8 @@
 #include "stalkermp/lua/RecordingScriptApi.h"
 #include "stalkermp/lua/ScriptApi.h"
 #include "stalkermp/lua/ScriptContext.h"
+#include "stalkermp/lua/ScriptLifecycle.h"
+#include "stalkermp/lua/ScriptLoader.h"
 #include "stalkermp/lua/ScriptRegistry.h"
 #include "stalkermp/lua/ScriptValidator.h"
 
@@ -860,4 +862,142 @@ TEST(PublicApiStep9, ScriptApiSetBundlesAllSeams)
     // The logging seam is reachable and side-effecting through the bundle.
     set.logging.Log(lua::ScriptLogLevel::Info, "sys", "ready");
     EXPECT_EQ(api.logCalls.size(), 1u);
+}
+
+// ============================================================================
+// Step 10 — ScriptLifecycle state machine
+// ============================================================================
+
+TEST(ScriptLifecycleStep10, LegalChainAdvancesState)
+{
+    lua::ScriptState s = lua::ScriptState::Unloaded;
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Load), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(s, lua::ScriptState::Loaded);
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Initialize), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(s, lua::ScriptState::Initialized);
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Execute), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(s, lua::ScriptState::Executing);
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Suspend), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(s, lua::ScriptState::Suspended);
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Resume), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(s, lua::ScriptState::Executing);
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Unload), lua::ScriptOutcome::Ok);
+    EXPECT_EQ(s, lua::ScriptState::Unloaded);
+}
+
+TEST(ScriptLifecycleStep10, IllegalTransitionRejectedStateUnchanged)
+{
+    lua::ScriptState s = lua::ScriptState::Unloaded;
+    // Cannot Execute before Load/Initialize.
+    EXPECT_EQ(lua::ScriptLifecycle::Apply(s, lua::LifecycleAction::Execute), lua::ScriptOutcome::RuntimeError);
+    EXPECT_EQ(s, lua::ScriptState::Unloaded); // unchanged
+    // Cannot Initialize an unloaded script.
+    EXPECT_FALSE(lua::ScriptLifecycle::IsLegal(lua::ScriptState::Unloaded, lua::LifecycleAction::Initialize));
+    // Resume only from Suspended.
+    EXPECT_FALSE(lua::ScriptLifecycle::IsLegal(lua::ScriptState::Initialized, lua::LifecycleAction::Resume));
+}
+
+TEST(ScriptLifecycleStep10, DestroyFromAnyAndNextQuery)
+{
+    for (std::uint8_t i = 0; i <= static_cast<std::uint8_t>(lua::ScriptState::Failed); ++i)
+    {
+        const auto st = static_cast<lua::ScriptState>(i);
+        EXPECT_TRUE(lua::ScriptLifecycle::IsLegal(st, lua::LifecycleAction::Destroy));
+    }
+    // Destroyed is terminal.
+    EXPECT_FALSE(lua::ScriptLifecycle::IsLegal(lua::ScriptState::Destroyed, lua::LifecycleAction::Destroy));
+
+    const auto next = lua::ScriptLifecycle::Next(lua::ScriptState::Loaded, lua::LifecycleAction::Initialize);
+    ASSERT_TRUE(next.HasValue());
+    EXPECT_EQ(next.Value(), lua::ScriptState::Initialized);
+    EXPECT_FALSE(lua::ScriptLifecycle::Next(lua::ScriptState::Unloaded, lua::LifecycleAction::Execute).HasValue());
+}
+
+// ============================================================================
+// Step 11 — ScriptLoader (discover -> validate -> load -> register -> lifecycle)
+// ============================================================================
+
+TEST(ScriptLoaderStep11, LoadAllRegistersInitializedScripts)
+{
+    lua::InMemoryScriptSource source;
+    source.Store(Descriptor(10, /*api*/ 1), Bytes({1, 2}));
+    source.Store(Descriptor(20, /*api*/ 1), Bytes({3}));
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptRegistry registry;
+
+    lua::ScriptLoader loader(source, runtime, registry, /*current*/ 1, /*strict*/ false);
+    const lua::ScriptLoadReport report = loader.LoadAll();
+
+    EXPECT_EQ(report.attempted, 2u);
+    EXPECT_EQ(report.loaded, 2u);
+    EXPECT_EQ(report.failed, 0u);
+    EXPECT_EQ(registry.Count(), 2u);
+
+    const auto* c10 = registry.Find(lua::ScriptId{10});
+    ASSERT_NE(c10, nullptr);
+    EXPECT_EQ(c10->state, lua::ScriptState::Initialized); // Load -> Initialize applied
+    // The runtime saw a chunk load for each script, but NEVER an execution.
+    EXPECT_EQ(runtime.loads.size(), 2u);
+    EXPECT_TRUE(runtime.executions.empty());
+}
+
+TEST(ScriptLoaderStep11, OneBadScriptIsIsolated)
+{
+    lua::InMemoryScriptSource source;
+    source.Store(Descriptor(1, /*api*/ 1), Bytes({1}));
+    source.Store(Descriptor(2, /*api*/ 9), Bytes({2})); // version-incompatible (api > current)
+    source.Store(Descriptor(3, /*api*/ 1), Bytes({3}));
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptRegistry registry;
+
+    lua::ScriptLoader loader(source, runtime, registry, /*current*/ 1, /*strict*/ false);
+    const lua::ScriptLoadReport report = loader.LoadAll();
+
+    EXPECT_EQ(report.attempted, 3u);
+    EXPECT_EQ(report.loaded, 2u);   // scripts 1 and 3
+    EXPECT_EQ(report.failed, 1u);   // script 2 isolated
+    ASSERT_EQ(report.failures.size(), 1u);
+    EXPECT_EQ(report.failures[0].first.value, 2u);
+    EXPECT_EQ(report.failures[0].second, lua::ScriptOutcome::ApiIncompatible);
+    // The good siblings still registered.
+    EXPECT_TRUE(registry.Contains(lua::ScriptId{1}));
+    EXPECT_FALSE(registry.Contains(lua::ScriptId{2}));
+    EXPECT_TRUE(registry.Contains(lua::ScriptId{3}));
+}
+
+TEST(ScriptLoaderStep11, SyntaxFailureFromRuntimeIsolatesScript)
+{
+    lua::InMemoryScriptSource source;
+    source.Store(Descriptor(5, 1), Bytes({0}));
+    lua::FakeLuaRuntime runtime;
+    runtime.loadOutcome = lua::ScriptOutcome::SyntaxError; // runtime rejects the chunk load
+    lua::ScriptRegistry registry;
+
+    lua::ScriptLoader loader(source, runtime, registry, 1, false);
+    const auto report = loader.LoadAll();
+    EXPECT_EQ(report.loaded, 0u);
+    ASSERT_EQ(report.failures.size(), 1u);
+    EXPECT_EQ(report.failures[0].second, lua::ScriptOutcome::SyntaxError);
+    EXPECT_EQ(registry.Count(), 0u); // nothing registered on failure
+}
+
+TEST(ScriptLoaderStep11, DuplicateAgainstExistingRegistryIsIsolated)
+{
+    lua::InMemoryScriptSource source;
+    source.Store(Descriptor(7, 1), Bytes({1}));
+    lua::FakeLuaRuntime runtime;
+    lua::ScriptRegistry registry;
+    // Pre-register id 7 so the loader sees a duplicate.
+    {
+        lua::ScriptContext existing;
+        existing.id = lua::ScriptId{7};
+        ASSERT_EQ(registry.Register(existing), lua::ScriptOutcome::Ok);
+    }
+
+    lua::ScriptLoader loader(source, runtime, registry, 1, false);
+    const auto report = loader.LoadAll();
+    EXPECT_EQ(report.loaded, 0u);
+    ASSERT_EQ(report.failures.size(), 1u);
+    EXPECT_EQ(report.failures[0].second, lua::ScriptOutcome::DuplicateScript);
+    EXPECT_TRUE(runtime.loads.empty()); // short-circuited before the runtime load
 }

@@ -170,6 +170,8 @@
     <ClCompile Include="src\lua\ScriptValidator.cpp" />
     <ClCompile Include="src\lua\InMemoryScriptSource.cpp" />
     <ClCompile Include="src\adapters\PlatformScriptStore.cpp" />
+    <ClCompile Include="src\lua\ScriptLifecycle.cpp" />
+    <ClCompile Include="src\lua\ScriptLoader.cpp" />
     <ClCompile Include="src\prediction\PredictionManager.cpp" />
     <ClCompile Include="src\prediction\SnapshotBuffer.cpp" />
     <ClCompile Include="src\prediction\InterpolationManager.cpp" />
@@ -392,6 +394,8 @@
     <ClInclude Include="include\stalkermp\adapters\PlatformScriptStore.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptApi.h" />
     <ClInclude Include="include\stalkermp\lua\RecordingScriptApi.h" />
+    <ClInclude Include="include\stalkermp\lua\ScriptLifecycle.h" />
+    <ClInclude Include="include\stalkermp\lua\ScriptLoader.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
