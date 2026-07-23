@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "stalkermp/adapters/PlatformPluginStore.h"
 #include "stalkermp/core/Config.h"
 #include "stalkermp/lua/RecordingScriptApi.h"
 #include "stalkermp/plugin/EventBinding.h"
@@ -603,4 +604,89 @@ TEST(PluginSourceStep7, UsableThroughInterfaceReferenceAndFakeAlias)
     EXPECT_TRUE(src.Exists(plugin::PluginId{1}));
     ASSERT_TRUE(src.ReadManifest(plugin::PluginId{1}).HasValue());
     EXPECT_EQ(src.ReadManifest(plugin::PluginId{1}).Value().id.value, 1u);
+}
+
+// ============================================================================
+// Step 08 — PlatformPluginStore (single platform boundary; static registration)
+// ============================================================================
+
+TEST(PlatformPluginStoreStep8, StaticRegistrationDeterministicOrder)
+{
+    adapters::ClearStaticPlugins();
+    // Register out of order; the discovery source must enumerate ascending by id.
+    EXPECT_EQ(adapters::RegisterStaticPlugin(Manifest(30)), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(adapters::RegisterStaticPlugin(Manifest(10)), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(adapters::RegisterStaticPlugin(Manifest(20)), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(adapters::StaticPluginCount(), 3u);
+
+    plugin::PluginConfiguration cfg;
+    auto src = adapters::CreatePlatformPluginSource(cfg);
+    ASSERT_NE(src, nullptr);
+    const auto all = src->Enumerate();
+    ASSERT_EQ(all.size(), 3u);
+    EXPECT_EQ(all[0].id.value, 10u);
+    EXPECT_EQ(all[1].id.value, 20u);
+    EXPECT_EQ(all[2].id.value, 30u);
+
+    adapters::ClearStaticPlugins();
+}
+
+TEST(PlatformPluginStoreStep8, ManifestLookupAndExists)
+{
+    adapters::ClearStaticPlugins();
+    ASSERT_EQ(adapters::RegisterStaticPlugin(Manifest(7, /*min*/ 2, /*max*/ 5)), plugin::PluginOutcome::Ok);
+
+    plugin::PluginConfiguration cfg;
+    auto src = adapters::CreatePlatformPluginSource(cfg);
+    ASSERT_NE(src, nullptr);
+    EXPECT_TRUE(src->Exists(plugin::PluginId{7}));
+    EXPECT_FALSE(src->Exists(plugin::PluginId{8}));
+    const auto m = src->ReadManifest(plugin::PluginId{7});
+    ASSERT_TRUE(m.HasValue());
+    EXPECT_EQ(m.Value().minApiVersion, 2u);
+    EXPECT_EQ(m.Value().maxApiVersion, 5u);
+    EXPECT_FALSE(src->ReadManifest(plugin::PluginId{8}).HasValue()); // NotFound value outcome
+
+    adapters::ClearStaticPlugins();
+}
+
+TEST(PlatformPluginStoreStep8, DuplicateAndNoneRegistrationRejected)
+{
+    adapters::ClearStaticPlugins();
+    EXPECT_EQ(adapters::RegisterStaticPlugin(Manifest(5)), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(adapters::RegisterStaticPlugin(Manifest(5)), plugin::PluginOutcome::DuplicatePlugin);
+    EXPECT_EQ(adapters::RegisterStaticPlugin(Manifest(0)), plugin::PluginOutcome::NotFound); // none id
+    EXPECT_EQ(adapters::StaticPluginCount(), 1u); // only the first registration stuck
+
+    adapters::ClearStaticPlugins();
+}
+
+TEST(PlatformPluginStoreStep8, EmptyRegistrationYieldsInertSource)
+{
+    adapters::ClearStaticPlugins();
+    plugin::PluginConfiguration cfg;
+    auto src = adapters::CreatePlatformPluginSource(cfg);
+    ASSERT_NE(src, nullptr);
+    EXPECT_TRUE(src->Enumerate().empty());
+    EXPECT_FALSE(src->Exists(plugin::PluginId{1}));
+    EXPECT_FALSE(src->ReadManifest(plugin::PluginId{1}).HasValue());
+}
+
+TEST(PlatformPluginStoreStep8, SourceIsReadOnlySnapshotAfterConstruction)
+{
+    adapters::ClearStaticPlugins();
+    ASSERT_EQ(adapters::RegisterStaticPlugin(Manifest(1)), plugin::PluginOutcome::Ok);
+
+    plugin::PluginConfiguration cfg;
+    auto src = adapters::CreatePlatformPluginSource(cfg); // snapshots {1}
+    // Registering more AFTER construction does not affect the existing source (read-only).
+    ASSERT_EQ(adapters::RegisterStaticPlugin(Manifest(2)), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(src->Enumerate().size(), 1u);
+    EXPECT_FALSE(src->Exists(plugin::PluginId{2}));
+
+    // A freshly-created source sees the current registrations.
+    auto src2 = adapters::CreatePlatformPluginSource(cfg);
+    EXPECT_EQ(src2->Enumerate().size(), 2u);
+
+    adapters::ClearStaticPlugins();
 }

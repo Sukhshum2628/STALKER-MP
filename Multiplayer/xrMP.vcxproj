@@ -172,6 +172,7 @@
     </ClCompile>
     <ClCompile Include="src\plugin\PluginValidator.cpp" />
     <ClCompile Include="src\plugin\InMemoryPluginSource.cpp" />
+    <ClCompile Include="src\adapters\PlatformPluginStore.cpp" />
     <ClCompile Include="src\lua\ScriptRegistry.cpp" />
     <ClCompile Include="src\lua\EventBinding.cpp" />
     <ClCompile Include="src\lua\ScriptValidator.cpp" />
@@ -402,6 +403,7 @@
     <ClInclude Include="include\stalkermp\plugin\IPluginSource.h" />
     <ClInclude Include="include\stalkermp\plugin\NullPluginSource.h" />
     <ClInclude Include="include\stalkermp\plugin\InMemoryPluginSource.h" />
+    <ClInclude Include="include\stalkermp\adapters\PlatformPluginStore.h" />
     <ClInclude Include="include\stalkermp\lua\ILuaRuntime.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptContext.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptRegistry.h" />
