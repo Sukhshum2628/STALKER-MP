@@ -19,6 +19,7 @@
 #include "stalkermp/plugin/NullPluginSource.h"
 #include "stalkermp/plugin/PluginConfiguration.h"
 #include "stalkermp/plugin/PluginContext.h"
+#include "stalkermp/plugin/PluginHostSurface.h"
 #include "stalkermp/plugin/PluginRegistry.h"
 #include "stalkermp/plugin/PluginTypes.h"
 #include "stalkermp/plugin/PluginValidator.h"
@@ -689,4 +690,76 @@ TEST(PlatformPluginStoreStep8, SourceIsReadOnlySnapshotAfterConstruction)
     EXPECT_EQ(src2->Enumerate().size(), 2u);
 
     adapters::ClearStaticPlugins();
+}
+
+// ============================================================================
+// Step 09 — Plugin host-service exposure seam (gameplay facades only, AR-P3 Option A)
+// ============================================================================
+
+TEST(PluginHostSurfaceStep9, ServiceTypeNamesAreTotalAndCount)
+{
+    EXPECT_EQ(plugin::kGameplayServiceCount, 7u);
+    EXPECT_STREQ(plugin::PluginServiceTypeName(plugin::PluginServiceType::World), "World");
+    EXPECT_STREQ(plugin::PluginServiceTypeName(plugin::PluginServiceType::Config), "Config");
+    for (std::uint8_t i = 0; i <= static_cast<std::uint8_t>(plugin::PluginServiceType::Config); ++i)
+    {
+        EXPECT_STRNE(plugin::PluginServiceTypeName(static_cast<plugin::PluginServiceType>(i)), "Unknown");
+    }
+}
+
+TEST(PluginHostSurfaceStep9, CatalogExposesExactlyTheSevenGameplayServices)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const plugin::IPluginHostSurface& s = surface;
+
+    const auto catalog = s.Catalog();
+    ASSERT_EQ(catalog.size(), 7u); // exactly the gameplay services; no admin/tooling
+    // Deterministic ascending-by-type order with correct metadata.
+    EXPECT_EQ(catalog[0].type, plugin::PluginServiceType::World);
+    EXPECT_STREQ(catalog[0].name, "World");
+    EXPECT_TRUE(catalog[0].available);
+    EXPECT_EQ(catalog[6].type, plugin::PluginServiceType::Config);
+    EXPECT_STREQ(catalog[6].name, "Config");
+
+    // Every gameplay service is available by default; lookup is deterministic.
+    for (std::uint8_t i = 0; i <= static_cast<std::uint8_t>(plugin::PluginServiceType::Config); ++i)
+    {
+        EXPECT_TRUE(s.IsAvailable(static_cast<plugin::PluginServiceType>(i)));
+    }
+}
+
+TEST(PluginHostSurfaceStep9, ServiceAvailabilityIsQueryableAndImmutableMetadata)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    surface.SetAvailable(plugin::PluginServiceType::Inventory, false);
+
+    const plugin::IPluginHostSurface& s = surface;
+    EXPECT_FALSE(s.IsAvailable(plugin::PluginServiceType::Inventory));
+    EXPECT_TRUE(s.IsAvailable(plugin::PluginServiceType::World));
+
+    // The catalog reflects availability but its entries are immutable value metadata.
+    const auto catalog = s.Catalog();
+    plugin::PluginServiceInfo copy = catalog[static_cast<std::size_t>(plugin::PluginServiceType::Inventory)];
+    EXPECT_FALSE(copy.available);
+    copy.available = true;                 // mutating the copy does not affect the surface
+    EXPECT_FALSE(s.IsAvailable(plugin::PluginServiceType::Inventory));
+    ASSERT_EQ(catalog.size(), 7u);
+    EXPECT_STREQ(catalog[static_cast<std::size_t>(plugin::PluginServiceType::Inventory)].name, "Inventory");
+}
+
+TEST(PluginHostSurfaceStep9, SurfaceExposesFacadeBundleWithoutExecuting)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const plugin::IPluginHostSurface& s = surface;
+
+    // The exposed bundle references the same underlying facades (exposure, not execution).
+    const lua::ScriptApiSet exposed = s.Services();
+    EXPECT_EQ(&exposed.world, static_cast<lua::IWorldApi*>(&api));
+    EXPECT_EQ(&exposed.logging, static_cast<lua::ILoggingApi*>(&api));
+    // The seam performed no service call: the recorder observed nothing.
+    EXPECT_TRUE(api.logCalls.empty());
+    EXPECT_TRUE(api.setWeatherCalls.empty());
 }

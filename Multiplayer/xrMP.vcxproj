@@ -404,6 +404,7 @@
     <ClInclude Include="include\stalkermp\plugin\NullPluginSource.h" />
     <ClInclude Include="include\stalkermp\plugin\InMemoryPluginSource.h" />
     <ClInclude Include="include\stalkermp\adapters\PlatformPluginStore.h" />
+    <ClInclude Include="include\stalkermp\plugin\PluginHostSurface.h" />
     <ClInclude Include="include\stalkermp\lua\ILuaRuntime.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptContext.h" />
     <ClInclude Include="include\stalkermp\lua\ScriptRegistry.h" />
