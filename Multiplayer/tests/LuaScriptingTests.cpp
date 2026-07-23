@@ -25,6 +25,8 @@
 #include "stalkermp/lua/LuaConfiguration.h"
 #include "stalkermp/lua/LuaScriptTypes.h"
 #include "stalkermp/lua/NullScriptSource.h"
+#include "stalkermp/lua/RecordingScriptApi.h"
+#include "stalkermp/lua/ScriptApi.h"
 #include "stalkermp/lua/ScriptContext.h"
 #include "stalkermp/lua/ScriptRegistry.h"
 #include "stalkermp/lua/ScriptValidator.h"
@@ -744,4 +746,118 @@ TEST(PlatformScriptStoreStep8, DerivedIdIsStableAcrossInstances)
     EXPECT_NE(ea[0].id.value, 0u);             // never the reserved none id
 
     fs::remove_all(dir, ec);
+}
+
+// ============================================================================
+// Step 09 — Public API facade seams (RecordingScriptApi test double)
+// ============================================================================
+
+TEST(PublicApiStep9, ReadFacadesReturnCannedValues)
+{
+    lua::RecordingScriptApi api;
+    api.simulationTick = 4200;
+    api.timeOfDaySeconds = 36000;
+    api.entityCount = 5;
+    api.playerCount = 2;
+    api.entityExistsResult = true;
+    api.environment = lua::EnvironmentInfo{2, 36000, 5};
+
+    const lua::IWorldApi& world = api;
+    EXPECT_EQ(world.SimulationTick(), 4200u);
+    EXPECT_EQ(world.TimeOfDaySeconds(), 36000u);
+    EXPECT_EQ(world.EntityCount(), 5u);
+    EXPECT_TRUE(world.EntityExists(world::EntityId{1}));
+
+    const lua::IEnvironmentApi& env = api;
+    EXPECT_EQ(env.Current().weatherId, 2u);
+    EXPECT_EQ(env.Current().lighting, 5u);
+
+    const lua::IPlayerApi& player = api;
+    EXPECT_EQ(player.PlayerCount(), 2u);
+}
+
+TEST(PublicApiStep9, QueriesReturnValueOutcomes)
+{
+    lua::RecordingScriptApi api;
+    api.entityInfo = lua::EntityInfo{world::EntityId{7}, world::Vec3{1.0f, 2.0f, 3.0f}, 11u};
+    api.playerInfo.id = player::PlayerId{9};
+
+    const lua::IEntityApi& entity = api;
+    const auto e = entity.Query(world::EntityId{7});
+    ASSERT_TRUE(e.HasValue());
+    EXPECT_EQ(e.Value().id.value, 7u);
+    EXPECT_EQ(e.Value().stateFlags, 11u);
+
+    api.entityQueryFound = false;
+    EXPECT_FALSE(entity.Query(world::EntityId{7}).HasValue()); // NotFound value outcome
+
+    const lua::IPlayerApi& player = api;
+    ASSERT_TRUE(player.Query(player::PlayerId{9}).HasValue());
+    api.playerQueryFound = false;
+    EXPECT_FALSE(player.Query(player::PlayerId{9}).HasValue());
+}
+
+TEST(PublicApiStep9, ControlledWritesRecordedAndReturnValueOutcome)
+{
+    lua::RecordingScriptApi api;
+
+    lua::IEnvironmentApi& env = api;
+    EXPECT_EQ(env.SetWeather(3), lua::ScriptOutcome::Ok);
+
+    lua::IEntityApi& entity = api;
+    EXPECT_EQ(entity.SetPosition(world::EntityId{4}, world::Vec3{5.0f, 0.0f, 0.0f}), lua::ScriptOutcome::Ok);
+
+    lua::IInventoryApi& inv = api;
+    EXPECT_EQ(inv.GiveItem(world::EntityId{4}, /*itemType*/ 100, /*count*/ 2), lua::ScriptOutcome::Ok);
+
+    ASSERT_EQ(api.setWeatherCalls.size(), 1u);
+    EXPECT_EQ(api.setWeatherCalls[0], 3u);
+    ASSERT_EQ(api.setPositionCalls.size(), 1u);
+    EXPECT_EQ(api.setPositionCalls[0].id.value, 4u);
+    EXPECT_EQ(api.setPositionCalls[0].position.x, 5.0f);
+    ASSERT_EQ(api.giveItemCalls.size(), 1u);
+    EXPECT_EQ(api.giveItemCalls[0].itemType, 100u);
+    EXPECT_EQ(api.giveItemCalls[0].count, 2u);
+
+    // A forced failure outcome is propagated as a value outcome.
+    api.writeOutcome = lua::ScriptOutcome::ScriptDisabled;
+    EXPECT_EQ(inv.GiveItem(world::EntityId{4}, 1, 1), lua::ScriptOutcome::ScriptDisabled);
+}
+
+TEST(PublicApiStep9, LoggingAndConfigFacades)
+{
+    lua::RecordingScriptApi api;
+    lua::ILoggingApi& log = api;
+    log.Log(lua::ScriptLogLevel::Warning, "quest", "low ammo");
+    log.Log(lua::ScriptLogLevel::Error, "quest", "failed");
+    ASSERT_EQ(api.logCalls.size(), 2u);
+    EXPECT_EQ(api.logCalls[0].level, lua::ScriptLogLevel::Warning);
+    EXPECT_EQ(api.logCalls[0].category, "quest");
+    EXPECT_EQ(api.logCalls[1].message, "failed");
+
+    api.configString = "hard";
+    api.configInt = 42;
+    api.configBool = true;
+    const lua::IConfigApi& cfg = api;
+    ASSERT_TRUE(cfg.GetString("game", "difficulty").HasValue());
+    EXPECT_EQ(cfg.GetString("game", "difficulty").Value(), "hard");
+    EXPECT_EQ(cfg.GetInt("game", "max").Value(), 42);
+    EXPECT_TRUE(cfg.GetBool("game", "pvp").Value());
+
+    api.configFound = false;
+    EXPECT_FALSE(cfg.GetString("game", "missing").HasValue()); // NotFound value outcome
+}
+
+TEST(PublicApiStep9, ScriptApiSetBundlesAllSeams)
+{
+    lua::RecordingScriptApi api;
+    api.entityCount = 3;
+    lua::ScriptApiSet set = api.AsSet();
+    EXPECT_EQ(set.world.EntityCount(), 3u);
+    EXPECT_EQ(set.environment.Current().weatherId, 0u);
+    // All seven references resolve to the single engine-free double (no engine object).
+    EXPECT_EQ(&set.world, static_cast<lua::IWorldApi*>(&api));
+    // The logging seam is reachable and side-effecting through the bundle.
+    set.logging.Log(lua::ScriptLogLevel::Info, "sys", "ready");
+    EXPECT_EQ(api.logCalls.size(), 1u);
 }

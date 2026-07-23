@@ -390,6 +390,8 @@
     <ClInclude Include="include\stalkermp\lua\NullScriptSource.h" />
     <ClInclude Include="include\stalkermp\lua\InMemoryScriptSource.h" />
     <ClInclude Include="include\stalkermp\adapters\PlatformScriptStore.h" />
+    <ClInclude Include="include\stalkermp\lua\ScriptApi.h" />
+    <ClInclude Include="include\stalkermp\lua\RecordingScriptApi.h" />
     <ClInclude Include="include\stalkermp\prediction\PredictionConfiguration.h" />
     <ClInclude Include="include\stalkermp\prediction\InputBuffer.h" />
     <ClInclude Include="include\stalkermp\prediction\StateBuffer.h" />
