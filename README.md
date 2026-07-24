@@ -106,7 +106,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 | **011** | Persistence Framework | ✅ Verified (Closed) |
 | **012** | **Save/Load System** | ✅ **Verified (Closed)**  |
 | **013** | **Lua Integration** | ✅ **Verified (Closed)** — all 18 steps |
-| 013–014 | Extensibility (Lua, plugin loader) | Progress(7/18)|
+| **014** | **Plugin Framework** | ✅ **Verified (Closed)** — all 18 steps |
 | 015 | Diagnostics / Optimization | ⏳ Planned |
 
 **Sprint-008 (Snapshot System) — Verified (Closed):** the immutable, deterministic per-tick capture of world state that decouples asynchronous consumers (replication, persistence, replay) from live simulation. All 14 steps were implemented one at a time and independently verified.
@@ -121,7 +121,9 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 **Sprint-013 (Lua Integration) — Verified (Closed):** a controlled, host-side scripting layer through which scripts observe the authoritative world and effect change only via sanctioned subsystem seams, on the Simulation Thread only. All 18 steps were implemented across eleven verification batches (with the load-bearing gates verified in isolation) and independently verified: the engine-free `ILuaRuntime` seam, `ScriptRegistry`/`ScriptContext`, `EventBinding`, `ScriptValidator`, the `IScriptSource` read seam + the `PlatformScriptStore` filesystem TU (ADR-009), the seven Public API facade seams (no engine object exposed, ADR-008), `ScriptLifecycle`, `ScriptLoader`, `LuaManager`, `ScriptManager` (`IService`+`ITickable`) with per-script fault isolation, non-invasive `LuaDiagnostics`, and the `ScriptThreadGuard`. The concrete Lua runtime binding (reusing the engine's existing Lua runtime) and the real Public API facades are confined to `EngineAdapters.cpp`; the `ScriptManager` ticks at the one new reserved `tick_order::kScripting = 375` (Gameplay phase: after ALife 350, before Snapshot 400; networking-last preserved), with `LuaManager.Init` + `ScriptManager.LoadAll` run once before networking. No thread is created (ADR-011); the wire protocol is untouched (ADR-010). Subsystem documentation: `Multiplayer/docs/LuaScripting.md`.
 
-**Current focus — Sprint-014 (Plugin Framework):** a native plugin framework for server modules, tooling, and future engine extensions atop the now-complete extensibility layer, respecting host authority, immutable snapshots, and subsystem ownership.
+**Sprint-014 (Plugin Framework) — Verified (Closed):** a native plugin framework for server modules, tooling, and future engine extensions, respecting host authority, immutable snapshots, and subsystem ownership; the engine operates correctly with zero plugins installed. All 18 steps were implemented across eleven verification batches (with the load-bearing gates verified in isolation) and independently verified: the engine-free `PluginTypes` vocabulary + `PluginConfiguration`, the stable `IPlugin` contract, `PluginRegistry`/`PluginContext`, `EventBinding`, `PluginValidator` (versioning + dependencies), the `IPluginSource` discovery seam + the `PlatformPluginStore` static-registration TU (ADR-009, `[AR-P1]` Option B; dynamic loading deferred), the `PluginHostSurface` reusing the Sprint-013 gameplay facades (no engine object exposed, ADR-008, `[AR-P3]` Option A), `PluginLifecycle`, `PluginLoader`, `PluginHost`, `PluginManager` (`IService`+`ITickable`) with `FaultIsolation`, non-invasive `PluginDiagnostics`, and the `PluginThreadGuard`. The `PluginManager` ticks at the pre-reserved `tick_order::kPlugins = 700` (after Persistence 500, before Networking 900; networking-last preserved) — **no new `tick_order` key** — with `PluginManager.Startup()` run once before networking. No thread is created (ADR-011); the wire protocol is untouched (ADR-010).
+
+**Current focus — Sprint-015 (Optimization, Profiling & QA):** performance optimization, profiling, scalability testing, automated testing, documentation review, and release engineering atop the now-complete extensibility layer. No new gameplay features are introduced.
 
 ---
 
@@ -137,7 +139,7 @@ All framework code conforms to ADR-007 through ADR-011; no ADR has been supersed
 
 ## Test Status
 
-- **736 / 736 build tests passing** (Release x64) on **GCC** and **MSVC** (675 Sprint-012 baseline + 61 Sprint-013; Sprint-013 closed). **Game testing has not started yet**.
+- **806 / 806 build tests passing** (Release x64) on **GCC** and **MSVC** (736 Sprint-013 baseline + 70 Sprint-014; Sprint-014 closed). **Game testing has not started yet**.
 - **0 errors, 0 warnings, no regressions.**
 - Engine-free subsystems are fully unit-tested with mock/loopback/null substrates (no engine, no OS, no threads required for the test build).
 - The single engine-touching and OS-touching translation units are verified on Windows.

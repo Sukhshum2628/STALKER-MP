@@ -23,10 +23,12 @@
 
 #include "stalkermp/StalkerMP.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include "stalkermp/core/Config.h"
 #include "stalkermp/core/Expected.h"
@@ -92,6 +94,16 @@
 #include "stalkermp/lua/LuaManager.h"                      // lua::LuaManager
 #include "stalkermp/lua/ScriptManager.h"                   // lua::ScriptManager
 #include "stalkermp/lua/ScriptThreadGuard.h"               // lua::ScriptThreadGuard
+// Plugin Framework (Sprint-014, Step 17) — composition-root wiring: static-registration
+// discovery backend ([AR-P1] Option B) + reused Sprint-013 gameplay host facades ([AR-P3]
+// Option A); PluginManager at the reserved kPlugins = 700.
+#include "stalkermp/adapters/PlatformPluginStore.h"        // CreatePlatformPluginSource ([AR-P1] Option B)
+#include "stalkermp/plugin/IPluginSource.h"                // plugin::IPluginSource
+#include "stalkermp/plugin/PluginConfiguration.h"          // plugin::PluginConfiguration
+#include "stalkermp/plugin/PluginDiagnostics.h"            // plugin::PluginDiagnostics
+#include "stalkermp/plugin/PluginHostSurface.h"            // plugin::GameplayHostSurface ([AR-P3] Option A)
+#include "stalkermp/plugin/PluginManager.h"                // plugin::PluginManager
+#include "stalkermp/plugin/PluginThreadGuard.h"            // plugin::PluginThreadGuard
 #include "stalkermp/world/WorldConfiguration.h"
 #include "stalkermp/world/WorldManager.h"
 #include "stalkermp/world/WorldModule.h"
@@ -150,6 +162,17 @@ namespace stalkermp
             "retry_backoff_ticks = 30\n"
             "backpressure_high_watermark = 12\n"
             "backpressure_low_watermark = 4\n"
+            "version = 1\n"
+            "\n"
+            "; Plugin Framework (Sprint-014). Static in-process registration only ([AR-P1]\n"
+            "; Option B); dynamic library loading is deferred. max_plugins >= 1. All optional\n"
+            "; (defaults shown).\n"
+            "[plugins]\n"
+            "plugin_directory = plugins\n"
+            "max_plugins = 64\n"
+            "enabled = true\n"
+            "validate_on_load = true\n"
+            "strict_api_version = true\n"
             "version = 1\n";
 
         constexpr std::string_view kDefaultClientConfig =
@@ -321,6 +344,26 @@ namespace stalkermp
             lua::ScriptManager* scriptManager = nullptr; // owned by ServiceRegistry
             lua::LuaDiagnostics luaDiagnostics;          // non-invasive collector
             lua::ScriptThreadGuard scriptThreadGuard;    // single-thread enforcement (bound at Init)
+
+            // Plugin Framework (Sprint-014, Step 17). Runtime-owned seams: the plugin config;
+            // the host-exposed API-id set; the discovery source (static-registration backend
+            // per [AR-P1] Option B — PlatformPluginStore; in-memory snapshot in tests); and the
+            // host-service surface (the reused Sprint-013 gameplay facades per [AR-P3] Option A,
+            // wrapping the SAME Public API bundle `luaApis` the ScriptManager uses — declared
+            // AFTER luaApis so it is destroyed BEFORE it). The PluginManager is ServiceRegistry-
+            // owned (cached here as a raw pointer) and subscribed to the FrameDispatcher at the
+            // reserved tick_order::kPlugins = 700 (after Persistence 500, before Networking 900).
+            // The diagnostics collector and thread guard are non-invasive Runtime-owned surfaces
+            // (the guard is bound to the simulation thread at Initialize). These seams outlive
+            // ShutdownAll and are destroyed with the Runtime; the manager never dereferences them
+            // at destruction.
+            plugin::PluginConfiguration pluginConfig;
+            std::vector<std::uint32_t> pluginAvailableApis;
+            std::unique_ptr<plugin::IPluginSource> pluginSource;
+            std::unique_ptr<plugin::IPluginHostSurface> pluginHostSurface;
+            plugin::PluginManager* pluginManager = nullptr; // owned by ServiceRegistry
+            plugin::PluginDiagnostics pluginDiagnostics;    // non-invasive collector
+            plugin::PluginThreadGuard pluginThreadGuard;    // single-thread enforcement (bound at Init)
         };
 
         // The single module-global. See file header for justification.
@@ -855,6 +898,49 @@ namespace stalkermp
             }
             runtime.scriptManager = scriptManagerPtr;
 
+            // Plugin Framework (Sprint-014, Step 17). Parse [plugins]; bind the discovery
+            // source (static-registration backend per [AR-P1] Option B — PlatformPluginStore;
+            // an in-memory snapshot in tests) and the host-service surface (the reused
+            // Sprint-013 gameplay facades per [AR-P3] Option A, wrapping the SAME Public API
+            // bundle `luaApis` the ScriptManager consumes — no new engine facade). The
+            // PluginManager is registered as an IService (after every simulation producer and
+            // after Scripting) and subscribed at the reserved tick_order::kPlugins = 700 —
+            // strictly after Persistence (500) and before Networking (900) — so a plugin's
+            // authoritative effects (applied through the sanctioned seams) are captured in the
+            // subsequent frame's snapshot. PluginManager.Startup() runs once at Initialize
+            // (before networking). No new tick_order key; networking-last preserved. Module-
+            // loading code stays confined to PlatformPluginStore.cpp (Option B: no OS loader).
+            auto pluginConfiguration = plugin::PluginConfiguration::FromConfig(runtime.serverConfig);
+            if (!pluginConfiguration)
+            {
+                return pluginConfiguration.GetError();
+            }
+            runtime.pluginConfig = pluginConfiguration.Value();
+            runtime.pluginSource = adapters::CreatePlatformPluginSource(runtime.pluginConfig);
+            runtime.pluginHostSurface =
+                std::make_unique<plugin::GameplayHostSurface>(runtime.luaApis->Apis());
+            runtime.pluginAvailableApis = {}; // host-advertised API ids (none in the Option A baseline)
+
+            auto pluginManager = std::make_unique<plugin::PluginManager>(
+                *runtime.pluginSource, *runtime.pluginHostSurface, runtime.pluginAvailableApis,
+                runtime.pluginConfig);
+            plugin::PluginManager* pluginManagerPtr = pluginManager.get();
+            if (auto registered = runtime.services.Register(std::move(pluginManager)); !registered)
+            {
+                return registered;
+            }
+
+            // Single plugin tick at the reserved tick_order::kPlugins = 700 (after Persistence
+            // 500, before Networking 900). Uses the single existing FrameDispatcher; no new
+            // tick_order key; networking-last (kNetworking = 900) preserved.
+            if (auto subscribed = runtime.frameDispatcher.Subscribe(
+                    *pluginManagerPtr, tick_order::kPlugins, "Plugins");
+                !subscribed)
+            {
+                return subscribed;
+            }
+            runtime.pluginManager = pluginManagerPtr;
+
             runtime.worldManager = managerPtr;
             return Success();
         }
@@ -1068,6 +1154,25 @@ namespace stalkermp
                                                    report.loaded, report.attempted));
             }
 
+            // 7d. Plugin Framework startup (Sprint-014, Step 17). Runs ONCE here — before the
+            //     engine frame bridge and before networking. Bind the thread guard to the
+            //     simulation thread (single-thread enforcement), then PluginManager.Startup():
+            //     load every statically-registered plugin (PluginLoader), then initialize and
+            //     activate the loaded-and-bound plugins through the PluginHost. A load or init
+            //     failure isolates ONLY the offending plugin (fault isolation); the engine
+            //     continues. The per-frame OnTick dispatch runs at kPlugins = 700. (In the
+            //     engine build, statically-linked plugins register their manifest and bind
+            //     their instance via EngineAdapters; the engine-free composition here loads the
+            //     registered manifests deterministically.)
+            runtime.pluginThreadGuard.Bind(1); // sanctioned simulation-thread token (as scripting)
+            const plugin::PluginStartupReport pluginReport = runtime.pluginManager->Startup();
+            runtime.pluginDiagnostics.Reset();
+            runtime.logger.Info(
+                kLogCategory,
+                common::Format("Plugins: loaded {}/{} and activated {} before networking ({} isolated)",
+                               pluginReport.loaded, pluginReport.discovered, pluginReport.initialized,
+                               pluginReport.isolated));
+
             // 8. Engine frame registration — strictly LAST: no engine
             //    callback may arrive before the module is fully ready
             //    (register-last / remove-first, Design Review §5).
@@ -1113,6 +1218,24 @@ namespace stalkermp
                     Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
                 }
                 g_runtime->entityFeed.reset();
+            }
+
+            // Plugin Framework runtime (Sprint-014): unsubscribe the PluginManager from the
+            // dispatcher (subscribed LAST, at kPlugins = 700) — reverse-order teardown, so it
+            // is removed before the Persistence/Lua consumers it followed in registration —
+            // then let ShutdownAll run its Shutdown (host.ShutdownAll + fault clear). The
+            // Runtime-owned plugin source / host surface / available-api set / config outlive
+            // ShutdownAll and are destroyed with the Runtime; the manager never dereferences
+            // them at destruction (the host surface is destroyed before `luaApis`, whose
+            // facades it wraps).
+            if (g_runtime->pluginManager != nullptr)
+            {
+                if (auto unsubscribed = g_runtime->frameDispatcher.Unsubscribe(*g_runtime->pluginManager);
+                    !unsubscribed && IsLogAvailable())
+                {
+                    Log().Warning(kLogCategory, unsubscribed.GetError().Describe());
+                }
+                g_runtime->pluginManager = nullptr;
             }
 
             // Persistence Framework runtime (Sprint-011) + Save/Load System (Sprint-012):

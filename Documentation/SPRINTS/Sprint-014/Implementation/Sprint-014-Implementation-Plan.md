@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Sprint | 014 — Plugin Framework |
-| Status | **FROZEN** (2026-07-20) — approved for execution. All Approval-Required items resolved (`[AR-P2]`/`[AR-P4]` from frozen docs; `[AR-P1]` Option B / `[AR-P3]` Option A by project-owner decision); step scope, dependency chain, and batching are now immutable. |
+| Status | **COMPLETED** — EXECUTED & CLOSED (2026-07-24). All 18 steps implemented across batches B1–B11, each independently Antigravity-verified; final baseline **806 / 806** tests passing (GCC + MSVC), zero warnings, no regressions; evidence gates E-G1-PL…E-G5-PL PASSED. Previously **FROZEN** (2026-07-20) — All Approval-Required items resolved (`[AR-P2]`/`[AR-P4]` from frozen docs; `[AR-P1]` Option B / `[AR-P3]` Option A by project-owner decision); step scope, dependency chain, and batching immutable. |
 | Scope authority | `Documentation/SPRINTS/Sprint-014/Sprint-014-Plugin-System.md` (approved) |
 | Baseline | Sprint-013 CLOSED & FROZEN — **736 / 736** tests passing (GCC + MSVC) |
 | Governing ADRs | ADR-007, ADR-008, ADR-009, ADR-010, ADR-011 (all preserved; none modified) |
@@ -15,13 +15,12 @@
 
 ## Status lifecycle
 
-This plan moves through three states. It is currently at **③ FROZEN (2026-07-20)** — approved for execution.
+This plan moved through three states and is now **④ EXECUTED & CLOSED (2026-07-24)** — implementation complete, verification successful.
 
 - **① DRAFT (PLANNED)** — content authored; Approval-Required register open. *(Passed.)*
 - **② FREEZE REVIEW** — Antigravity verification PASSED; `[AR-P2]`/`[AR-P4]` resolved from frozen documentation; `[AR-P1]`/`[AR-P3]` referred to the project owner. *(Passed.)*
-- **③ FROZEN — current state (2026-07-20).** The project owner decided `[AR-P1]` (Option B — static registration; dynamic loading deferred) and `[AR-P3]` (Option A — gameplay facades only; administration/tooling deferred). All Approval-Required items are resolved; step scope, dependency chain, and batching are immutable; **Batch-1 (Steps 01 + 02) is approved for implementation** under the standard workflow (implement → Antigravity verification → commit → push → next batch). Freezing records readiness only; it does not itself begin implementation.
-
-This document is planning/architecture only. **No production code is written; the plan is not frozen; no sprint closure is performed.**
+- **③ FROZEN (2026-07-20).** The project owner decided `[AR-P1]` (Option B — static registration; dynamic loading deferred) and `[AR-P3]` (Option A — gameplay facades only; administration/tooling deferred). All Approval-Required items resolved; step scope, dependency chain, and batching immutable. *(Passed.)*
+- **④ EXECUTED & CLOSED — current state (2026-07-24).** All 18 steps implemented across batches B1–B11 under the standard workflow (implement → Antigravity verification → commit → push → next batch), the load-bearing gates (B5/B6/B10) verified in isolation. Final baseline **806 / 806** tests passing (GCC + MSVC), zero warnings, no regressions; evidence gates E-G1-PL…E-G5-PL PASSED. Sprint-014 is Closed & Frozen.
 
 ---
 
@@ -186,19 +185,21 @@ No cycles. Reused Sprint-002/003/005/007/008/013 seams are pre-existing inputs (
 
 The 18 steps are frozen exactly as written once approved; this subsection defines only the **execution batching**. Batching combines steps only where it violates no dependency, crosses no architectural/ADR/verification boundary, keeps diagnostics non-invasive and hardening test-only, and preserves independent testability and failure isolation. The load-bearing gates (Step-08 platform boundary, Step-09 engine API boundary, Step-17 integration) remain isolated; Step-18 is the documentation-only closure batch.
 
-| Batch | Steps | Isolation | Nature of the batch |
-|---|---|---|---|
-| **B1** | 01 + 02 | — | Value types + `PluginConfiguration` (pure, engine-free/loader-free foundation). |
-| **B2** | 03 + 04 | — | `IPlugin` contract (+ fake/null) + `PluginContext`/`PluginRegistry`. |
-| **B3** | 05 + 06 | — | Event-binding registry + `PluginValidator` (versioning + deps). |
-| **B4** | 07 | **Isolated** | `IPluginSource` discovery read seam (+ null/in-memory). |
-| **B5** | 08 | **Isolated** | Platform plugin backend — **Single Platform Boundary / ADR-009** (only module-loading TU; Windows smoke). |
-| **B6** | 09 | **Isolated** | Host-service exposure seam — **Single Engine Boundary / ADR-008** decision point. |
-| **B7** | 10 + 11 | — | Plugin lifecycle + `PluginLoader` (engine-free consumers of the Step-07/09 seams). |
-| **B8** | 12 + 13 + 14 | — | **Plugin Runtime Subsystem** — `PluginHost` + `PluginManager` + fault isolation, over the fake plugin + null source + recording host facades. |
-| **B9** | 15 + 16 | — | Non-invasive diagnostics/statistics + thread-safety enforcement. |
-| **B10** | 17 | **Isolated** | Composition-root + engine adapters + integration + `Plugins.md` — **Integration gate** (ADR-008 host facades + ADR-009 module-loading backend + `kPlugins = 700` ordering; Windows smoke). |
-| **B11** | 18 | **Isolated** | Sprint closure (documentation only; no code). |
+| Batch | Steps | Isolation | Status | Nature of the batch |
+|---|---|---|---|---|
+| **B1** | 01 + 02 | — | ✅ Complete | Value types + `PluginConfiguration` (pure, engine-free/loader-free foundation). |
+| **B2** | 03 + 04 | — | ✅ Complete | `IPlugin` contract (+ fake/null) + `PluginContext`/`PluginRegistry`. |
+| **B3** | 05 + 06 | — | ✅ Complete | Event-binding registry + `PluginValidator` (versioning + deps). |
+| **B4** | 07 | **Isolated** | ✅ Complete | `IPluginSource` discovery read seam (+ null/in-memory). |
+| **B5** | 08 | **Isolated** | ✅ Complete | Platform plugin backend — **Single Platform Boundary / ADR-009** (only module-loading TU; Windows smoke). |
+| **B6** | 09 | **Isolated** | ✅ Complete | Host-service exposure seam — **Single Engine Boundary / ADR-008** decision point. |
+| **B7** | 10 + 11 | — | ✅ Complete | Plugin lifecycle + `PluginLoader` (engine-free consumers of the Step-07/09 seams). |
+| **B8** | 12 + 13 + 14 | — | ✅ Complete | **Plugin Runtime Subsystem** — `PluginHost` + `PluginManager` + fault isolation, over the fake plugin + null source + recording host facades. |
+| **B9** | 15 + 16 | — | ✅ Complete | Non-invasive diagnostics/statistics + thread-safety enforcement. |
+| **B10** | 17 | **Isolated** | ✅ Complete | Composition-root + integration — **Integration gate** (reused ADR-008 host facades + ADR-009 module-loading backend + `kPlugins = 700` ordering; Windows smoke). Plugin developer guide `Plugins.md` deferred to the follow-up documentation pass per the project-owner scope decision. |
+| **B11** | 18 | **Isolated** | ✅ Complete | Sprint closure (documentation only; no code). |
+
+All eleven batches (Steps 01–18) are implemented, independently Antigravity-verified, and complete; final baseline **806 / 806** tests passing (GCC + MSVC).
 
 **Batching does not alter the dependency graph.** Within any multi-step batch, steps are implemented in their documented order.
 

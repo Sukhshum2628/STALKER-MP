@@ -13,14 +13,21 @@
 #include "stalkermp/core/Config.h"
 #include "stalkermp/lua/RecordingScriptApi.h"
 #include "stalkermp/plugin/EventBinding.h"
+#include "stalkermp/plugin/FaultIsolation.h"
 #include "stalkermp/plugin/IPlugin.h"
 #include "stalkermp/plugin/IPluginSource.h"
 #include "stalkermp/plugin/InMemoryPluginSource.h"
 #include "stalkermp/plugin/NullPluginSource.h"
 #include "stalkermp/plugin/PluginConfiguration.h"
 #include "stalkermp/plugin/PluginContext.h"
+#include "stalkermp/plugin/PluginDiagnostics.h"
+#include "stalkermp/plugin/PluginHost.h"
 #include "stalkermp/plugin/PluginHostSurface.h"
+#include "stalkermp/plugin/PluginLifecycle.h"
+#include "stalkermp/plugin/PluginLoader.h"
+#include "stalkermp/plugin/PluginManager.h"
 #include "stalkermp/plugin/PluginRegistry.h"
+#include "stalkermp/plugin/PluginThreadGuard.h"
 #include "stalkermp/plugin/PluginTypes.h"
 #include "stalkermp/plugin/PluginValidator.h"
 
@@ -762,4 +769,738 @@ TEST(PluginHostSurfaceStep9, SurfaceExposesFacadeBundleWithoutExecuting)
     // The seam performed no service call: the recorder observed nothing.
     EXPECT_TRUE(api.logCalls.empty());
     EXPECT_TRUE(api.setWeatherCalls.empty());
+}
+
+// ============================================================================
+// Step 10 — PluginLifecycle state machine
+// ============================================================================
+
+TEST(PluginLifecycleStep10, InitialStateAndLegalChain)
+{
+    plugin::PluginState s = plugin::PluginState::Discovered; // initial
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Validate), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Validated);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Load), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Loaded);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Initialize), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Initialized);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Activate), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Active);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Suspend), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Suspended);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Resume), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Active);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Shutdown), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Shutdown);
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Unload), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(s, plugin::PluginState::Unloaded);
+}
+
+TEST(PluginLifecycleStep10, IllegalTransitionsRejectedStateUnchanged)
+{
+    plugin::PluginState s = plugin::PluginState::Discovered;
+    // Cannot Initialize/Activate before Validate+Load.
+    EXPECT_EQ(plugin::PluginLifecycle::Apply(s, plugin::LifecycleAction::Initialize), plugin::PluginOutcome::RuntimeError);
+    EXPECT_EQ(s, plugin::PluginState::Discovered); // unchanged
+    EXPECT_FALSE(plugin::PluginLifecycle::IsLegal(plugin::PluginState::Discovered, plugin::LifecycleAction::Activate));
+    // Resume only from Suspended.
+    EXPECT_FALSE(plugin::PluginLifecycle::IsLegal(plugin::PluginState::Active, plugin::LifecycleAction::Resume));
+    // Unloaded is terminal.
+    EXPECT_FALSE(plugin::PluginLifecycle::IsLegal(plugin::PluginState::Unloaded, plugin::LifecycleAction::Unload));
+}
+
+TEST(PluginLifecycleStep10, NextQueryAndFailedRecovery)
+{
+    const auto next = plugin::PluginLifecycle::Next(plugin::PluginState::Loaded, plugin::LifecycleAction::Initialize);
+    ASSERT_TRUE(next.HasValue());
+    EXPECT_EQ(next.Value(), plugin::PluginState::Initialized);
+    EXPECT_FALSE(plugin::PluginLifecycle::Next(plugin::PluginState::Discovered, plugin::LifecycleAction::Activate)
+                     .HasValue());
+    // A Failed plugin may be shut down and unloaded.
+    EXPECT_TRUE(plugin::PluginLifecycle::IsLegal(plugin::PluginState::Failed, plugin::LifecycleAction::Shutdown));
+    EXPECT_TRUE(plugin::PluginLifecycle::IsLegal(plugin::PluginState::Failed, plugin::LifecycleAction::Unload));
+}
+
+// ============================================================================
+// Step 11 — PluginLoader (discover -> validate -> register -> lifecycle to Loaded)
+// ============================================================================
+
+TEST(PluginLoaderStep11, LoadAllRegistersLoadedPlugins)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(10, /*min*/ 1, /*max*/ 5));
+    source.Store(Manifest(20, /*min*/ 1, /*max*/ 5));
+    plugin::PluginRegistry registry;
+    const std::vector<std::uint32_t> availableApis; // no required apis on these manifests
+    const plugin::PluginConfiguration config = EnabledConfig(/*host*/ 3, /*strict*/ true);
+
+    plugin::PluginLoader loader(source, registry, availableApis, config);
+    const plugin::PluginLoadReport report = loader.LoadAll();
+
+    EXPECT_EQ(report.attempted, 2u);
+    EXPECT_EQ(report.loaded, 2u);
+    EXPECT_EQ(report.failed, 0u);
+    EXPECT_EQ(registry.Count(), 2u);
+
+    const auto* c10 = registry.Find(plugin::PluginId{10});
+    ASSERT_NE(c10, nullptr);
+    EXPECT_EQ(c10->state, plugin::PluginState::Loaded); // Validated -> Loaded; NOT Initialized
+}
+
+TEST(PluginLoaderStep11, ValidationFailureIsolatesPlugin)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(1, /*min*/ 1, /*max*/ 5));  // ok
+    source.Store(Manifest(2, /*min*/ 6, /*max*/ 9));  // host 3 < min 6 -> ApiIncompatible
+    source.Store(Manifest(3, /*min*/ 1, /*max*/ 5));  // ok
+    plugin::PluginRegistry registry;
+    const std::vector<std::uint32_t> noApis;                    // lifetime exceeds the loader
+    const plugin::PluginConfiguration config = EnabledConfig(3, true); // lifetime exceeds the loader
+    plugin::PluginLoader loader(source, registry, noApis, config);
+
+    const auto report = loader.LoadAll();
+    EXPECT_EQ(report.attempted, 3u);
+    EXPECT_EQ(report.loaded, 2u);  // plugins 1 and 3
+    EXPECT_EQ(report.failed, 1u);
+    ASSERT_EQ(report.failures.size(), 1u);
+    EXPECT_EQ(report.failures[0].first.value, 2u);
+    EXPECT_EQ(report.failures[0].second, plugin::PluginOutcome::ApiIncompatible);
+    EXPECT_TRUE(registry.Contains(plugin::PluginId{1}));
+    EXPECT_FALSE(registry.Contains(plugin::PluginId{2}));
+    EXPECT_TRUE(registry.Contains(plugin::PluginId{3}));
+}
+
+TEST(PluginLoaderStep11, DuplicateAgainstExistingRegistryIsolated)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(7, 1, 5));
+    plugin::PluginRegistry registry;
+    {
+        plugin::PluginContext existing;
+        existing.id = plugin::PluginId{7};
+        ASSERT_EQ(registry.Register(existing), plugin::PluginOutcome::Ok);
+    }
+    const std::vector<std::uint32_t> noApis;                    // lifetime exceeds the loader
+    const plugin::PluginConfiguration config = EnabledConfig(3, true); // lifetime exceeds the loader
+    plugin::PluginLoader loader(source, registry, noApis, config);
+    const auto report = loader.LoadAll();
+    EXPECT_EQ(report.loaded, 0u);
+    ASSERT_EQ(report.failures.size(), 1u);
+    EXPECT_EQ(report.failures[0].second, plugin::PluginOutcome::DuplicatePlugin);
+    EXPECT_EQ(registry.Count(), 1u); // unchanged (the pre-existing one)
+}
+
+TEST(PluginLoaderStep11, DisabledConfigAndEmptySource)
+{
+    // Disabled config -> every plugin isolated as PluginDisabled.
+    {
+        plugin::InMemoryPluginSource source;
+        source.Store(Manifest(1, 1, 5));
+        plugin::PluginRegistry registry;
+        plugin::PluginConfiguration disabled = EnabledConfig(3, true);
+        disabled.enabled = false;
+        const std::vector<std::uint32_t> noApis; // lifetime exceeds the loader
+        plugin::PluginLoader loader(source, registry, noApis, disabled);
+        const auto report = loader.LoadAll();
+        EXPECT_EQ(report.loaded, 0u);
+        ASSERT_EQ(report.failures.size(), 1u);
+        EXPECT_EQ(report.failures[0].second, plugin::PluginOutcome::PluginDisabled);
+    }
+    // Empty source -> nothing attempted.
+    {
+        plugin::InMemoryPluginSource source;
+        plugin::PluginRegistry registry;
+        const std::vector<std::uint32_t> noApis;                    // lifetime exceeds the loader
+        const plugin::PluginConfiguration config = EnabledConfig(3, true); // lifetime exceeds the loader
+        plugin::PluginLoader loader(source, registry, noApis, config);
+        const auto report = loader.LoadAll();
+        EXPECT_EQ(report.attempted, 0u);
+        EXPECT_EQ(report.loaded, 0u);
+        EXPECT_EQ(registry.Count(), 0u);
+    }
+}
+
+// ============================================================================
+// Step 12 — PluginHost (bind, initialize/activate, dispatch, shutdown; faults)
+// ============================================================================
+
+namespace
+{
+    // Register a Loaded context for `id` (the state the loader leaves plugins in).
+    void RegisterLoaded(plugin::PluginRegistry& registry, std::uint64_t id)
+    {
+        ASSERT_EQ(registry.Register(MakeContext(id, plugin::PluginState::Loaded)), plugin::PluginOutcome::Ok);
+    }
+
+    plugin::FakePlugin MakeFake(std::uint64_t id)
+    {
+        plugin::FakePlugin f;
+        f.descriptor.id = plugin::PluginId{id};
+        f.descriptor.version = plugin::PluginVersion{1, 0, 0};
+        return f;
+    }
+} // namespace
+
+TEST(PluginHostStep12, BindRejectsNoneAndDuplicate)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    plugin::PluginRegistry registry;
+    plugin::FaultIsolation faults;
+    plugin::PluginHost host(surface, registry, faults);
+
+    plugin::FakePlugin a = MakeFake(5);
+    plugin::NullPlugin none;
+
+    EXPECT_EQ(host.Bind(plugin::PluginId{}, none), plugin::PluginOutcome::NotFound);
+    EXPECT_EQ(host.Bind(plugin::PluginId{5}, a), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(host.Bind(plugin::PluginId{5}, a), plugin::PluginOutcome::DuplicatePlugin);
+    EXPECT_EQ(host.BoundCount(), 1u);
+}
+
+TEST(PluginHostStep12, InitializeAllActivatesLoadedPluginsAscending)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    plugin::PluginRegistry registry;
+    plugin::FaultIsolation faults;
+    plugin::PluginHost host(surface, registry, faults);
+
+    RegisterLoaded(registry, 20);
+    RegisterLoaded(registry, 10);
+    plugin::FakePlugin p10 = MakeFake(10);
+    plugin::FakePlugin p20 = MakeFake(20);
+    ASSERT_EQ(host.Bind(plugin::PluginId{20}, p20), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(host.Bind(plugin::PluginId{10}, p10), plugin::PluginOutcome::Ok);
+
+    const plugin::PluginHostReport report = host.InitializeAll();
+    EXPECT_EQ(report.invoked, 2u);
+    EXPECT_EQ(report.isolated, 0u);
+    EXPECT_TRUE(p10.initialized);
+    EXPECT_TRUE(p20.initialized);
+    EXPECT_EQ(registry.Find(plugin::PluginId{10})->state, plugin::PluginState::Active);
+    EXPECT_EQ(registry.Find(plugin::PluginId{20})->state, plugin::PluginState::Active);
+    EXPECT_EQ(host.ActiveCount(), 2u);
+}
+
+TEST(PluginHostStep12, InitializeFaultIsolatesOnlyTheOffender)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    plugin::PluginRegistry registry;
+    plugin::FaultIsolation faults;
+    plugin::PluginHost host(surface, registry, faults);
+
+    RegisterLoaded(registry, 1);
+    RegisterLoaded(registry, 2);
+    plugin::FakePlugin good = MakeFake(1);
+    plugin::FakePlugin bad = MakeFake(2);
+    bad.initOutcome = plugin::PluginOutcome::InitFailed;
+    ASSERT_EQ(host.Bind(plugin::PluginId{1}, good), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(host.Bind(plugin::PluginId{2}, bad), plugin::PluginOutcome::Ok);
+
+    const plugin::PluginHostReport report = host.InitializeAll();
+    EXPECT_EQ(report.invoked, 1u);
+    EXPECT_EQ(report.isolated, 1u);
+    EXPECT_FALSE(host.IsIsolated(plugin::PluginId{1}));
+    EXPECT_TRUE(host.IsIsolated(plugin::PluginId{2}));
+    EXPECT_EQ(registry.Find(plugin::PluginId{1})->state, plugin::PluginState::Active);
+    EXPECT_EQ(registry.Find(plugin::PluginId{2})->state, plugin::PluginState::Failed);
+}
+
+TEST(PluginHostStep12, DispatchInvokeAndShutdown)
+{
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    plugin::PluginRegistry registry;
+    plugin::FaultIsolation faults;
+    plugin::PluginHost host(surface, registry, faults);
+
+    RegisterLoaded(registry, 1);
+    RegisterLoaded(registry, 2);
+    plugin::FakePlugin p1 = MakeFake(1);
+    plugin::FakePlugin p2 = MakeFake(2);
+    p2.eventOutcome = plugin::PluginOutcome::RuntimeError; // faults on first event
+    ASSERT_EQ(host.Bind(plugin::PluginId{1}, p1), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(host.Bind(plugin::PluginId{2}, p2), plugin::PluginOutcome::Ok);
+    (void)host.InitializeAll(); // both Active
+
+    // Dispatch: p1 handles Ok, p2 faults -> isolated; siblings continue.
+    const plugin::PluginHostReport d = host.Dispatch(plugin::PluginEvent::OnTick, plugin::PluginArgs{});
+    EXPECT_EQ(d.invoked, 1u);
+    EXPECT_EQ(d.isolated, 1u);
+    EXPECT_TRUE(host.IsIsolated(plugin::PluginId{2}));
+
+    // Invoke on the isolated plugin -> PluginDisabled skip; unbound -> NotFound.
+    EXPECT_EQ(host.Invoke(plugin::PluginId{2}, plugin::PluginEvent::OnTick, plugin::PluginArgs{}),
+              plugin::PluginOutcome::PluginDisabled);
+    EXPECT_EQ(host.Invoke(plugin::PluginId{99}, plugin::PluginEvent::OnTick, plugin::PluginArgs{}),
+              plugin::PluginOutcome::NotFound);
+    // Invoke on the healthy active plugin -> Ok.
+    EXPECT_EQ(host.Invoke(plugin::PluginId{1}, plugin::PluginEvent::OnPlayerJoin, plugin::PluginArgs{}),
+              plugin::PluginOutcome::Ok);
+
+    host.ShutdownAll();
+    EXPECT_TRUE(p1.shutdownCalled);
+    EXPECT_TRUE(p2.shutdownCalled); // isolated (Failed) plugins are still shut down
+    EXPECT_EQ(registry.Find(plugin::PluginId{1})->state, plugin::PluginState::Shutdown);
+    EXPECT_EQ(registry.Find(plugin::PluginId{2})->state, plugin::PluginState::Shutdown);
+}
+
+// ============================================================================
+// Step 13 — PluginManager (orchestrate loader + host; startup/tick/shutdown)
+// ============================================================================
+
+TEST(PluginManagerStep13, StartupLoadsAndActivatesBoundPlugins)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(10, /*min*/ 1, /*max*/ 5));
+    source.Store(Manifest(20, /*min*/ 1, /*max*/ 5));
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(/*host*/ 3, /*strict*/ true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    plugin::FakePlugin p10 = MakeFake(10);
+    plugin::FakePlugin p20 = MakeFake(20);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{10}, p10), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{20}, p20), plugin::PluginOutcome::Ok);
+
+    const plugin::PluginStartupReport report = manager.Startup();
+    EXPECT_EQ(report.discovered, 2u);
+    EXPECT_EQ(report.loaded, 2u);
+    EXPECT_EQ(report.initialized, 2u);
+    EXPECT_EQ(report.isolated, 0u);
+    EXPECT_EQ(manager.PluginCount(), 2u);
+    EXPECT_TRUE(p10.initialized);
+    EXPECT_TRUE(p20.initialized);
+}
+
+TEST(PluginManagerStep13, SubscribeDispatchAndTick)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(1, 1, 5));
+    source.Store(Manifest(2, 1, 5));
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(3, true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    plugin::FakePlugin p1 = MakeFake(1);
+    plugin::FakePlugin p2 = MakeFake(2);
+    p2.eventOutcome = plugin::PluginOutcome::RuntimeError;
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{1}, p1), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{2}, p2), plugin::PluginOutcome::Ok);
+    (void)manager.Startup();
+
+    // Subscribe both to OnTick; none id rejected.
+    EXPECT_EQ(manager.Subscribe(plugin::PluginEvent::OnTick, plugin::PluginId{}), plugin::PluginOutcome::InvalidHook);
+    ASSERT_EQ(manager.Subscribe(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.Subscribe(plugin::PluginEvent::OnTick, plugin::PluginId{2}), plugin::PluginOutcome::Ok);
+
+    const plugin::PluginHostReport d = manager.DispatchEvent(plugin::PluginEvent::OnTick, plugin::PluginArgs{});
+    EXPECT_EQ(d.invoked, 1u);   // p1 ok
+    EXPECT_EQ(d.isolated, 1u);  // p2 faulted this dispatch
+    EXPECT_TRUE(manager.IsIsolated(plugin::PluginId{2}));
+    EXPECT_EQ(manager.IsolatedCount(), 1u);
+
+    // Tick dispatches OnTick again deterministically; p2 already isolated -> skipped.
+    const std::uint64_t before = manager.Ticks();
+    manager.Tick(0.016);
+    EXPECT_EQ(manager.Ticks(), before + 1u);
+}
+
+TEST(PluginManagerStep13, ServiceContractAndShutdown)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(1, 1, 5));
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(3, true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    EXPECT_EQ(manager.Name(), "Plugins");
+    const auto deps = manager.Dependencies();
+    EXPECT_FALSE(deps.empty());
+    EXPECT_TRUE(manager.Initialize().HasValue());
+
+    plugin::FakePlugin p1 = MakeFake(1);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{1}, p1), plugin::PluginOutcome::Ok);
+    (void)manager.Startup();
+    EXPECT_TRUE(p1.initialized);
+
+    manager.Shutdown();
+    EXPECT_TRUE(p1.shutdownCalled);
+    EXPECT_EQ(manager.IsolatedCount(), 0u); // cleared on shutdown
+}
+
+// ============================================================================
+// Step 14 — FaultIsolation (deterministic isolation policy)
+// ============================================================================
+
+TEST(PluginHardeningStep14, IsolateMarksFailedAndRecordsIdempotent)
+{
+    plugin::PluginRegistry registry;
+    RegisterLoaded(registry, 5);
+    plugin::FaultIsolation faults;
+
+    EXPECT_FALSE(faults.IsIsolated(plugin::PluginId{5}));
+    EXPECT_EQ(faults.Isolate(plugin::PluginId{5}, registry), plugin::PluginOutcome::PluginDisabled);
+    EXPECT_TRUE(faults.IsIsolated(plugin::PluginId{5}));
+    EXPECT_EQ(registry.Find(plugin::PluginId{5})->state, plugin::PluginState::Failed);
+    EXPECT_EQ(faults.Count(), 1u);
+
+    // Idempotent: re-isolating is a no-op that still reports PluginDisabled.
+    EXPECT_EQ(faults.Isolate(plugin::PluginId{5}, registry), plugin::PluginOutcome::PluginDisabled);
+    EXPECT_EQ(faults.Count(), 1u);
+}
+
+TEST(PluginHardeningStep14, IsolationIsSortedAndClearable)
+{
+    plugin::PluginRegistry registry;
+    plugin::FaultIsolation faults;
+
+    // Insert out of order; disabled set stays sorted/deduplicated internally.
+    (void)faults.Isolate(plugin::PluginId{30}, registry);
+    (void)faults.Isolate(plugin::PluginId{10}, registry);
+    (void)faults.Isolate(plugin::PluginId{20}, registry);
+    EXPECT_EQ(faults.Count(), 3u);
+    EXPECT_TRUE(faults.IsIsolated(plugin::PluginId{10}));
+    EXPECT_TRUE(faults.IsIsolated(plugin::PluginId{20}));
+    EXPECT_TRUE(faults.IsIsolated(plugin::PluginId{30}));
+    EXPECT_FALSE(faults.IsIsolated(plugin::PluginId{25}));
+
+    faults.Clear();
+    EXPECT_EQ(faults.Count(), 0u);
+    EXPECT_FALSE(faults.IsIsolated(plugin::PluginId{10}));
+}
+
+TEST(PluginHardeningStep14, IsolateMissingRegistryEntryStillRecords)
+{
+    plugin::PluginRegistry registry; // empty — id not present
+    plugin::FaultIsolation faults;
+
+    // No registry context to mark Failed, but the plugin is still recorded disabled.
+    EXPECT_EQ(faults.Isolate(plugin::PluginId{42}, registry), plugin::PluginOutcome::PluginDisabled);
+    EXPECT_TRUE(faults.IsIsolated(plugin::PluginId{42}));
+    EXPECT_EQ(faults.Count(), 1u);
+    EXPECT_EQ(registry.Count(), 0u);
+}
+
+// ============================================================================
+// Step 15 — PluginDiagnostics (non-invasive collector + read-only inspectors)
+// ============================================================================
+
+TEST(PluginDiagnosticsStep15, CountersAreMonotonicAndSnapshotIsAValueCopy)
+{
+    plugin::PluginDiagnostics diag;
+    plugin::PluginStatistics zero = diag.Snapshot();
+    EXPECT_EQ(zero.loadedPlugins, 0u);
+    EXPECT_EQ(zero.activePlugins, 0u);
+    EXPECT_EQ(zero.eventDispatches, 0u);
+    EXPECT_EQ(zero.apiCalls, 0u);
+    EXPECT_EQ(zero.pluginErrors, 0u);
+
+    diag.RecordPluginLoaded();
+    diag.RecordPluginLoaded();
+    diag.RecordPluginActivated();
+    diag.RecordEventDispatch();
+    diag.RecordEventDispatch();
+    diag.RecordEventDispatch();
+    diag.RecordApiCall();
+    diag.RecordPluginError();
+
+    const plugin::PluginStatistics s = diag.Snapshot();
+    EXPECT_EQ(s.loadedPlugins, 2u);
+    EXPECT_EQ(s.activePlugins, 1u);
+    EXPECT_EQ(s.eventDispatches, 3u);
+    EXPECT_EQ(s.apiCalls, 1u);
+    EXPECT_EQ(s.pluginErrors, 1u);
+
+    // The earlier snapshot is an independent value copy (non-invasive).
+    EXPECT_EQ(zero.loadedPlugins, 0u);
+
+    // Decrement counters saturate at zero (never underflow).
+    diag.RecordPluginUnloaded();
+    diag.RecordPluginUnloaded();
+    diag.RecordPluginUnloaded(); // extra — must clamp
+    diag.RecordPluginDeactivated();
+    diag.RecordPluginDeactivated(); // extra — must clamp
+    const plugin::PluginStatistics s2 = diag.Snapshot();
+    EXPECT_EQ(s2.loadedPlugins, 0u);
+    EXPECT_EQ(s2.activePlugins, 0u);
+
+    diag.Reset();
+    EXPECT_EQ(diag.Snapshot().eventDispatches, 0u);
+}
+
+TEST(PluginDiagnosticsStep15, DiagnosticTimingIsDeterministicAndNeverGates)
+{
+    plugin::PluginDiagnostics diag;
+    EXPECT_EQ(diag.AverageExecutionMicros(), 0u); // no samples
+
+    diag.RecordExecutionTime(100);
+    diag.RecordExecutionTime(300);
+    EXPECT_EQ(diag.AverageExecutionMicros(), 200u); // deterministic integer average
+    EXPECT_EQ(diag.Snapshot().executionTimeMicros, 300u); // last sample
+
+    diag.RecordMemory(4096);
+    EXPECT_EQ(diag.Snapshot().memoryBytes, 4096u);
+}
+
+TEST(PluginDiagnosticsStep15, InspectStatesReportsLifecycleAndIsolationReadOnly)
+{
+    plugin::PluginRegistry registry;
+    ASSERT_EQ(registry.Register(MakeContext(30, plugin::PluginState::Active)), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(registry.Register(MakeContext(10, plugin::PluginState::Loaded)), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(registry.Register(MakeContext(20, plugin::PluginState::Failed)), plugin::PluginOutcome::Ok);
+    plugin::FaultIsolation faults;
+    (void)faults.Isolate(plugin::PluginId{10}, registry); // also flips 10 -> Failed
+
+    const std::size_t countBefore = registry.Count();
+    const auto states = plugin::PluginDiagnostics::InspectStates(registry, faults);
+
+    // Ascending by id; read-only (registry size unchanged).
+    ASSERT_EQ(states.size(), 3u);
+    EXPECT_EQ(states[0].id.value, 10u);
+    EXPECT_EQ(states[1].id.value, 20u);
+    EXPECT_EQ(states[2].id.value, 30u);
+    EXPECT_TRUE(states[0].isolated);  // isolated via FaultIsolation (and now Failed)
+    EXPECT_TRUE(states[1].isolated);  // Failed state
+    EXPECT_FALSE(states[2].isolated); // Active, not isolated
+    EXPECT_EQ(states[2].state, plugin::PluginState::Active);
+    EXPECT_EQ(registry.Count(), countBefore); // inspection mutated nothing
+
+    EXPECT_EQ(plugin::PluginDiagnostics::CountInState(registry, plugin::PluginState::Failed), 2u);
+    EXPECT_EQ(plugin::PluginDiagnostics::CountInState(registry, plugin::PluginState::Active), 1u);
+}
+
+TEST(PluginDiagnosticsStep15, InspectConsistencyDetectsActiveAndIsolatedBreach)
+{
+    plugin::PluginRegistry registry;
+    ASSERT_EQ(registry.Register(MakeContext(1, plugin::PluginState::Active)), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(registry.Register(MakeContext(2, plugin::PluginState::Loaded)), plugin::PluginOutcome::Ok);
+    plugin::EventBinding events;
+    ASSERT_EQ(events.Bind(plugin::PluginEvent::OnTick, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    plugin::FaultIsolation faults;
+
+    // Consistent baseline: one active (id 1), one loaded, one bound hook.
+    plugin::PluginConsistency c = plugin::PluginDiagnostics::InspectConsistency(registry, events, faults);
+    EXPECT_EQ(c.registeredPlugins, 2u);
+    EXPECT_EQ(c.boundHooks, 1u);
+    EXPECT_EQ(c.activePlugins, 1u);
+    EXPECT_TRUE(c.consistent);
+
+    // Force an invariant breach: id 1 is Active but recorded isolated in FaultIsolation.
+    // (Isolate would normally flip it to Failed; simulate a stale record by isolating a
+    // *different* absent id would not breach — so isolate 1 but restore its Active state to
+    // model the "active-and-isolated" invariant the inspector must catch.)
+    (void)faults.Isolate(plugin::PluginId{1}, registry);
+    if (plugin::PluginContext* ctx = registry.Find(plugin::PluginId{1}))
+    {
+        ctx->state = plugin::PluginState::Active; // stale: active yet isolated
+    }
+    c = plugin::PluginDiagnostics::InspectConsistency(registry, events, faults);
+    EXPECT_FALSE(c.consistent);
+}
+
+// ============================================================================
+// Step 16 — PluginThreadGuard (Simulation-Thread-only enforcement; ADR-011)
+// ============================================================================
+
+TEST(PluginThreadSafetyStep16, ApprovedThreadSucceedsNonApprovedRejected)
+{
+    plugin::PluginThreadGuard guard;
+    constexpr std::uint64_t kOwner = 0xABCDEF01u;
+    constexpr std::uint64_t kWorker = 0x1234u;
+
+    // Unbound: every entry is a violation (fails closed).
+    EXPECT_FALSE(guard.IsBound());
+    EXPECT_EQ(guard.Verify(kOwner), plugin::PluginOutcome::RuntimeError);
+
+    guard.Bind(kOwner);
+    EXPECT_TRUE(guard.IsBound());
+    EXPECT_TRUE(guard.IsOnOwner(kOwner));
+    EXPECT_FALSE(guard.IsOnOwner(kWorker));
+
+    // Approved (Simulation Thread) entry succeeds; worker entry is rejected as a value outcome.
+    EXPECT_EQ(guard.Verify(kOwner), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(guard.Verify(kWorker), plugin::PluginOutcome::RuntimeError);
+}
+
+TEST(PluginThreadSafetyStep16, ViolationsCountedDeterministicallyAndResettable)
+{
+    plugin::PluginThreadGuard guard;
+    guard.Bind(7);
+
+    EXPECT_EQ(guard.Verify(7), plugin::PluginOutcome::Ok);      // no violation
+    EXPECT_EQ(guard.Verify(8), plugin::PluginOutcome::RuntimeError);
+    EXPECT_EQ(guard.Verify(9), plugin::PluginOutcome::RuntimeError);
+    EXPECT_EQ(guard.Violations(), 2u); // deterministic count; Ok never counted
+
+    guard.Reset();
+    EXPECT_FALSE(guard.IsBound());
+    EXPECT_EQ(guard.Violations(), 0u);
+    // After reset, still fails closed until re-bound.
+    EXPECT_EQ(guard.Verify(7), plugin::PluginOutcome::RuntimeError);
+    EXPECT_EQ(guard.Violations(), 1u);
+}
+
+TEST(PluginThreadSafetyStep16, GuardIsTriviallyValueTypedNoThreadingLeakage)
+{
+    // The guard is a pure value component: trivially copyable, no threading primitive state.
+    EXPECT_TRUE(std::is_trivially_copyable_v<plugin::PluginThreadGuard>);
+
+    // A copy carries the bound owner but is otherwise independent (no shared/atomic state).
+    plugin::PluginThreadGuard a;
+    a.Bind(42);
+    plugin::PluginThreadGuard b = a;
+    EXPECT_TRUE(b.IsOnOwner(42));
+    EXPECT_EQ(b.Verify(42), plugin::PluginOutcome::Ok);
+    EXPECT_EQ(a.Violations(), 0u); // independent instances
+}
+
+// ============================================================================
+// Step 17 — Composed integration (PluginManager + PluginHost + host surface)
+//
+// These exercise the composed subsystem the way Bootstrap wires it (Step 17): a
+// PluginManager loads statically-registered manifests from the discovery source and,
+// through the PluginHost, initializes/activates the bound plugin instances and dispatches
+// events/OnTick over the reused Sprint-013 gameplay host surface ([AR-P3] Option A) — all
+// engine-free (in-memory source + fake plugins + recording facades). The real static-
+// registration backend + engine host facades are Antigravity-smoke-verified on Windows.
+// ============================================================================
+
+TEST(PluginIntegrationStep17, StartupLoadsManifestsAndActivatesBoundPlugins)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(10, /*min*/ 1, /*max*/ 5));
+    source.Store(Manifest(20, /*min*/ 1, /*max*/ 5));
+    lua::RecordingScriptApi api; // reused gameplay facades ([AR-P3] Option A)
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(/*host*/ 3, /*strict*/ true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    plugin::FakePlugin p10 = MakeFake(10);
+    plugin::FakePlugin p20 = MakeFake(20);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{10}, p10), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{20}, p20), plugin::PluginOutcome::Ok);
+
+    const plugin::PluginStartupReport report = manager.Startup();
+    EXPECT_EQ(report.discovered, 2u);
+    EXPECT_EQ(report.loaded, 2u);
+    EXPECT_EQ(report.initialized, 2u);
+    EXPECT_EQ(report.isolated, 0u);
+    EXPECT_TRUE(p10.initialized);
+    EXPECT_TRUE(p20.initialized);
+}
+
+TEST(PluginIntegrationStep17, ServerAndGameplayEventFlow)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(1, 1, 5));
+    source.Store(Manifest(2, 1, 5));
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(3, true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    plugin::FakePlugin p1 = MakeFake(1);
+    plugin::FakePlugin p2 = MakeFake(2);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{1}, p1), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{2}, p2), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.Startup().initialized, 2u);
+
+    ASSERT_EQ(manager.Subscribe(plugin::PluginEvent::OnServerStart, plugin::PluginId{1}), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.Subscribe(plugin::PluginEvent::OnPlayerJoin, plugin::PluginId{2}), plugin::PluginOutcome::Ok);
+
+    EXPECT_EQ(manager.DispatchEvent(plugin::PluginEvent::OnServerStart, plugin::PluginArgs{}).invoked, 1u);
+    EXPECT_EQ(manager.DispatchEvent(plugin::PluginEvent::OnPlayerJoin, plugin::PluginArgs{}).invoked, 1u);
+    EXPECT_EQ(manager.DispatchEvent(plugin::PluginEvent::OnPlayerLeave, plugin::PluginArgs{}).invoked, 0u); // none bound
+    EXPECT_EQ(p1.events.size(), 1u);
+    EXPECT_EQ(p2.events.size(), 1u);
+}
+
+TEST(PluginIntegrationStep17, LargePluginCollectionTickDispatch)
+{
+    plugin::InMemoryPluginSource source;
+    for (std::uint64_t id = 1; id <= 200; ++id)
+    {
+        source.Store(Manifest(id, 1, 5));
+    }
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(3, true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    std::vector<plugin::FakePlugin> plugins;
+    plugins.reserve(200);
+    for (std::uint64_t id = 1; id <= 200; ++id)
+    {
+        plugins.push_back(MakeFake(id));
+    }
+    for (std::uint64_t id = 1; id <= 200; ++id)
+    {
+        ASSERT_EQ(manager.BindPlugin(plugin::PluginId{id}, plugins[id - 1]), plugin::PluginOutcome::Ok);
+    }
+    EXPECT_EQ(manager.Startup().initialized, 200u);
+
+    for (std::uint64_t id = 1; id <= 200; ++id)
+    {
+        ASSERT_EQ(manager.Subscribe(plugin::PluginEvent::OnTick, plugin::PluginId{id}), plugin::PluginOutcome::Ok);
+    }
+    manager.Tick(0.016);
+    // All 200 reacted deterministically (one OnTick each).
+    for (const plugin::FakePlugin& p : plugins)
+    {
+        EXPECT_EQ(p.events.size(), 1u);
+    }
+    EXPECT_EQ(manager.Ticks(), 1u);
+}
+
+TEST(PluginIntegrationStep17, FaultIsolationAcrossTicks)
+{
+    plugin::InMemoryPluginSource source;
+    source.Store(Manifest(1, 1, 5));
+    source.Store(Manifest(2, 1, 5));
+    source.Store(Manifest(3, 1, 5));
+    lua::RecordingScriptApi api;
+    plugin::GameplayHostSurface surface(api.AsSet());
+    const std::vector<std::uint32_t> noApis;
+    const plugin::PluginConfiguration config = EnabledConfig(3, true);
+    plugin::PluginManager manager(source, surface, noApis, config);
+
+    plugin::FakePlugin p1 = MakeFake(1);
+    plugin::FakePlugin p2 = MakeFake(2);
+    plugin::FakePlugin p3 = MakeFake(3);
+    p2.eventOutcome = plugin::PluginOutcome::RuntimeError; // faults on its first OnTick
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{1}, p1), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{2}, p2), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.BindPlugin(plugin::PluginId{3}, p3), plugin::PluginOutcome::Ok);
+    ASSERT_EQ(manager.Startup().initialized, 3u);
+    for (std::uint64_t id = 1; id <= 3; ++id)
+    {
+        ASSERT_EQ(manager.Subscribe(plugin::PluginEvent::OnTick, plugin::PluginId{id}), plugin::PluginOutcome::Ok);
+    }
+
+    manager.Tick(0.016); // Tick 1: dispatches OnTick, isolates the faulting plugin (id 2)
+    EXPECT_TRUE(manager.IsIsolated(plugin::PluginId{2}));
+    EXPECT_FALSE(manager.IsIsolated(plugin::PluginId{1}));
+    EXPECT_FALSE(manager.IsIsolated(plugin::PluginId{3}));
+
+    // Subsequent ticks keep running the healthy siblings, skipping the isolated one.
+    const std::size_t p1Before = p1.events.size();
+    const std::size_t p3Before = p3.events.size();
+    manager.Tick(0.016);
+    manager.Tick(0.016);
+    EXPECT_EQ(p1.events.size() - p1Before, 2u); // two more ticks
+    EXPECT_EQ(p3.events.size() - p3Before, 2u);
+    EXPECT_EQ(manager.Ticks(), 3u);
+    EXPECT_EQ(manager.IsolatedCount(), 1u);
 }
